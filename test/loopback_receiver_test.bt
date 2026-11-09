@@ -122,3 +122,119 @@ TestCase subclass: LoopbackReceiverTest
   testNegativeTimeoutAnswersConfigError =>
     outcome := self.rx awaitCallback: -1
     self assert: outcome error code equals: "config"
+
+  testKeptAliveBrowserConnectionDoesNotStallShutdown =>
+    // Browsers keep the connection open after the redirect; stopping the
+    // listener must not wait out the engine's drain on it.
+    browser := HTTPClient spawnWith: #{
+      #baseUrl => "http://127.0.0.1:{self.rx port}"
+    }
+    (browser get: "/favicon.ico") unwrap
+    (browser get: "/callback?code=kept") unwrap
+    t0 := Erlang erlang monotonic_time: #millisecond
+    query := (self.rx awaitCallback: 5000) unwrap
+    elapsed := (Erlang erlang monotonic_time: #millisecond) - t0
+    browser stop
+    self assert: (query at: "code") equals: "kept"
+    self assert: elapsed < 2000
+
+  testHeadOnCallbackAnswers404AndKeepsTheSlot =>
+    resp := (HTTPClient
+      request: #HEAD
+      url: self.rx redirectUri ++ "?code=head"
+      options: #{}) unwrap
+    self assert: resp status equals: 404
+    self browse: "/callback?code=got"
+    query := (self.rx awaitCallback: 5000) unwrap
+    self assert: (query at: "code") equals: "got"
+
+  testNearMissPathsAnswer404AndKeepTheSlot =>
+    #("/callback/?code=a", "/Callback?code=b", "/callbackx?code=c") do: [:path |
+      self assert: (self browse: path) unwrap status equals: 404
+    ]
+    self browse: "/callback?code=got"
+    query := (self.rx awaitCallback: 5000) unwrap
+    self assert: (query at: "code") equals: "got"
+
+  testForeignHostAnswers404AndKeepsTheSlot =>
+    // HTTPClient always sends its own Host, so drive the gate directly.
+    gate := LoopbackGate spawn
+    gate expectHost: "127.0.0.1:4000"
+    rebound := HTTPRequest
+      new: #{
+        #method => "GET",
+        #path => "/callback",
+        #headers => #(#("host", "evil.example:4000")),
+        #queryParams => #{"code" => "rebound"}
+      }
+    self assert: (gate handle: rebound) status equals: 404
+    good := rebound withHeaders: #(#("Host", "127.0.0.1:4000"))
+    self assert: (gate handle: good) status equals: 200
+    gate stop
+
+  testCloseTabPageForbidsScriptsAndFraming =>
+    resp := (self browse: "/callback?code=x") unwrap
+    csp := resp headers detect: [:h |
+      (h at: 1) lowercase =:= "content-security-policy"
+    ] ifNone: [nil]
+    self assert: csp notNil
+    self assert: ((csp at: 2) includesSubstring: "frame-ancestors 'none'")
+
+  testAwaitFromAnotherProcess =>
+    // The receiver need not be awaited by the process that started it.
+    self browse: "/callback?code=elsewhere"
+    me := Pid current
+    tag := Reference new
+    rx := self.rx
+    worker := [
+      query := (rx awaitCallback: 5000) unwrap
+      me send: {#beamtalk_oauth_callback, tag, query}
+    ] fork
+    reply := (LoopbackReceiver
+      await: tag
+      from: worker
+      timeout: 5000) unwrap
+    self assert: (reply at: "code") equals: "elsewhere"
+    self deny: rx isListening
+
+  testStopWhileWaitingEndsTheWaitPromptly =>
+    rx := self.rx
+    [
+      Timer sleep: 200
+      rx stop
+    ] fork
+    t0 := Erlang erlang monotonic_time: #millisecond
+    outcome := self.rx awaitCallback: 5000
+    elapsed := (Erlang erlang monotonic_time: #millisecond) - t0
+    self assert: outcome error code equals: "config"
+    self assert: elapsed < 3000
+
+  testSecondConcurrentWaiterIsRefused =>
+    rx := self.rx
+    [rx awaitCallback: 3000] fork
+    Timer sleep: 200
+    outcome := self.rx awaitCallback: 50
+    self assert: outcome error code equals: "config"
+    self assert: self.rx isListening
+
+  testAwaitAfterSuccessAnswersConfigError =>
+    self browse: "/callback?code=x"
+    (self.rx awaitCallback: 5000) unwrap
+    self assert: (self.rx awaitCallback: 50) error code equals: "config"
+
+  testAwaitZeroTakesAnArrivedCallback =>
+    self browse: "/callback?code=ready"
+    self assert: ((self.rx awaitCallback: 0) unwrap at: "code") equals: "ready"
+
+  testOversizedTimeoutAnswersConfigError =>
+    outcome := self.rx awaitCallback: LoopbackReceiver maxTimeout + 1
+    self assert: outcome error code equals: "config"
+    self assert: self.rx isListening
+
+  testNoStrayMessagesAfterTimeoutOrCallback =>
+    before := Erlang beamtalk_oauth_loopback mailbox_size
+    self.rx awaitCallback: 20
+    other := LoopbackReceiver start unwrap
+    HTTPClient get: other redirectUri ++ "?code=x"
+    (other awaitCallback: 5000) unwrap
+    self assert: (Erlang beamtalk_oauth_loopback mailbox_size) equals: before

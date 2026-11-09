@@ -46,35 +46,46 @@ typed Value subclass: LoopbackReceiver
   /// Start a listener on `127.0.0.1`, port 0 (OS-assigned), with a fresh
   /// binding. Answers a `transport` error when the listener cannot start.
   class start -> Result(LoopbackReceiver, OAuthError) =>
+    binding := Secrets generate
     gate := LoopbackGate spawn
+    srv := nil
     outcome := Result
       tryDo: [
-        HTTPServer
+        srv := HTTPServer
           start: 0
           handler: gate
           options: #{#bind => "127.0.0.1"}
-      ]
-    outcome isError
-      ifTrue: [
-        gate stop
-        ^Result error: (OAuthError transport: "loopback listener failed to start: {outcome error messageText}")
-      ]
-    srv := outcome value
-    Result
-      ok: (self
-        new: #{
+        rx := self new: #{
           #server => srv,
           #gate => gate,
           #port => srv port,
-          #binding => Secrets generate
-        })
+          #binding => binding
+        }
+        gate expectHost: "127.0.0.1:{rx port}"
+        rx
+      ]
+    outcome
+      ifOk: [:rx | Result ok: rx]
+      ifError: [:e |
+        (self new: #{#server => srv, #gate => gate}) stop
+        Result error: (OAuthError transport: "loopback listener failed to start: {e messageText}")
+      ]
+
+  /// The largest `awaitCallback:` timeout, in ms: the BEAM's limit for a
+  /// receive timeout (about 49 days).
+  class maxTimeout -> Integer => 4294967295
 
   /// Block the calling process until `{#beamtalk_oauth_callback, tag, query}`
-  /// arrives or `timeoutMs` passes.
-  class await: tag :: Reference timeout: timeoutMs :: Integer -> Result(Dictionary, Symbol) =>
-    // `{ok, Query}` / `{error, timeout}` from the native module.
-    @expect type
-    Erlang beamtalk_oauth_loopback await: tag timeout: timeoutMs
+  /// arrives from the gate process `gatePid`, `timeoutMs` passes
+  /// (`#timeout`) or the gate exits (`#stopped`).
+  class await: tag :: Reference from: gatePid :: Pid timeout: timeoutMs :: Integer -> Result(Dictionary, Object) =>
+    // `{callback, Query}`, `timeout` or `stopped` from the native module.
+    answer := Erlang beamtalk_oauth_loopback
+      await: tag
+      gate: gatePid
+      timeout: timeoutMs
+    (answer isKindOf: Tuple) ifTrue: [^Result ok: (answer at: 2)]
+    Result error: answer
 
   /// The redirect URI to register with the provider for this flow:
   /// `http://127.0.0.1:{port}/callback`.
@@ -85,15 +96,19 @@ typed Value subclass: LoopbackReceiver
   /// `OAuthFlows handleCallback:store:boundTo:`. A callback that arrived
   /// before the call is answered at once.
   ///
-  /// The wait happens in the calling process. The listener is stopped
-  /// before this answers. Errors:
+  /// The wait happens in the calling process, which blocks: call this from
+  /// a plain or forked process, not from inside an actor method, or that
+  /// actor stops answering (and its callers time out) while the user signs
+  /// in. The listener is stopped before this answers. Errors:
   ///
   /// - `callback_timeout`: nothing arrived in time;
-  /// - `config`: a negative timeout, or the receiver was already stopped.
+  /// - `config`: a timeout outside `0..maxTimeout`; the receiver was
+  ///   stopped, before or during the wait; or another process is already
+  ///   waiting on it (that wait carries on, and the listener stays up).
   awaitCallback: timeoutMs :: Integer -> Result(Dictionary, OAuthError) =>
-    timeoutMs < 0
+    ((timeoutMs < 0) or: [timeoutMs > self class maxTimeout])
       ifTrue: [
-        ^Result error: (OAuthError config: "awaitCallback: timeout must not be negative")
+        ^Result error: (OAuthError config: "awaitCallback: timeout must be between 0 and {self class maxTimeout} ms")
       ]
     tag := Reference new
     registered := Result tryDo: [self.gate awaitFrom: Pid current tag: tag]
@@ -102,20 +117,44 @@ typed Value subclass: LoopbackReceiver
         self stop
         ^Result error: (OAuthError config: "LoopbackReceiver is stopped")
       ]
-    outcome := self class await: tag timeout: timeoutMs
+    registered value
+      ifFalse: [
+        ^Result error: (OAuthError config: "another process is already waiting on this LoopbackReceiver")
+      ]
+    gatePid := self.gate pid
+    outcome := self class
+      await: tag
+      from: gatePid
+      timeout: timeoutMs
     self stop
     // A callback that raced the timeout may already be in the mailbox:
     // take it, which also leaves no stray message behind.
-    outcome isError ifTrue: [outcome := self class await: tag timeout: 0]
-    outcome ifOk: [:query |
-      Result ok: query
-    ] ifError: [:e | Result error: OAuthError callbackTimeout]
+    (outcome isError and: [outcome error =:= #timeout])
+      ifTrue: [
+        outcome := self class
+          await: tag
+          from: gatePid
+          timeout: 0
+      ]
+    outcome
+      ifOk: [:query | Result ok: query]
+      ifError: [:reason |
+        reason =:= #stopped
+          ifTrue: [
+            Result error: (OAuthError config: "LoopbackReceiver was stopped while waiting")
+          ]
+          ifFalse: [Result error: OAuthError callbackTimeout]
+      ]
 
-  /// Stop the listener. Idempotent: answers `#ok` every time, like
-  /// `Actor>>stop`.
+  /// Stop the listener, then its handler. Idempotent: answers `#ok` every
+  /// time, like `Actor>>stop`, and never raises, so the handler is stopped
+  /// even when the server's shutdown fails. The server gets 10 s, more
+  /// than the 5 s its own engine shutdown may take.
   stop -> Symbol =>
-    self.server isNil ifFalse: [self.server stop]
-    self.gate isNil ifFalse: [self.gate stop]
+    self.server isNil ifFalse: [
+      [self.server stopWith: #normal timeout: 10000] on: Error do: [:e | nil]
+    ]
+    self.gate isNil ifFalse: [[self.gate stop] on: Error do: [:e | nil]]
     #ok
 
   /// Whether the listener is still accepting connections.
