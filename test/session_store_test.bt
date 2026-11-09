@@ -65,6 +65,13 @@ TestCase subclass: SessionStoreTest
       store create: (self.session withState: "") boundTo: self.binding
     ] raise: #user_error
 
+  testCreateWithStateAsBindingRaises =>
+    store := SessionStore spawn
+    self should: [
+      store create: self.session boundTo: self.session state
+    ] raise: #user_error
+    self assert: store size equals: 0
+
   testCreateDuplicateStateRaises =>
     store := SessionStore spawn
     store create: self.session boundTo: self.binding
@@ -151,6 +158,15 @@ TestCase subclass: SessionStoreTest
     probe := store consume: self.session state boundTo: "x"
     self assert: probe error code equals: "session_mismatch"
 
+  testConsumeExpiredMismatchReportsMismatch =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock
+    store create: self.session boundTo: self.binding
+    clock time: 1500
+    // The wrong binding never learns that the session expired.
+    out := store consume: self.session state boundTo: Secrets generate
+    self assert: out error code equals: "session_mismatch"
+
   testConsumeExpiredSession =>
     clock := FakeClock spawnWith: #{#time => 0}
     store := self storeWith: clock
@@ -214,7 +230,7 @@ TestCase subclass: SessionStoreTest
     store create: s boundTo: self.binding
     status := Erlang sys get_status: store pid
     text := self render: status
-    self assert: (text includesSubstring: "#Fun<")
+    self assert: (text includesSubstring: "#Ref<")
     self deny: (text includesSubstring: s state)
     self deny: (text includesSubstring: s nonce)
     self deny: (text includesSubstring: s codeVerifier)
@@ -229,3 +245,12 @@ TestCase subclass: SessionStoreTest
     self deny: (text includesSubstring: s state)
     self deny: (text includesSubstring: s codeVerifier)
     self deny: (text includesSubstring: self.binding)
+
+  testTableIsPrivate =>
+    store := SessionStore spawn
+    store create: self.session boundTo: self.binding
+    table := store fieldAt: #table
+    self assert: (Erlang ets info: table with: #protection) equals: #private
+    self assert: (Erlang ets info: table with: #size) equals: 1
+    // FFI wraps ets's badarg as a type_error.
+    self should: [Erlang ets tab2list: table] raise: #type_error

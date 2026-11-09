@@ -291,10 +291,11 @@ Object subclass: ProviderPresets
 // started it. Sessions expire after 10 minutes by default (policy,
 // configurable; RFC 6749 §4.1.2's 10-minute maximum is for authorization
 // codes, not state), enforced in consume:, with a periodic sweep so
-// abandoned attempts cannot accumulate. Implements format_status so
+// abandoned attempts cannot accumulate. Sessions live in a private ETS
+// table the actor owns (Beamtalk actors have no format_status hook), so
 // crash reports and sys:get_state never show verifiers or bindings.
 Actor subclass: SessionStore
-  state: sessions :: Dictionary = #{}
+  state: table = nil   // private ETS table, created in initialize
 
   create: sess :: OAuthSession boundTo: binding :: String -> Nil => ...
   consume: state :: String boundTo: binding :: String -> Result(OAuthSession, OAuthError) => ...
@@ -423,7 +424,8 @@ typed Value subclass: OAuthError
     (`http://127.0.0.1:{port}` / `http://[::1]:{port}`). RFC 8252 §8.3
     marks `localhost` NOT RECOMMENDED, and §7.3 has the port chosen at
     runtime.
-  - `printString`, `asJson` and actor `format_status` redact secrets
+  - `printString`, `asJson` and actor state (`sys:get_state`, crash
+    reports) redact secrets
     (tokens, secrets, verifiers).
   - PKCE is always required (`require_pkce => true`); S256 only.
   - No HTTP call follows redirects (`HTTPClient` never does, so a
@@ -732,9 +734,13 @@ Resolved:
    0.1 sizes M. Device flow was added to 0.1 and then dropped entirely
    (see "Never" under Implementation). Confirmed 2026-11-09.
 
-7. `SessionStore` storage: Actor state (a `Dictionary`), no ETS. Native
-   apps hold a handful of sessions per process, and a consume inside the
-   actor is atomic for free. Decided 2026-11-09.
+7. `SessionStore` storage: a private ETS table owned by the actor. The
+   first plan was actor state (a `Dictionary`), but Beamtalk actors have
+   no `format_status/1` hook, so the sessions would show in
+   `sys:get_state` and crash reports. A private table is unreadable from
+   other processes, survives hot code reloading, and dies with the actor
+   (fail closed); a consume inside the actor is still atomic. Revised
+   2026-11-09 (BT-4559).
 8. Time: pure `TokenSet isExpiredAt:`/`needsRefreshAt:` plus
    `isExpired`/`needsRefresh` conveniences reading the system clock;
    `SessionStore spawnWith: #{#ttl => ..., #now => [...]}` for tests;
