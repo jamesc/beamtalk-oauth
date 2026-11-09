@@ -10,7 +10,7 @@ build:
 
 # Run the test suite
 test:
-    beamtalk test
+    beamtalk test --warnings-as-errors
 
 # Check formatting
 fmt:
