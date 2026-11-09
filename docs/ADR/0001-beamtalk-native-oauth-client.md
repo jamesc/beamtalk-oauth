@@ -388,11 +388,12 @@ typed Value subclass: OAuthError
 
 - **One HTTP stack: `http`/Mint.** The shim passes
   `request_opts => #{http_adapter => {beamtalk_oauth_http_adapter, Cfg}}`
-  on every `oidcc` call, so `oidcc` never touches `httpc`. The adapter
-  calls `HTTPClient`'s class-side `request:url:options:` from Erlang
-  through its generated module (`'bt@http@httpclient'`, language
-  ADR 0055) and converts the returned `Result` and `HTTPResponse` to
-  what `oidcc` expects. TLS verification, no-redirect behaviour,
+  on every `oidcc` call, so `oidcc` never touches `httpc` (a test guard
+  fails the suite on any `httpc:request` call). The adapter sends
+  `request:url:options:` to the `HTTPClient` class object passed in its
+  config (via `beamtalk_message_dispatch:send/3` until BT-4556 provides
+  a supported API) and converts the returned `Result` and
+  `HTTPResponse` to what `oidcc` expects. TLS verification, no-redirect behaviour,
   `#maxBodyBytes` and (later) proxy settings are then identical for
   every provider call.
 - **Proxies.** Desktop apps on corporate networks need them, and neither
@@ -759,6 +760,18 @@ Resolved:
 13. The fork: split into `rfc7009-revocation` (upstream PR candidate,
     held) and `rfc8628-device-flow` (parked). Neither is consumed by
     0.1. Decided 2026-11-09.
+
+## Implementation Tracking
+
+**Epic:** BT-4557
+**Issues:** BT-4558 (core values), BT-4559 (`SessionStore`), BT-4560
+(`LoopbackReceiver`), BT-4561 (native layer, `OAuthServer`, presets,
+fixture provider), BT-4562 (`OAuthFlows`), BT-4563 (revocation,
+`tokenInfo`), BT-4564 (`ProviderWorker`), BT-4565 (end-to-end test,
+examples, README)
+**Related (beamtalk):** BT-4556 (supported native-to-Beamtalk send
+API), BT-4555 (git sources in `[native.dependencies]`, optional)
+**Status:** Planned
 
 ## Migration Path
 
