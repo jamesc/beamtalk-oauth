@@ -1,0 +1,139 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+TestCase subclass: OAuthErrorTest
+
+  // A raw Erlang binary, as oidcc produces (distinct from a String).
+  bin: text => Binary fromIolist: #(text)
+
+  testLocalConstructors =>
+    self assert: (OAuthError transport: "x") code equals: "transport"
+    self assert: (OAuthError parse: "x") code equals: "parse"
+    self assert: (OAuthError config: "x") code equals: "config"
+    self assert: (OAuthError insecureEndpoint: "x") code equals: "insecure_endpoint"
+    self assert: OAuthError expiredSession code equals: "expired_session"
+    self assert: OAuthError reusedState code equals: "reused_state"
+    self assert: OAuthError sessionMismatch code equals: "session_mismatch"
+    self assert: OAuthError callbackTimeout code equals: "callback_timeout"
+
+  testLocalConstructorKeepsDescription =>
+    e := OAuthError transport: "connection refused"
+    self assert: e description equals: "connection refused"
+    self assert: e status equals: nil
+
+  testHttpErrorWithProviderCode =>
+    body := (#{} at: (self bin: "error") put: (self bin: "invalid_grant")) at: (self bin: "error_description") put: (self bin: "code expired")
+    e := OAuthError fromOidcc: {#http_error, 400, body}
+    self assert: e code equals: "invalid_grant"
+    self assert: e status equals: 400
+    self assert: e description equals: "code expired"
+
+  testHttpErrorWithStringKeys =>
+    e := OAuthError fromOidcc: {#http_error, 401, #{
+      "error" => "invalid_client"
+    }}
+    self assert: e code equals: "invalid_client"
+    self assert: e status equals: 401
+    self assert: e description equals: ""
+
+  testHttpErrorWithoutProviderCode =>
+    e := OAuthError fromOidcc: {#http_error, 500, self bin: "Internal Server Error"}
+    self assert: e code equals: "http_error"
+    self assert: e status equals: 500
+
+  testAtomReason =>
+    self assert: (OAuthError fromOidcc: #token_expired) code equals: "token_expired"
+    self assert: (OAuthError fromOidcc: #no_supported_auth_method) code equals: "no_supported_auth_method"
+
+  testTupleReason =>
+    claims := #{} at: (self bin: "sub") put: (self bin: "1234")
+    e := OAuthError fromOidcc: {#missing_claim, {self bin: "aud", self bin: "app"}, claims}
+    self assert: e code equals: "missing_claim"
+
+  testWrappedErrorTupleIsUnwrapped =>
+    self assert: (OAuthError fromOidcc: {#error, #sub_invalid}) code equals: "sub_invalid"
+
+  testAnythingElseIsTransport =>
+    self assert: (OAuthError fromOidcc: 42) code equals: "transport"
+    self assert: (OAuthError fromOidcc: (self bin: "boom")) code equals: "transport"
+    self assert: (OAuthError fromOidcc: {1, 2}) code equals: "transport"
+
+  testDetailRedactsClaimsMap =>
+    claims := (#{} at: (self bin: "sub") put: (self bin: "1234")) at: (self bin: "email") put: (self bin: "alice@example.com")
+    e := OAuthError fromOidcc: {#missing_claim, {self bin: "aud", self bin: "app"}, claims}
+    self assert: (e detail at: 1) equals: #missing_claim
+    self assert: (e detail at: 3) equals: "[redacted]"
+    self deny: (e detail printString includesSubstring: "alice@example.com")
+
+  testDetailRedactsJwt =>
+    jwt := self bin: "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"
+    e := OAuthError fromOidcc: {#token_invalid, jwt}
+    self assert: (e detail at: 2) equals: "[redacted]"
+
+  testDetailRedactsOpaqueToken =>
+    e := OAuthError fromOidcc: {#bad_token, self bin: "glpat-abcdefghij1234567890"}
+    self assert: (e detail at: 2) equals: "[redacted]"
+
+  testDetailRedactsSecretNamedMembers =>
+    body := (#{} at: (self bin: "access_token") put: (self bin: "short")) at: (self bin: "token_type") put: (self bin: "bearer")
+    e := OAuthError fromOidcc: {#http_error, 200, body}
+    redactedBody := e detail at: 3
+    self assert: (redactedBody at: (self bin: "access_token")) equals: "[redacted]"
+    self assert: ((redactedBody at: (self bin: "token_type")) =:= (self bin: "bearer"))
+
+  testDetailRedactsInvalidUtf8 =>
+    e := OAuthError fromOidcc: {#odd, Erlang erlang list_to_binary: #(255, 254, 253)}
+    self assert: (e detail at: 2) equals: "[redacted]"
+
+  testDetailKeepsHarmlessValues =>
+    e := OAuthError fromOidcc: {#issuer_mismatch, self bin: "https://gitlab.com", #(1, 2)}
+    self assert: ((e detail at: 2) =:= (self bin: "https://gitlab.com"))
+    self assert: (e detail at: 3) equals: #(1, 2)
+
+  testPrintStringOmitsDetail =>
+    jwt := self bin: "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"
+    e := OAuthError fromOidcc: {#token_invalid, jwt}
+    self deny: (e printString includesSubstring: "eyJ")
+    self assert: (e printString includesSubstring: "token_invalid")
+
+  testDetailRedactsNonAlphabetSecret =>
+    e := OAuthError fromOidcc: {#bad, self bin: "p@ss!w0rd#secret-value-xyz"}
+    self assert: (e detail at: 2) equals: "[redacted]"
+
+  testDetailRedactsBearerHeader =>
+    e := OAuthError fromOidcc: {#bad, self bin: "Bearer abc"}
+    self assert: (e detail at: 2) equals: "[redacted]"
+
+  testDetailRedactsEmbeddedJwt =>
+    e := OAuthError fromOidcc: {#bad, self bin: "token was eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiIxIn0 rejected"}
+    self assert: (e detail at: 2) equals: "[redacted]"
+
+  testDetailRedactsCallbackUrl =>
+    e := OAuthError fromOidcc: {#bad, self bin: "https://app/cb?code=abc&state=xyz"}
+    self assert: (e detail at: 2) equals: "[redacted]"
+
+  testDetailRedactsSecretRecords =>
+    e := OAuthError fromOidcc: {#bad, {#oidcc_token, 1, 2, 3}, {#oidcc_client_context, #x}, {#jose_jwk, #y}}
+    self assert: (e detail at: 2) equals: "[redacted]"
+    self assert: (e detail at: 3) equals: "[redacted]"
+    self assert: (e detail at: 4) equals: "[redacted]"
+
+  testDetailRedactsKeywordListPairs =>
+    e := OAuthError fromOidcc: {#bad, #({#client_secret, self bin: "s"}, {#scope, #openid})}
+    self assert: (e detail at: 2) equals: #({#client_secret, "[redacted]"}, {#scope, #openid})
+
+  testDetailRedactsClaimsWithoutSub =>
+    claims := #{} at: (self bin: "email") put: (self bin: "alice@example.com")
+    e := OAuthError fromOidcc: {#missing_claim, {self bin: "sub", #undefined}, claims}
+    self assert: (e detail at: 3) equals: "[redacted]"
+
+  testNestedErrorTuplesAreUnwrapped =>
+    self assert: (OAuthError fromOidcc: {#error, {#error, #sub_invalid}}) code equals: "sub_invalid"
+
+  testNonReasonAtomsAreTransport =>
+    self assert: (OAuthError fromOidcc: #undefined) code equals: "transport"
+    self assert: (OAuthError fromOidcc: false) code equals: "transport"
+
+  testJsonGenerateHidesDetailSecrets =>
+    e := OAuthError fromOidcc: {#bad, self bin: "glpat-abcdefghij1234567890"}
+    self deny: ((Json generate: e) includesSubstring: "glpat")
