@@ -24,7 +24,7 @@
 /// `#maxSessions` (the most sessions held at once, 10,000 by default; see
 /// "Size cap"), `#sweepEvery` (store calls between sweeps, 64 by default;
 /// see "Expiry and the sweep") and `#now` (a block answering the time in
-/// milliseconds, for tests). By
+/// milliseconds, for tests; it must not run backwards). By
 /// default TTLs run on the monotonic clock, so wall-clock steps neither
 /// extend nor cut short a session, and `createdAt` is stamped in Unix
 /// milliseconds; with `#now`, both use the injected clock.
@@ -34,8 +34,10 @@
 /// `consume:boundTo:` removes the session it finds before checking it, so
 /// a probed, mismatched or expired state can never be retried. The binding
 /// is checked before expiry, so a caller with the wrong binding learns
-/// only `session_mismatch`, never the session's age. Apps should show the
-/// user one generic failure and log the specific code.
+/// only `session_mismatch`, never whether the session expired. (A session
+/// past the grace below answers `reused_state` to everyone, exactly as if
+/// it had been swept.) Apps should show the user one generic failure and
+/// log the specific code.
 ///
 /// ## Expiry and the sweep
 ///
@@ -48,29 +50,38 @@
 /// `consume:boundTo:`, `issueTicket:forState:`, `redeemTicket:forState:`)
 /// runs one `ets:select_delete/2` per table on the creation stamp, dropping
 /// the sessions and tickets past the grace, so abandoned attempts cannot
-/// accumulate. The sweep runs inside ETS without copying rows into the
-/// actor, and only once per `#sweepEvery` calls, so the other calls cost
-/// O(1). A full store also sweeps before it refuses anything.
+/// accumulate. The sweep scans the table inside ETS without copying rows
+/// into the actor, and runs once per `#sweepEvery` calls, so a call costs
+/// amortised O(n / `#sweepEvery`) rather than O(n). A full store also
+/// sweeps before it refuses (see "Size cap").
 ///
 /// ## Size cap
 ///
 /// `#maxSessions` bounds the sessions held, so a server-side web app that
 /// creates a session on an unauthenticated `GET /login` cannot be grown
-/// without bound. When the store is full, `create:boundTo:` sweeps; if it
-/// is still full it answers `session_store_full` and stores nothing. It
-/// then notes when its oldest session will go stale and refuses without
-/// sweeping until that time, so a flood against a full store costs O(1)
-/// per refused call rather than a sweep each.
+/// without bound. When the store is full, `create:boundTo:` first drops
+/// every expired session, not only those past the grace: an expired
+/// session can never complete a login, so dropping it breaks nothing. If
+/// the store is still full it answers `session_store_full` and stores
+/// nothing.
 ///
-/// The store rejects new logins rather than evicting old sessions.
+/// That sweep scans the table, so a full store does not repeat it on
+/// every refused call. It sweeps again only once its oldest session has
+/// expired, and at most once per tenth of a TTL (one minute by default),
+/// so a flood against a full store costs O(1) per refused call. The price
+/// is that a slot freed by expiry can stay unused for up to that tenth
+/// of a TTL; a slot freed by `consume:boundTo:` is reused at once.
+///
+/// The store rejects new logins rather than evicting live sessions.
 /// Evicting the oldest session would let a flood push out a user who is
 /// already mid-login, whose callback would then fail with `reused_state`.
-/// Rejecting means a flood can block new logins until its own sessions
-/// age out, but it cannot break a login already started, and the failure
-/// is visible: monitor `session_store_full` and `size`. `consume:boundTo:`
-/// is never refused, so logins in flight still complete when the store is
-/// full, and each one frees a slot. The cap is a backstop, not a rate
-/// limit: rate-limit login starts in the web layer.
+/// Rejecting means a flood can block new logins for as long as it keeps
+/// the store full (each of its sessions holds a slot for one TTL), but it
+/// cannot break a login already started, and the failure is visible:
+/// monitor `session_store_full` and `size`. `consume:boundTo:` is never
+/// refused, so logins in flight still complete when the store is full,
+/// and each one frees a slot. The cap is a backstop, not a rate limit:
+/// rate-limit login starts in the web layer.
 ///
 /// Callback tickets have their own cap, also `#maxSessions`, counted
 /// apart from sessions (`ticketCount`). Each ticket stands for a session
@@ -79,8 +90,10 @@
 /// a cap a loop of login and callback could grow the ticket table without
 /// bound. Counting them apart keeps a full session table from failing the
 /// callback of a login already in flight. When the ticket table is full
-/// after a sweep, `issueTicket:forState:` answers `session_store_full`,
-/// and so does `OAuthFlows handleCallback:store:boundTo:`.
+/// after a sweep, `issueTicket:forState:` answers `session_store_full`.
+/// `OAuthFlows handleCallback:store:boundTo:` asks `hasTicketRoom` before
+/// it consumes the session, so a full ticket table refuses the callback
+/// with `session_store_full` but leaves the session for a retry.
 ///
 /// ## Callback tickets
 ///
@@ -132,8 +145,8 @@ typed Actor subclass: SessionStore
   state: sweepEvery :: Integer = 64
   /// Store calls since the last sweep.
   state: calls :: Integer = 0
-  /// Per full table, the stamp before which no sweep can free a row: its
-  /// oldest row's stamp plus two TTLs. See "Size cap".
+  /// Per table, the stamp before which a full table refuses without
+  /// sweeping. See "Size cap".
   state: fullUntil :: Dictionary = #{}
 
   /// The default session lifetime: 10 minutes, in milliseconds.
@@ -246,6 +259,12 @@ typed Actor subclass: SessionStore
   /// swept. For tests and monitoring.
   ticketCount -> Integer => Erlang ets info: self.tickets with: #size
 
+  /// Whether `issueTicket:forState:` would record a ticket now, sweeping a
+  /// full ticket table as it would. Lets `OAuthFlows handleCallback:store:boundTo:`
+  /// refuse before it burns the session; another callback can still take
+  /// the last slot in between, and then `issueTicket:forState:` refuses.
+  hasTicketRoom -> Boolean => self hasRoomIn: self.tickets at: self clock
+
   /// Record `ticket`, a single-use proof that the session with `state`
   /// was consumed by `OAuthFlows handleCallback:store:boundTo:`. Kept as
   /// SHA-256 digests, like sessions, and expiring after the same TTL.
@@ -322,22 +341,31 @@ typed Actor subclass: SessionStore
   internal isStale: created :: Integer at: stamp :: Integer -> Boolean =>
     created <= (stamp - (2 * self.ttl))
 
-  /// Whether `table` holds fewer than `#maxSessions` rows at `stamp`,
-  /// sweeping first when it is full.
+  /// Whether `table` holds fewer than `#maxSessions` rows at `stamp`.
   ///
-  /// A sweep that frees nothing records when the oldest row will go stale,
-  /// and until then a full table refuses without sweeping again, so a
-  /// flood against a full store costs O(1) per refused call. Rows are
-  /// stamped in clock order, so no later row can go stale first.
+  /// A full table drops its expired rows, then records in `fullUntil` when
+  /// to try again: a tenth of a TTL later, or when its oldest row expires
+  /// if it is still full and that is later. Until then it refuses without
+  /// sweeping, so a flood against a full store costs O(1) per refused
+  /// call. Rows are stamped in clock order, so no later row expires first.
+  /// A `fullUntil` more than a TTL ahead can only come from a clock that
+  /// ran backwards, and is ignored.
   internal hasRoomIn: table :: Object at: stamp :: Integer -> Boolean =>
     (Erlang ets info: table with: #size) < self.maxSessions ifTrue: [^true]
     until := self.fullUntil at: table ifAbsent: [nil]
-    (until notNil and: [stamp < until]) ifTrue: [^false]
-    self sweepAt: stamp
-    (Erlang ets info: table with: #size) < self.maxSessions ifTrue: [^true]
-    stamps := Erlang ets select: table with: #({#'$1', #(), #({#element, 2, #'$1'})})
-    self.fullUntil := self.fullUntil at: table put: (Erlang lists min: stamps) + (2 * self.ttl)
-    false
+    ((until notNil and: [
+      stamp < until
+    ]) and: [until - stamp <= self.ttl]) ifTrue: [^false]
+    self sweep: table before: stamp - self.ttl
+    room := (Erlang ets info: table with: #size) < self.maxSessions
+    next := stamp + ((self.ttl div: 10) max: 1)
+    room
+      ifFalse: [
+        stamps := Erlang ets select: table with: #({#'$1', #(), #({#element, 2, #'$1'})})
+        next := next max: (Erlang lists min: stamps) + self.ttl
+      ]
+    self.fullUntil := self.fullUntil at: table put: next
+    room
 
   /// Drop the sessions and tickets that are stale at `stamp` (see
   /// `isStale:at:`), with one `ets:select_delete/2` per table on the
@@ -345,10 +373,15 @@ typed Actor subclass: SessionStore
   /// count.
   internal sweepAt: stamp :: Integer -> Nil =>
     cutoff := stamp - (2 * self.ttl)
-    stale := #({#'$1', #({#'=<', {#element, 2, #'$1'}, cutoff}), #(true)})
-    Erlang ets select_delete: self.table with: stale
-    Erlang ets select_delete: self.tickets with: stale
+    self sweep: self.table before: cutoff
+    self sweep: self.tickets before: cutoff
     self.calls := 0
+    nil
+
+  /// Drop the rows of `table` stamped at or before `cutoff`, with one
+  /// `ets:select_delete/2` on the stamp (each row's second element).
+  internal sweep: table :: Object before: cutoff :: Integer -> Nil =>
+    Erlang ets select_delete: table with: #({#'$1', #({#'=<', {#element, 2, #'$1'}, cutoff}), #(true)})
     nil
 
   /// The table key for `state`: its SHA-256 digest, a raw binary (a

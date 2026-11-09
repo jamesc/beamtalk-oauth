@@ -202,8 +202,8 @@ TestCase subclass: OAuthFlowsTest
       store: store
       boundTo: self.binding
     self assert: (self codeOf: got) equals: "session_store_full"
-    // The session is burned all the same.
-    self assert: store size equals: 0
+    // The session is left for a retry once a ticket slot frees up.
+    self assert: store size equals: 1
     store stop
 
   testHandleCallbackAcceptsQueryStringAndUrl =>

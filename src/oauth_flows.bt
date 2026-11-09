@@ -189,8 +189,9 @@ Object subclass: OAuthFlows
   ///   `reused_state`, `expired_session`), and an `iss` parameter
   ///   (RFC 9207) must equal the session's issuer (`issuer_mismatch`).
   /// - A store already holding its cap of callback tickets answers
-  ///   `session_store_full` (`SessionStore issueTicket:forState:`); the
-  ///   session is burned by then.
+  ///   `session_store_full` (`SessionStore hasTicketRoom`) before the
+  ///   session is consumed, so the login can be retried; this is the one
+  ///   failure that does not burn the session.
   ///
   /// Text taken from the callback (`iss`, `error_description`, an
   /// unregistered error code) is stripped of control characters and cut
@@ -209,6 +210,13 @@ Object subclass: OAuthFlows
         ^Result error: parsed
       ]
     state := parsed at: "state" ifAbsent: [""]
+    // A full ticket table would refuse the ticket after the session is
+    // burned: refuse first, and leave the session for a retry.
+    (state isEmpty not and: [
+      (parsed at: "error" ifAbsent: [nil]) isNil
+    ]) ifTrue: [
+      store hasTicketRoom ifFalse: [^Result error: OAuthError sessionStoreFull]
+    ]
     burned := state isEmpty ifTrue: [
       nil
     ] ifFalse: [store consume: state boundTo: binding]

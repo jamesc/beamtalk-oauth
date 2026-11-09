@@ -320,14 +320,25 @@ TestCase subclass: SessionStoreTest
     // Nothing was stored for the refused login.
     self assert: (store consume: extra state boundTo: self.binding) error code equals: "reused_state"
 
-  testCapDoesNotEvictLiveSessions =>
+  testCapKeepsLiveSessions =>
     clock := FakeClock spawnWith: #{#time => 0}
     store := self storeWith: clock options: #{#maxSessions => 1}
     store create: self.session boundTo: self.binding
-    // Expired but within the grace: still held, so still counted.
-    clock time: 1500
+    clock time: 999
     self assert: (store create: self otherSession boundTo: self.binding) error code equals: "session_store_full"
-    self assert: (store consume: self.session state boundTo: self.binding) error code equals: "expired_session"
+    self assert: (store consume: self.session state boundTo: self.binding) isOk
+
+  testFullStoreDropsExpiredSessions =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock options: #{#maxSessions => 1}
+    store create: self.session boundTo: self.binding
+    // Expired, though within the grace: it can never complete, so a full
+    // store drops it to make room.
+    clock time: 1000
+    fresh := self otherSession
+    self assert: (store create: fresh boundTo: self.binding) isOk
+    self assert: (store consume: self.session state boundTo: self.binding) error code equals: "reused_state"
+    self assert: (store consume: fresh state boundTo: self.binding) isOk
 
   testSweepFreesRoomWhenFull =>
     clock := FakeClock spawnWith: #{#time => 0}
@@ -342,25 +353,56 @@ TestCase subclass: SessionStoreTest
     self assert: store size equals: 1
     self assert: (store consume: fresh state boundTo: self.binding) isOk
 
-  testFullStoreSkipsSweepUntilOldestGoesStale =>
+  testFullStoreSkipsSweepUntilOldestExpires =>
     clock := FakeClock spawnWith: #{#time => 0}
     store := self storeWith: clock options: #{#maxSessions => 2}
     store create: self.session boundTo: self.binding
     clock time: 500
     second := self otherSession
     store create: second boundTo: self.binding
+    clock time: 600
+    self assert: (store create: self otherSession boundTo: self.binding) error code equals: "session_store_full"
+    // The oldest session expires at 0 + ttl: refused without a sweep until
+    // then.
+    self assert: (store fieldAt: #fullUntil) values asList equals: #(1000)
+    clock time: 999
+    self assert: (store create: self otherSession boundTo: self.binding) error code equals: "session_store_full"
     clock time: 1000
-    self assert: (store create: self otherSession boundTo: self.binding) error code equals: "session_store_full"
-    // The oldest row goes stale at 0 + 2 * ttl: refused until then.
-    self assert: (store fieldAt: #fullUntil) values asList equals: #(2000)
-    clock time: 1999
-    self assert: (store create: self otherSession boundTo: self.binding) error code equals: "session_store_full"
-    clock time: 2000
     third := self otherSession
     self assert: (store create: third boundTo: self.binding) isOk
     self assert: store size equals: 2
-    self assert: (store consume: second state boundTo: self.binding) error code equals: "expired_session"
+    // Full again: the next sweep waits a tenth of a TTL, though `second`
+    // expires first.
+    self assert: (store fieldAt: #fullUntil) values asList equals: #(1100)
+    clock time: 1050
+    self assert: (store create: self otherSession boundTo: self.binding) error code equals: "session_store_full"
+    clock time: 1500
+    self assert: (store create: self otherSession boundTo: self.binding) isOk
+    self assert: (store consume: second state boundTo: self.binding) error code equals: "reused_state"
     self assert: (store consume: third state boundTo: self.binding) isOk
+
+  testConsumeFreesSlotBeforeFullUntil =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock options: #{#maxSessions => 1}
+    store create: self.session boundTo: self.binding
+    late := self otherSession
+    self assert: (store create: late boundTo: self.binding) error code equals: "session_store_full"
+    store consume: self.session state boundTo: self.binding
+    // fullUntil is far off, but the store has room: no sweep needed.
+    self assert: (store create: late boundTo: self.binding) isOk
+    self assert: (store create: self otherSession boundTo: self.binding) error code equals: "session_store_full"
+    self assert: (store consume: late state boundTo: self.binding) isOk
+
+  testFullUntilIsPerTable =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock options: #{#maxSessions => 1}
+    store create: self.session boundTo: self.binding
+    self assert: (store create: self otherSession boundTo: self.binding) isError
+    // A full session table does not hold back tickets.
+    self assert: store hasTicketRoom
+    store issueTicket: Secrets generate forState: self.session state
+    self deny: store hasTicketRoom
+    self assert: (store fieldAt: #fullUntil) size equals: 2
 
   testConsumeWorksWhenFull =>
     store := SessionStore spawnWith: #{#maxSessions => 1}
@@ -390,7 +432,7 @@ TestCase subclass: SessionStoreTest
     clock := FakeClock spawnWith: #{#time => 0}
     store := self storeWith: clock options: #{#maxSessions => 1}
     store issueTicket: Secrets generate forState: self.session state
-    clock time: 2000
+    clock time: 1000
     self assert: (store issueTicket: Secrets generate forState: self.session state) isOk
     self assert: store ticketCount equals: 1
 
