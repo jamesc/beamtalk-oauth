@@ -19,7 +19,8 @@ as a map. Requests are tagged on the way out; responses are converted
 back to the `httpc` shape `oidcc` expects: lowercase charlist header names
 and a binary body.
 
-Every failure answers `{error, {http_client, Reason}}`, where `Reason` is
+Every failure but a `response_check` refusal (below) answers
+`{error, {http_client, Reason}}`, where `Reason` is
 the `HTTPClient` error's message (a binary) or a fixed atom. It never
 carries the request: no URL query, headers or body, which hold codes,
 secrets and tokens.
@@ -29,6 +30,13 @@ response is also kept in the calling process's dictionary under
 `beamtalk_oauth_captured_body` (see `take_captured/0`). The shim uses
 this for refresh: `oidcc_token:refresh/3` discards a response that has
 no ID token, and the shim must still read it.
+
+With `response_check => Fun` in the config, each response is passed to
+`Fun(Method, Url, {ok, Response}, AllowUnsafe)` before `oidcc` sees it;
+an `{error, Reason}` from it is answered as is (not wrapped in
+`http_client`). The shim uses this to HTTPS-check the distributed-claim
+endpoints a userinfo response names before `oidcc` fetches them
+(`beamtalk_oauth_oidcc:check_claim_sources/2`).
 
 Every URL must be HTTPS (`{error, {http_client, insecure_url}}`
 otherwise), whatever `oidcc` accepted: `oidcc` itself takes a plain-HTTP
@@ -77,7 +85,7 @@ malformed_headers | unsupported_ssl_options | insecure_url}}`); any crash answer
 """.
 -spec request(Method, Request, HttpOptions, RequestOptions, Config) ->
     {ok, {{string(), non_neg_integer(), string()}, [{string(), string()}], binary()}}
-    | {error, {http_client, term()}}
+    | {error, {http_client, term()} | {insecure_endpoint, atom(), term()}}
 when
     Method :: oidcc_http_adapter:method(),
     Request :: oidcc_http_adapter:request(),
@@ -86,7 +94,9 @@ when
     Config :: #{
         client := term(),
         max_body_bytes => non_neg_integer() | unlimited,
-        allow_unsafe_http => boolean()
+        allow_unsafe_http => boolean(),
+        capture => boolean(),
+        response_check => fun((atom(), term(), {ok, term()}, boolean()) -> ok | {error, term()})
     }.
 request(Method, Request, HttpOptions, _RequestOptions, #{client := Client} = Config) ->
     %% Everything runs inside the try: a crash anywhere here (a header
@@ -119,10 +129,20 @@ do_request(Method, Request, HttpOptions, Client, Config) ->
             beamtalk_message_dispatch:send(Client, 'request:url:options:', [Method, str(Url), Opts])
         ),
         capture(Method, Answer, Config),
+        ok ?= check_response(Method, Url, Answer, Config),
         Answer
     else
+        {error, {insecure_endpoint, _, _}} = Refused -> Refused;
         {error, Reason} -> {error, {http_client, Reason}}
     end.
+
+%% The config's `response_check`, if any, on a response that arrived.
+check_response(Method, Url, {ok, _} = Answer, #{response_check := Check} = Config) when
+    is_function(Check, 4)
+->
+    Check(Method, Url, Answer, unsafe(Config));
+check_response(_Method, _Url, _Answer, _Config) ->
+    ok.
 
 capture(post, {ok, {_Status, _Headers, Body}}, #{capture := true}) ->
     put(?CAPTURE_KEY, Body),

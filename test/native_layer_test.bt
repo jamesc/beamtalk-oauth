@@ -215,6 +215,39 @@ TestCase subclass: NativeLayerTest
     checked := Erlang beamtalk_oauth_oidcc check_https: endpoints with: false
     self assert: (OAuthError fromOidcc: checked error) code equals: "insecure_endpoint"
 
+  testClaimSourceCheck =>
+    // Claims as oidcc has them: decoded JSON, raw binary keys.
+    claims := [:endpoint |
+      Erlang json
+        decode: (self
+          bin: (Json
+            generate: #{
+              "sub" => "user-1",
+              "_claim_sources" => #{
+                "a" => #{"JWT" => "e30.e30.sig"},
+                "b" => #{"endpoint" => endpoint, "access_token" => "x"}
+              }
+            }))
+    ]
+    check := [:endpoint :unsafe |
+      Erlang beamtalk_oauth_oidcc check_claim_sources: (claims value: endpoint) with: unsafe
+    ]
+    self assert: (check value: "https://claims.test/b" value: false) isOk
+    insecure := check value: "http://claims.test/b" value: false
+    err := OAuthError fromOidcc: insecure error
+    self assert: err code equals: "insecure_endpoint"
+    self assert: err description equals: "claim_source must be https: http://claims.test/b"
+    // The loopback opt-in applies, as for every other endpoint.
+    self assert: (check value: "http://127.0.0.1:1/b" value: true) isOk
+    self assert: (check value: "http://127.0.0.1:1/b" value: false) isError
+    self assert: (check value: "http://claims.test/b" value: true) isError
+    // No sources, or claims that are not a map: nothing to check.
+    noSources := Erlang json decode: (self bin: (Json generate: #{
+      "sub" => "u"
+    }))
+    self assert: (Erlang beamtalk_oauth_oidcc check_claim_sources: noSources with: false) isOk
+    self assert: (Erlang beamtalk_oauth_oidcc check_claim_sources: #(1, 2) with: false) isOk
+
   testClockSkewIsSet =>
     skew := (Erlang application get_env: #oidcc with: #max_clock_skew) unwrap
     self assert: skew equals: 60

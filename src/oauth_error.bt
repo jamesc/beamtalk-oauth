@@ -94,6 +94,13 @@ typed Value subclass: OAuthError
   /// `undefined`, `true` and `false` are not reasons and answer `transport`.
   /// `detail` always holds the redacted original term (see `redact:`).
   class fromOidcc: reason :: Object -> OAuthError =>
+    self fromOidcc: reason secrets: #()
+
+  /// As `fromOidcc:`, with every text in the reason that contains one of
+  /// `secrets` (the tokens and client secret the request carried) replaced
+  /// by the marker first (see `scrub:secrets:`), so a provider error that
+  /// echoes a token cannot carry it into `description` or `detail`.
+  class fromOidcc: reason :: Object secrets: secrets :: List(String) -> OAuthError =>
     // An FFI `{error, R}` arrives as `Result error:` an Exception whose
     // `reason` is `R`.
     term := (reason isKindOf: Exception) ifTrue: [
@@ -104,6 +111,7 @@ typed Value subclass: OAuthError
         (term size =:= 2) and: [(term at: 1) =:= #error]
       ]
     ] whileTrue: [term := term at: 2]
+    term := self scrub: term secrets: secrets
     detail := self redact: term
     tag := (term isKindOf: Symbol)
       ifTrue: [term]
@@ -211,6 +219,49 @@ typed Value subclass: OAuthError
 
   /// The marker that replaces redacted values.
   class redacted -> String => "[redacted]"
+
+  /// `term` with every text (String or raw binary) that contains one of
+  /// `secrets`, raw or URL-encoded, replaced by the marker, at any depth
+  /// of tuples, lists and map values. Empty secrets are ignored.
+  class scrub: term :: Object secrets: secrets :: List(String) -> Dynamic =>
+    secrets isEmpty ifTrue: [^term]
+    (term isKindOf: Binary)
+      ifTrue: [
+        text := self textOf: term
+        ^(text notNil and: [
+          self mentions: text secrets: secrets
+        ]) ifTrue: [self redacted] ifFalse: [term]
+      ]
+    (term isKindOf: Tuple)
+      ifTrue: [
+        ^Tuple withAll: ((1 to: term size) collect: [:i |
+          self scrub: (term at: i) secrets: secrets
+        ])
+      ]
+    @expect type
+    (term isKindOf: List) ifTrue: [
+      ^term collect: [:each | self scrub: each secrets: secrets]
+    ]
+    (term isKindOf: Dictionary) ifFalse: [^term]
+    out := #{}
+    @expect type
+    term keysAndValuesDo: [:k :v |
+      out := out at: k put: (self scrub: v secrets: secrets)
+    ]
+    out
+
+  /// True when `text` contains a non-empty member of `secrets`, raw or
+  /// URL-encoded.
+  class mentions: text :: String secrets: secrets :: List(String) -> Boolean =>
+    secrets
+      anySatisfy: [:secret |
+        secret isEmpty not
+          and: [
+            (text includesSubstring: secret) or: [
+              text includesSubstring: secret urlEncoded
+            ]
+          ]
+      ]
 
   /// `term` with secrets removed, for `detail` and logs. Redaction errs
   /// towards hiding: the marker `"[redacted]"` replaces

@@ -382,7 +382,9 @@ Object subclass: OAuthFlows
   /// Then `oidcc_token:retrieve` sends the code with the PKCE verifier and
   /// client authentication, and validates the ID token, including the
   /// session's nonce (`missing_claim` on a mismatch) and audience. Provider
-  /// errors pass through verbatim (`invalid_grant`, ...). A response
+  /// errors pass through verbatim (`invalid_grant`, ...), except that any
+  /// text echoing the code, the PKCE verifier or the client secret is
+  /// redacted. A response
   /// without an ID token answers `missing_id_token`. Answers a `TokenSet`
   /// with the validated `idTokenClaims`, the raw `idToken`, and
   /// `obtainedAt` stamped when the request was sent.
@@ -407,9 +409,12 @@ Object subclass: OAuthFlows
       retrieve_token: server context
       with: (self clientOf: reg)
       with: params
+    secrets := self secretsOf: #(cb code, sess codeVerifier, reg clientSecret)
     found ifOk: [:toks |
       Result ok: (self tokenSetFrom: toks obtainedAt: sentAt)
-    ] ifError: [:reason | Result error: (OAuthError fromOidcc: reason)]
+    ] ifError: [:reason |
+      Result error: (OAuthError fromOidcc: reason secrets: secrets)
+    ]
 
   // ===== Refresh =====
 
@@ -430,7 +435,8 @@ Object subclass: OAuthFlows
   /// Answers `toks mergedWith:` the response: new values win, and the old
   /// refresh token, scope and ID token (raw JWT and claims together) carry
   /// forward when the response omits them. Store the answer; the old
-  /// refresh token may be spent.
+  /// refresh token may be spent. An error that echoes the tokens or the
+  /// client secret has them redacted.
   class refresh: server :: OAuthServer client: reg :: ClientRegistration tokenSet: toks :: TokenSet -> Result(TokenSet, OAuthError) =>
     refreshToken := toks refreshToken
     (refreshToken isNil or: [
@@ -452,11 +458,14 @@ Object subclass: OAuthFlows
       refresh_token: server context
       with: (self clientOf: reg)
       with: params
+    secrets := self secretsOf: #(refreshToken, toks accessToken, reg clientSecret)
     found
       ifOk: [:fresh |
         Result ok: (toks mergedWith: (self tokenSetFrom: fresh obtainedAt: sentAt))
       ]
-      ifError: [:reason | Result error: (OAuthError fromOidcc: reason)]
+      ifError: [:reason |
+        Result error: (OAuthError fromOidcc: reason secrets: secrets)
+      ]
 
   // ===== Userinfo =====
 
@@ -501,7 +510,10 @@ Object subclass: OAuthFlows
   /// (`config` / `issuer_mismatch` / `session_mismatch`, before any
   /// network call). A provider without a userinfo endpoint answers
   /// `no_userinfo_endpoint`. The answer's `sub` must equal `toks subject`
-  /// (`bad_subject` otherwise). Answers the claims with String keys.
+  /// (`bad_subject` otherwise). A distributed-claim source endpoint
+  /// (`_claim_sources`) that is not HTTPS answers `insecure_endpoint`
+  /// before any source is fetched. An error that echoes the tokens or the
+  /// client secret has them redacted. Answers the claims with String keys.
   class userInfo: server :: OAuthServer client: reg :: ClientRegistration tokenSet: toks :: TokenSet -> Result(Dictionary, OAuthError) =>
     toks accessToken isEmpty ifTrue: [
       ^Result error: (OAuthError config: "the token set has no access token")
@@ -520,9 +532,12 @@ Object subclass: OAuthFlows
       userinfo: server context
       with: (self clientOf: reg)
       with: params
+    secrets := self secretsOf: #(toks accessToken, toks refreshToken, reg clientSecret)
     found ifOk: [:claims |
       Result ok: claims
-    ] ifError: [:reason | Result error: (OAuthError fromOidcc: reason)]
+    ] ifError: [:reason |
+      Result error: (OAuthError fromOidcc: reason secrets: secrets)
+    ]
 
   // ===== Revocation and token info =====
 
@@ -597,6 +612,11 @@ Object subclass: OAuthFlows
         ^OAuthError code: "session_mismatch" description: "the tokens were not issued to client {reg clientId}"
       ]
     nil
+
+  /// The non-empty Strings of `candidates`: the secrets a request
+  /// carried, to scrub from its error (`OAuthError fromOidcc:secrets:`).
+  class secretsOf: candidates :: List -> List(String) =>
+    candidates select: [:each | (each isKindOf: String) and: [each isEmpty not]]
 
   /// The shim's client map for `reg`.
   class clientOf: reg :: ClientRegistration -> Dictionary =>
