@@ -10,6 +10,8 @@ TestCase subclass: ProviderPresetsTest
     self assert: (p at: #tokenInfoEndpoint) equals: "https://gitlab.com/oauth/token/info"
     self assert: (p at: #tokenInfoAuth) equals: #bearer
     self assert: ((p at: #tokenInfoFields) at: #subject) equals: "resource_owner_id"
+    self assert: (p at: #revocationPath) equals: "/oauth/revoke"
+    self assert: (p at: #tokenInfoPath) equals: "/oauth/token/info"
     methods := (p at: #documentOverrides) at: "token_endpoint_auth_methods_supported"
     self assert: (methods includes: "none")
     self assert: (methods includes: "client_secret_basic")
