@@ -1,0 +1,10 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+/// ProviderWorkerSup — an app supervisor with one `ProviderWorker` child,
+/// as the `ProviderWorker` class comment shows. Its start args (`self
+/// args`) are the worker's: `#{#issuer => ..., #options => ...}`.
+Supervisor subclass: ProviderWorkerSup
+
+  childSpecs =>
+    #(((ProviderWorker supervisionSpecFor: self args) withId: #provider withRestart: #permanent))

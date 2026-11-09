@@ -82,8 +82,10 @@ typed Value subclass: OAuthServer
   /// - `#maxBodyBytes` — the response cap (default 1 MiB);
   /// - `#timeout` — per-request timeout in milliseconds;
   /// - `#allowUnsafeHttp` — `true` accepts plain-HTTP endpoints. **Tests
-  ///   only**: the fixture provider is plain HTTP. Never set it for a real
-  ///   provider.
+  ///   only**: the fixture provider is plain HTTP. It also needs the
+  ///   application flag `beamtalk_oauth` / `allow_unsafe_http_for_tests`
+  ///   (`FixtureProvider start` sets it); without it the answer is
+  ///   `unsafe_http_disabled`. Never set either for a real provider.
   ///
   /// An unknown option raises.
   class fromDiscovery: issuer :: String preset: preset :: Dictionary options: opts :: Dictionary -> Result(OAuthServer, OAuthError) =>
