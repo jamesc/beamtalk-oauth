@@ -11,6 +11,15 @@
 /// `revocationEndpoint` from the discovery document, else the preset;
 /// `tokenInfoEndpoint` from the preset (no standard names it).
 ///
+/// The preset's absolute endpoints (`#revocationEndpoint`,
+/// `#tokenInfoEndpoint`) belong to its `#issuer`, so they are used only
+/// when the discovered issuer is that issuer. For any other issuer (a
+/// self-hosted GitLab discovered with `ProviderPresets gitlab`, say) they
+/// are derived from the discovered issuer via the preset's `#revocationPath`
+/// and `#tokenInfoPath`, or left nil, so one issuer's tokens never go to
+/// the preset issuer's endpoints. To point at a different endpoint,
+/// override it explicitly: `server withTokenInfoEndpoint: "https://..."`.
+///
 /// Every request goes through the `http` package's `HTTPClient`, never
 /// `httpc`. The issuer and every endpoint the discovery document names
 /// must be HTTPS; anything else answers `insecure_endpoint`.
@@ -32,9 +41,11 @@ typed Value subclass: OAuthServer
   field: issuer :: String = ""
   /// The opaque `oidcc` provider context. Never printed.
   field: context :: Object = nil
-  /// RFC 7009 revocation endpoint, from discovery or the preset.
+  /// RFC 7009 revocation endpoint, from discovery or the preset (see
+  /// the class comment for when the preset applies).
   field: revocationEndpoint :: String | Nil = nil
-  /// The provider's token-info endpoint, from the preset.
+  /// The provider's token-info endpoint, from the preset (see the class
+  /// comment for when the preset applies).
   field: tokenInfoEndpoint :: String | Nil = nil
   /// The provider configuration as discovered (overrides applied), keyed
   /// by `oidcc` field name: `#token_endpoint`,
@@ -97,18 +108,44 @@ typed Value subclass: OAuthServer
 
   /// Build the server from the shim's discovery answer.
   class fromShim: info :: Dictionary preset: preset :: Dictionary -> OAuthServer =>
-    revocation := (info at: #revocation_endpoint) ifNil: [
-      preset at: #revocationEndpoint ifAbsent: [nil]
-    ]
+    issuer := info at: #issuer
+    revocation := (info at: #revocation_endpoint)
+      ifNil: [
+        self
+          endpoint: #revocationEndpoint
+          path: #revocationPath
+          issuer: issuer
+          preset: preset
+      ]
     self
       new: #{
-        #issuer => (info at: #issuer),
+        #issuer => issuer,
         #context => (info at: #context),
         #revocationEndpoint => revocation,
-        #tokenInfoEndpoint => (preset at: #tokenInfoEndpoint ifAbsent: [nil]),
+        #tokenInfoEndpoint => (self
+          endpoint: #tokenInfoEndpoint
+          path: #tokenInfoPath
+          issuer: issuer
+          preset: preset),
         #metadata => (info at: #metadata),
         #preset => preset
       }
+
+  /// A preset endpoint for the discovered `issuer`: the preset's absolute
+  /// URL (`key`) when `issuer` is the preset's own `#issuer`; else the
+  /// preset's relative path (`pathKey`) appended to `issuer`; else nil.
+  class endpoint: key :: Symbol path: pathKey :: Symbol issuer: issuer :: String preset: preset :: Dictionary -> String | Nil =>
+    presetIssuer := preset at: #issuer ifAbsent: [nil]
+    ((presetIssuer isKindOf: String) and: [
+      (self trimSlash: presetIssuer) =:= (self trimSlash: issuer)
+    ]) ifTrue: [^preset at: key ifAbsent: [nil]]
+    path := preset at: pathKey ifAbsent: [nil]
+    path isNil ifTrue: [^nil]
+    "{self trimSlash: issuer}{path}"
+
+  /// `url` without one trailing `/`.
+  class trimSlash: url :: String -> String =>
+    (url endsWith: "/") ifTrue: [url take: url size - 1] ifFalse: [url]
 
   /// The token endpoint from discovery, or nil.
   tokenEndpoint -> String | Nil =>
