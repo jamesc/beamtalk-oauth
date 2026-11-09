@@ -1,0 +1,363 @@
+# Copyright 2026 James Casey
+# SPDX-License-Identifier: Apache-2.0
+name: Claude Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# Cancel an in-flight review if a newer push lands on the same PR.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Claude BeamTalk Review
+    runs-on: ubuntu-latest
+    # Restrict to same-repo PRs from jamesc only — prevents fork PRs from accessing
+    # CLAUDE_CODE_OAUTH_TOKEN (critical on a public repo; forks run in a separate context
+    # but the secret would still be exposed if the job ran on a fork-originated PR).
+    if: |
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login == 'jamesc'
+    timeout-minutes: 20
+    permissions:
+      id-token: write       # OIDC token exchange for the OAuth subscription auth
+      contents: read        # checkout + read source; the reviewer never commits/pushes
+      pull-requests: write  # post inline review comments + suggestions
+      issues: write         # upsert the sticky summary comment
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Compute diff ranges
+        id: ranges
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          before="${{ github.event.before }}"
+          # opened/reopened/ready_for_review have no usable `before`; a force-push
+          # can leave `before` pointing at a vanished commit. Fall back to full range.
+          if [ -z "$before" ] \
+             || [ "$before" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${before}^{commit}" 2>/dev/null; then
+            incr="${base}...${head}"
+          else
+            incr="${before}...${head}"
+          fi
+          echo "full=${base}...${head}" >> "$GITHUB_OUTPUT"
+          echo "incr=${incr}" >> "$GITHUB_OUTPUT"
+
+          # Pre-compute de-noised diffs the reviewer reads instead of running its own
+          # `git diff` over the whole range. Excluding the lockfile, generated Core Erlang
+          # and test fixtures keeps token cost down with no loss of review-relevant signal
+          # (these match the prompt's DO-NOT-FLAG list). -U20 gives generous context so the
+          # agent rarely needs to open full files.
+          excludes=(.
+            ':(exclude,glob)**/*.lock'
+            ':(exclude,glob)**/*.core'
+            ':(exclude,glob)**/_build/**'
+            ':(exclude,glob)**/fixtures/**'
+            ':(exclude,glob)**/test_fixtures/**')
+          git diff -U20 "${base}...${head}" -- "${excludes[@]}" \
+            > "${GITHUB_WORKSPACE}/.claude-review-full.diff" || true
+          git diff -U20 "${incr}" -- "${excludes[@]}" \
+            > "${GITHUB_WORKSPACE}/.claude-review-incr.diff" || true
+
+      - name: Select model
+        id: model
+        env:
+          FULL_RANGE: ${{ steps.ranges.outputs.full }}
+        run: |
+          # Config-only PRs get the cheaper Haiku model; anything touching code OR docs
+          # stays on Sonnet. Unknown extensions default to Sonnet — never silently
+          # downgrade a substantive change.
+          # Sonnet 5 uses a new tokenizer (~30% more tokens for the same text than
+          # Sonnet 4.6) — the pre-computed diffs and -U20 context above are what keep
+          # that in check, so don't widen them without re-checking review cost.
+          model='claude-sonnet-5'
+          files="$(git diff --name-only "${FULL_RANGE}")"
+          # A file is "config" if it matches this pattern. If grep finds any changed file
+          # that does NOT match (and is non-empty), the PR touches code/docs → Sonnet.
+          # If every changed file is config → Haiku. Empty file list also stays Sonnet.
+          config_re='\.(toml|ya?ml|json|lock|cfg|ini|conf|config)$|(^|/)\.(gitignore|gitattributes|editorconfig|dockerignore)$|^$'
+          if [ -n "${files}" ] && ! printf '%s\n' "${files}" | grep -qvE "${config_re}"; then
+            model='claude-haiku-4-5'
+          fi
+          echo "Selected model: ${model}"
+          echo "model=${model}" >> "$GITHUB_OUTPUT"
+
+      # The review prompt lives in .github/claude-review-prompt.md so it can be edited
+      # without touching the workflow. The action's `prompt` input is a plain string and
+      # ${{ }} does not interpolate inside an external file, so the diff ranges are injected
+      # here via __INCR_RANGE__ / __FULL_RANGE__ placeholders (ranges are git SHAs — no shell
+      # metacharacters), and the result is handed to the action through a step output.
+      - name: Load review prompt
+        id: load_prompt
+        env:
+          INCR_RANGE: ${{ steps.ranges.outputs.incr }}
+          FULL_RANGE: ${{ steps.ranges.outputs.full }}
+        run: |
+          prompt_file="${RUNNER_TEMP}/claude-review-prompt.txt"
+          sed -e "s|__INCR_RANGE__|${INCR_RANGE}|g" \
+              -e "s|__FULL_RANGE__|${FULL_RANGE}|g" \
+              .github/claude-review-prompt.md > "${prompt_file}"
+          {
+            echo 'prompt<<__BTPROMPTEOF__'
+            cat "${prompt_file}"
+            echo '__BTPROMPTEOF__'
+          } >> "$GITHUB_OUTPUT"
+
+      # The review agent occasionally dies before writing .claude-verdict (observed
+      # pattern: transient infra/API failure, e.g. rate-limit/quota — treating *any*
+      # missing verdict as a hard BLOCK would turn infra hiccups into false red X's on
+      # otherwise-green PRs). continue-on-error lets the job carry on to the retry step
+      # below instead of stopping here if this step itself exits non-zero.
+      - name: Run Claude review
+        id: review
+        continue-on-error: true
+        uses: anthropics/claude-code-action@c96dd0a84e0232ab86947fca5fe34f1caae8792f # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The reviewer never mutates the repo directly: it reads code, runs
+          # read-only git, and writes findings/summary/verdict files with the Write
+          # tool (a default-allowed file op). No commit/push or arbitrary Bash is
+          # granted — proposed fixes are delivered as applyable GitHub suggestions,
+          # not pushed commits.
+          # The agent does NOT post to GitHub itself: it records line-anchored findings
+          # in .claude-findings.json and the "Post PR review" step below batches them
+          # into a single PR review. (The action's own mcp__github_inline_comment tool
+          # posts one separate review per comment; batched reviews are an open feature
+          # request — anthropics/claude-code-action#1049.)
+          claude_args: '--max-turns 50 --model ${{ steps.model.outputs.model }} --allowedTools "Read,Grep,Glob,Write,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(cat:*),Bash(ls:*),Bash(find:*)"'
+          prompt: ${{ steps.load_prompt.outputs.prompt }}
+
+      # No verdict after the first attempt usually means the agent step died early
+      # (e.g. API rate-limit/quota) rather than that the review legitimately found
+      # nothing to say. Back off briefly before retrying so a transient rate-limit
+      # window has a chance to clear (PR-level concurrency above already serialises
+      # runs per-PR, so this is the only additional backoff needed).
+      - name: Wait before retry
+        if: always() && hashFiles('.claude-verdict') == ''
+        run: sleep 30
+
+      # Single retry of the exact same review step, only when the first attempt left
+      # no verdict file. If this also produces no verdict, the gate step below stays
+      # fail-closed — see "Gate on verdict".
+      - name: Retry Claude review (no verdict from first attempt)
+        id: review_retry
+        if: always() && hashFiles('.claude-verdict') == ''
+        continue-on-error: true
+        uses: anthropics/claude-code-action@c96dd0a84e0232ab86947fca5fe34f1caae8792f # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: '--max-turns 50 --model ${{ steps.model.outputs.model }} --allowedTools "Read,Grep,Glob,Write,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(cat:*),Bash(ls:*),Bash(find:*)"'
+          prompt: ${{ steps.load_prompt.outputs.prompt }}
+
+      # Post the agent's line-anchored findings as ONE batched PR review (inline
+      # comments incl. ```suggestion fixes) instead of per-comment posts. The review
+      # event mirrors the verdict so branch protection can key off the bot's review
+      # state:
+      #   PASS       -> APPROVE          Requires "Allow GitHub Actions to create and
+      #                                  approve pull requests" (Settings → Actions →
+      #                                  General); without it GitHub 422s and this
+      #                                  step falls back to a COMMENT review + warning.
+      #   BLOCK      -> REQUEST_CHANGES  Superseded automatically by a later run's
+      #                                  APPROVE — GitHub keeps only the latest review
+      #                                  state per reviewer.
+      #   no verdict -> COMMENT          Agent died mid-run; never approve or
+      #                                  request-changes on an incomplete review (the
+      #                                  fail-closed gate below goes red anyway).
+      # Anchors are validated against the PR's real diff first, so one hallucinated
+      # line number can't 422-reject the whole review; findings that don't anchor are
+      # folded into the review body rather than dropped. Posting failures are
+      # warnings, not job failures — findings also appear (in short form) in the
+      # sticky summary, and merge blocking is the separate "Gate on verdict" step, so
+      # a red X here would only add noise. Each push posts a NEW review (submitted
+      # reviews can't be edited); GitHub marks superseded comments "outdated"
+      # automatically.
+      - name: Post PR review
+        if: always() && (hashFiles('.claude-verdict') != '' || hashFiles('.claude-findings.json') != '')
+        uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553 # v9
+        with:
+          script: |
+            const fs = require('fs');
+            const read = (p) => { try { return fs.readFileSync(p, 'utf8').trim(); } catch { return null; } };
+
+            const verdict = read('.claude-verdict');
+            let findings = [];
+            const rawFindings = read('.claude-findings.json');
+            if (rawFindings !== null) {
+              try {
+                const parsed = JSON.parse(rawFindings);
+                if (Array.isArray(parsed)) {
+                  findings = parsed.filter((f) => f && typeof f.path === 'string' && typeof f.body === 'string');
+                } else {
+                  core.warning('.claude-findings.json is not a JSON array; treating as no findings');
+                }
+              } catch (e) {
+                core.warning(`Unparseable .claude-findings.json: ${e.message}`);
+              }
+            }
+            if (verdict === null && findings.length === 0) {
+              core.info('No verdict and no findings — nothing to post');
+              return;
+            }
+
+            const { owner, repo } = context.repo;
+            const pull_number = context.payload.pull_request.number;
+
+            // Index which (path, side, line) tuples are commentable in the PR's actual
+            // diff. GitHub rejects the ENTIRE review if any single comment anchors
+            // outside the diff, so mis-anchored findings are demoted to the review body.
+            const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number, per_page: 100 });
+            const anchors = new Map();
+            for (const file of files) {
+              const sets = { RIGHT: new Set(), LEFT: new Set() };
+              anchors.set(file.filename, sets);
+              if (!file.patch) continue; // binary / too-large diff: nothing commentable
+              let oldLine = 0, newLine = 0;
+              for (const row of file.patch.split('\n')) {
+                const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(row);
+                if (hunk) { oldLine = Number(hunk[1]); newLine = Number(hunk[2]); continue; }
+                if (row.startsWith('+')) sets.RIGHT.add(newLine++);
+                else if (row.startsWith('-')) sets.LEFT.add(oldLine++);
+                else if (!row.startsWith('\\')) { sets.RIGHT.add(newLine++); sets.LEFT.add(oldLine++); }
+              }
+            }
+
+            const tag = (s) => s === 'Blocker' ? '🛑 **Blocker**' : s === 'Nit' ? '🔹 **Nit**' : '💡 **Suggestion**';
+            const anchored = [];
+            const unanchored = [];
+            for (const f of findings) {
+              const side = f.side === 'LEFT' ? 'LEFT' : 'RIGHT';
+              const sets = anchors.get(f.path);
+              if (!sets || !Number.isInteger(f.line) || !sets[side].has(f.line)) {
+                unanchored.push(f);
+                continue;
+              }
+              const comment = { path: f.path, line: f.line, side, body: `${tag(f.severity)}\n\n${f.body}` };
+              // Multi-line range only when every line in it is commentable; otherwise
+              // degrade to a single-line comment rather than losing the finding.
+              if (Number.isInteger(f.start_line) && f.start_line < f.line) {
+                let spanOk = true;
+                for (let l = f.start_line; l < f.line; l++) {
+                  if (!sets[side].has(l)) { spanOk = false; break; }
+                }
+                if (spanOk) { comment.start_line = f.start_line; comment.start_side = side; }
+              }
+              anchored.push(comment);
+            }
+
+            const count = (sev) => findings.filter((f) => f.severity === sev).length;
+            const counts = `${count('Blocker')} Blocker(s), ${count('Suggestion')} Suggestion(s), ${count('Nit')} Nit(s)`;
+            const event = verdict === 'PASS' ? 'APPROVE'
+                        : verdict === null ? 'COMMENT'
+                        : 'REQUEST_CHANGES';
+            let body;
+            if (event === 'APPROVE') {
+              body = findings.length === 0
+                ? '✅ **Claude Review** — no findings. Approved.'
+                : `✅ **Claude Review** — approved, with non-blocking feedback: ${counts} as inline comments.`;
+            } else if (event === 'REQUEST_CHANGES') {
+              body = `❌ **Claude Review** — changes requested: ${counts}. See the inline comments and the summary comment (which also carries any finding outside this push's diff).`;
+            } else {
+              body = `⚠️ **Claude Review** — the review agent did not complete (no verdict). Posting its findings (${counts}) without an approve / request-changes state.`;
+            }
+            if (unanchored.length > 0) {
+              body += '\n\nFindings that could not be anchored to a diff line:';
+              for (const f of unanchored) {
+                const loc = Number.isInteger(f.line) ? `${f.path}:${f.line}` : f.path;
+                body += `\n\n---\n\`${loc}\` — ${tag(f.severity)}\n\n${f.body}`;
+              }
+            }
+
+            // GitHub can still reject an anchor the index considered valid (e.g. a
+            // multi-line span crossing hunks) — fall back body-only so nothing is
+            // lost. An APPROVE additionally falls back to COMMENT for repos where
+            // "Allow GitHub Actions to create and approve pull requests" is off.
+            let bodyOnly = body + '\n\nInline anchors were rejected by GitHub; all findings as a list:';
+            for (const c of anchored) bodyOnly += `\n\n---\n\`${c.path}:${c.line}\`\n\n${c.body}`;
+
+            const attempts = [[event, body, anchored]];
+            if (anchored.length > 0) attempts.push([event, bodyOnly, []]);
+            if (event === 'APPROVE') {
+              attempts.push(['COMMENT', body, anchored]);
+              if (anchored.length > 0) attempts.push(['COMMENT', bodyOnly, []]);
+            }
+
+            let posted = false;
+            for (const [ev, b, cs] of attempts) {
+              try {
+                await github.rest.pulls.createReview({
+                  owner, repo, pull_number,
+                  commit_id: context.payload.pull_request.head.sha,
+                  event: ev,
+                  body: b,
+                  comments: cs,
+                });
+                core.info(`Posted ${ev} review with ${cs.length} inline comment(s) (${unanchored.length} unanchored)`);
+                posted = true;
+                break;
+              } catch (e) {
+                core.warning(`createReview ${ev} with ${cs.length} inline comment(s) failed: ${e.message}`);
+                if (ev === 'APPROVE' && /approv/i.test(String(e.message))) {
+                  core.warning('To let this workflow approve PRs, enable Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests".');
+                }
+              }
+            }
+            if (!posted) core.warning('All review submission attempts failed — findings remain in the sticky summary comment');
+
+      - name: Post review summary
+        if: always()
+        uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553 # v9
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- claude-review-summary -->';
+            const read = (p) => { try { return fs.readFileSync(p, 'utf8').trim(); } catch { return null; } };
+
+            const summary = read('.claude-summary.md');
+            const verdict = read('.claude-verdict') || 'UNKNOWN';
+            const header = verdict === 'PASS' ? '### ✅ Claude Review — PASS'
+                         : verdict === 'BLOCK' ? '### ❌ Claude Review — BLOCK'
+                         : '### ⚠️ Claude Review — did not complete';
+            const body = summary
+              ? `${marker}\n${header}\n\n${summary}`
+              : `${marker}\n${header}\n\n_The review did not produce a summary (it may have failed before completing). See the workflow logs for details._`;
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Gate on verdict
+        if: always()
+        run: |
+          # The review agent occasionally dies before writing .claude-verdict
+          # (infra/API rate-limit). The retry step above absorbs one such failure; if
+          # the verdict is STILL missing after both attempts, the gate stays
+          # FAIL-CLOSED: a missing verdict blocks, because passing silently would let
+          # an unreviewed PR through the gate. The error message distinguishes the
+          # infra case from a genuine BLOCK so a human can re-run the job rather than
+          # hunt for phantom findings.
+          if [ ! -f .claude-verdict ]; then
+            echo "::error::No verdict after review + retry — agent infra failure; re-run this job (gate is fail-closed)"
+            exit 1
+          fi
+          verdict=$(tr -d '[:space:]' < .claude-verdict)
+          echo "Claude verdict: $verdict"
+          if [ "$verdict" != "PASS" ]; then
+            echo "::error::Claude found Blockers — merge is gated"
+            exit 1
+          fi
+          echo "No Blockers found — gate passed"
