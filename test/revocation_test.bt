@@ -282,6 +282,59 @@ TestCase subclass: RevocationTest
     self assert: (TokenRevocation checkEndpoint: "http://[::1]:8080/revoke") equals: nil
     self assert: (TokenRevocation checkEndpoint: "ftp://example.test/revoke") code equals: "insecure_endpoint"
 
+  testPresetPlainHttpEndpointIsRefused =>
+    // The preset's absolute endpoint applies (its #issuer is the discovered
+    // one) and is checked when the request is made, like an override.
+    self.provider discoveryOverrides: #{"revocation_endpoint" => nil}
+    srv := (OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: #{
+        #issuer => self.provider issuer,
+        #revocationEndpoint => "http://example.test/revoke"
+      }
+      options: #{#allowUnsafeHttp => true}) unwrap
+    self assert: srv revocationEndpoint equals: "http://example.test/revoke"
+    got := TokenRevocation
+      revoke: srv
+      client: self publicClient
+      token: self tokens
+    self assert: got error code equals: "insecure_endpoint"
+    self deny: (got error printString includesSubstring: "rt-1")
+
+  testDerivedPlainHttpEndpointNeedsTestFlag =>
+    // A path-derived endpoint on the plain-HTTP fixture issuer passes only
+    // under the test-only flag (the shim's check_https/2 rule).
+    self.provider discoveryOverrides: #{"revocation_endpoint" => nil}
+    srv := (OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: #{#issuer => "https://other.test", #revocationPath => "/revoke"}
+      options: #{#allowUnsafeHttp => true}) unwrap
+    self assert: srv revocationEndpoint equals: "{self.provider issuer}/revoke"
+    restore := [
+      Erlang application
+        set_env: #beamtalk_oauth
+        with: #allow_unsafe_http_for_tests
+        with: true
+    ]
+    Erlang application
+      set_env: #beamtalk_oauth
+      with: #allow_unsafe_http_for_tests
+      with: false
+    [
+      got := TokenRevocation
+        revoke: srv
+        client: self publicClient
+        token: self tokens
+      self assert: got error code equals: "insecure_endpoint"
+      self assert: (self.provider hits: "/revoke") equals: 0
+    ] ensure: restore
+    again := TokenRevocation
+      revoke: srv
+      client: self publicClient
+      token: self tokens
+    self assert: again isOk
+    self assert: (self.provider hits: "/revoke") equals: 1
+
   // ===== No token in errors =====
   testErrorsNeverCarryTheToken =>
     self.provider

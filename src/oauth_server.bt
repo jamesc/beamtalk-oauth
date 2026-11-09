@@ -24,6 +24,15 @@
 /// `httpc`. The issuer and every endpoint the discovery document names
 /// must be HTTPS; anything else answers `insecure_endpoint`.
 ///
+/// `revocationEndpoint` and `tokenInfoEndpoint` may also come from the
+/// preset (absolute, or derived from a path) or from
+/// `withRevocationEndpoint:` / `withTokenInfoEndpoint:`, so the server
+/// can hold a plain-HTTP URL there. It is never used: `TokenRevocation`
+/// checks the endpoint before each request with the same rule
+/// (`TokenRevocation checkEndpoint:`, i.e. the shim's `check_https/2`)
+/// and answers `insecure_endpoint` without sending the token. Plain HTTP
+/// passes only to a loopback host under the test-only application flag.
+///
 /// `fromDiscovery:` loads the configuration once. That suits scripts,
 /// CLIs and the REPL; ID-token validation still reloads the JWKS when a
 /// token names an unknown key.
