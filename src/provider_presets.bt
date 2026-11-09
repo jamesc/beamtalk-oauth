@@ -1,0 +1,73 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// ProviderPresets — what this library knows about specific providers,
+/// as data.
+///
+/// A preset is a Dictionary with Symbol keys:
+///
+/// - `#issuer` — the issuer to discover;
+/// - `#scopes` — default scopes, always including `openid`;
+/// - `#authorizeParams` — extra authorization-request parameters;
+/// - `#revocationEndpoint` — used when discovery does not name one;
+/// - `#tokenInfoEndpoint` — the provider's (non-standard) token-info URL;
+/// - `#tokenInfoAuth` — how token info takes the token: `#bearer` (an
+///   `Authorization` header) or `#query` (an `access_token` parameter);
+/// - `#tokenInfoFields` — where the normalized token-info fields
+///   (`#subject`, `#scopes`, `#expiresIn`) live in the provider's answer;
+/// - `#documentOverrides` — members merged over the discovery document,
+///   for metadata the provider gets wrong.
+///
+/// Pass a preset to `OAuthServer fromPreset:` or `fromDiscovery:preset:`.
+///
+/// ## Examples
+/// ```beamtalk
+/// ProviderPresets gitlab at: #issuer        // => "https://gitlab.com"
+/// server := (OAuthServer fromPreset: ProviderPresets google) unwrap
+/// ```
+Object subclass: ProviderPresets
+
+  /// GitLab.com (checked against its discovery document, 2026-11-09).
+  ///
+  /// GitLab advertises only `client_secret_basic` and `client_secret_post`
+  /// in `token_endpoint_auth_methods_supported`, so a public native
+  /// client (no secret) would fail with `no_supported_auth_method`; the
+  /// override adds `none`. Token info is `GET /oauth/token/info` with the
+  /// token as a bearer header.
+  class gitlab -> Dictionary =>
+    #{
+      #issuer => "https://gitlab.com",
+      #scopes => #("openid", "profile", "email"),
+      #authorizeParams => #{},
+      #revocationEndpoint => "https://gitlab.com/oauth/revoke",
+      #tokenInfoEndpoint => "https://gitlab.com/oauth/token/info",
+      #tokenInfoAuth => #bearer,
+      #tokenInfoFields => #{
+        #subject => "resource_owner_id",
+        #scopes => "scope",
+        #expiresIn => "expires_in"
+      },
+      #documentOverrides => #{
+        "token_endpoint_auth_methods_supported" => #("none", "client_secret_basic", "client_secret_post")
+      }
+    }
+
+  /// Google. `access_type=offline` asks for a refresh token and
+  /// `prompt=consent` makes Google issue one again on later logins. Token
+  /// info is `GET tokeninfo?access_token=...`. Discovery names the
+  /// revocation endpoint; the preset repeats it as the fallback.
+  class google -> Dictionary =>
+    #{
+      #issuer => "https://accounts.google.com",
+      #scopes => #("openid", "profile", "email"),
+      #authorizeParams => #{"access_type" => "offline", "prompt" => "consent"},
+      #revocationEndpoint => "https://oauth2.googleapis.com/revoke",
+      #tokenInfoEndpoint => "https://oauth2.googleapis.com/tokeninfo",
+      #tokenInfoAuth => #query,
+      #tokenInfoFields => #{
+        #subject => "sub",
+        #scopes => "scope",
+        #expiresIn => "expires_in"
+      },
+      #documentOverrides => #{}
+    }

@@ -1,0 +1,33 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+TestCase subclass: ProviderPresetsTest
+
+  testGitlab =>
+    p := ProviderPresets gitlab
+    self assert: (p at: #issuer) equals: "https://gitlab.com"
+    self assert: ((p at: #scopes) includes: "openid")
+    self assert: (p at: #tokenInfoEndpoint) equals: "https://gitlab.com/oauth/token/info"
+    self assert: (p at: #tokenInfoAuth) equals: #bearer
+    self assert: ((p at: #tokenInfoFields) at: #subject) equals: "resource_owner_id"
+    methods := (p at: #documentOverrides) at: "token_endpoint_auth_methods_supported"
+    self assert: (methods includes: "none")
+    self assert: (methods includes: "client_secret_basic")
+
+  testGoogle =>
+    p := ProviderPresets google
+    self assert: (p at: #issuer) equals: "https://accounts.google.com"
+    self assert: (p at: #scopes) equals: #("openid", "profile", "email")
+    extras := p at: #authorizeParams
+    self assert: (extras at: "access_type") equals: "offline"
+    self assert: (extras at: "prompt") equals: "consent"
+    self assert: (p at: #tokenInfoAuth) equals: #query
+    self assert: (p at: #documentOverrides) equals: #{}
+
+  testEndpointsAreHttps =>
+    #(ProviderPresets gitlab, ProviderPresets google)
+      do: [:p |
+        #(#issuer, #revocationEndpoint, #tokenInfoEndpoint) do: [:k |
+          self assert: ((p at: k) startsWith: "https://")
+        ]
+      ]

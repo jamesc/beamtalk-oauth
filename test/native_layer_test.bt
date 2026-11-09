@@ -1,0 +1,227 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+// The native layer through its Erlang entry points: the HTTPClient
+// adapter, the shim's HTTPS check and token retrieval, and the
+// FixtureProvider later issues test against. No test hits the network,
+// and none may reach httpc (HttpcGuard).
+
+TestCase subclass: NativeLayerTest
+  field: provider = nil
+
+  setUp =>
+    HttpcGuard install
+    self.provider := FixtureProvider start
+
+  tearDown =>
+    self.provider stop
+    self assert: HttpcGuard calls equals: 0
+    nil
+
+  // A raw Erlang binary, as oidcc passes (distinct from a String).
+  bin: text :: String -> Binary => Binary fromIolist: #(text)
+
+  server -> OAuthServer =>
+    (OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: #{}
+      options: #{#allowUnsafeHttp => true}) unwrap
+
+  adapterConfig -> Dictionary => #{#client => HTTPClient}
+
+  confidential -> Dictionary =>
+    #{
+      #client_id => FixtureProvider clientId,
+      #client_secret => FixtureProvider clientSecret
+    }
+
+  codeParams -> Dictionary =>
+    #{
+      #code => "code-1",
+      #redirect_uri => "http://127.0.0.1:50278/callback",
+      #nonce => FixtureProvider nonce,
+      #pkce_verifier => Secrets generate
+    }
+
+  retrieve: client :: Dictionary -> Result =>
+    Erlang beamtalk_oauth_oidcc
+      retrieve_token: self server context
+      with: client
+      with: self codeParams
+
+  // ===== Adapter =====
+  testAdapterAnswersHttpcShape =>
+    url := self bin: "{self.provider issuer}/.well-known/openid-configuration"
+    got := Erlang beamtalk_oauth_http_adapter
+      request: #get
+      with: {url, #()}
+      with: #()
+      with: #()
+      with: self adapterConfig
+    {statusLine, headers, body} := self assertOk: got
+    self assert: (statusLine at: 2) equals: 200
+    // Header names are charlists, as httpc answers them.
+    names := headers collect: [:h |
+      (Erlang erlang list_to_binary: (h at: 1)) asStringUnchecked
+    ]
+    self assert: (names includes: "content-type")
+    self assert: (body asStringUnchecked includesSubstring: "token_endpoint")
+
+  testAdapterErrorCarriesNoRequest =>
+    srv := HTTPServer start: 0 handler: [:req |
+      HTTPResponse new: #{#status => 404}
+    ]
+    port := srv port
+    srv stop
+    url := self bin: "http://127.0.0.1:{port}/token"
+    headers := #({self bin: "authorization", self bin: "Basic c2VjcmV0LXNlY3JldA=="})
+    request := {url, headers, self bin: "application/x-www-form-urlencoded", self bin: "code=abc123&code_verifier=xyz"}
+    got := Erlang beamtalk_oauth_http_adapter
+      request: #post
+      with: request
+      with: #()
+      with: #()
+      with: self adapterConfig
+    self assert: got isError
+    reason := got error reason
+    self assert: (reason at: 1) equals: #http_client
+    text := reason printString
+    self deny: (text includesSubstring: "c2VjcmV0")
+    self deny: (text includesSubstring: "abc123")
+    self deny: (text includesSubstring: "/token")
+
+  testAdapterRejectsStreamingBody =>
+    url := self bin: "{self.provider issuer}/token"
+    request := {url, #(), self bin: "text/plain", {#chunkify, #producer, #acc}}
+    got := Erlang beamtalk_oauth_http_adapter
+      request: #post
+      with: request
+      with: #()
+      with: #()
+      with: self adapterConfig
+    self assert: got error reason equals: {#http_client, #streaming_request_body}
+    self assert: self.provider lastTokenRequest equals: nil
+
+  // ===== Shim =====
+  testHttpsCheck =>
+    ok := #{
+      #issuer => "https://a.test",
+      #token_endpoint => "https://a.test/token",
+      #registration_endpoint => #undefined
+    }
+    self assert: (Erlang beamtalk_oauth_oidcc check_https: ok with: false) isOk
+    bad := #{
+      #issuer => "https://a.test",
+      #token_endpoint => "http://a.test/token"
+    }
+    checked := Erlang beamtalk_oauth_oidcc check_https: bad with: false
+    self assert: checked isError
+    self assert: (OAuthError fromOidcc: checked error) code equals: "insecure_endpoint"
+    self assert: (Erlang beamtalk_oauth_oidcc check_https: bad with: true) isOk
+
+  testHttpsCheckCoversAliases =>
+    endpoints := #{
+      #mtls_endpoint_aliases => #{#token_endpoint => "http://a.test/token"}
+    }
+    checked := Erlang beamtalk_oauth_oidcc check_https: endpoints with: false
+    self assert: (OAuthError fromOidcc: checked error) code equals: "insecure_endpoint"
+
+  testClockSkewIsSet =>
+    skew := (Erlang application get_env: #oidcc with: #max_clock_skew) unwrap
+    self assert: skew equals: 60
+
+  // ===== Fixture provider through oidcc =====
+  testRetrieveValidatesIdToken =>
+    toks := self assertOk: (self retrieve: self confidential)
+    self assert: (toks at: #access_token) equals: "at-1"
+    self assert: (toks at: #refresh_token) equals: "rt-1"
+    self assert: (toks at: #expires_in) equals: 3600
+    self assert: (toks at: #scope) equals: "openid profile email"
+    claims := toks at: #id_token_claims
+    self assert: (claims at: "sub") equals: "user-1"
+    self assert: (claims at: "iss") equals: self.provider issuer
+
+  testFixtureRecordsTokenRequest =>
+    self assertOk: (self retrieve: self confidential)
+    seen := self.provider lastTokenRequest
+    form := seen at: #form
+    self assert: (form at: "grant_type") equals: "authorization_code"
+    self assert: (form at: "code") equals: "code-1"
+    self assert: (form at: "code_verifier") size equals: 43
+    // oidcc prefers client_secret_post when the provider offers it.
+    self assert: (form at: "client_id") equals: FixtureProvider clientId
+    self assert: (form at: "client_secret") equals: FixtureProvider clientSecret
+
+  testPublicClientNeedsNoneAuthMethod =>
+    public := #{#client_id => FixtureProvider clientId, #client_secret => nil}
+    refused := self retrieve: public
+    self assert: (OAuthError fromOidcc: refused error) code equals: "no_supported_auth_method"
+    gitlab := (OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: ProviderPresets gitlab
+      options: #{#allowUnsafeHttp => true}) unwrap
+    self
+      assertOk: (Erlang beamtalk_oauth_oidcc
+        retrieve_token: gitlab context
+        with: public
+        with: self codeParams)
+    seen := self.provider lastTokenRequest
+    self assert: ((seen at: #form) at: "client_id") equals: FixtureProvider clientId
+    self deny: ((seen at: #headers) includesKey: "authorization")
+
+  testNonceMismatchIsRejected =>
+    self.provider claims: #{"nonce" => "someone-elses"}
+    result := self retrieve: self confidential
+    self assert: result isError
+    self deny: (OAuthError fromOidcc: result error) code =:= "transport"
+
+  testExpiredIdTokenIsRejected =>
+    now := Erlang erlang system_time: #second
+    self.provider claims: #{"exp" => now - 3600, "iat" => now - 7200}
+    result := self retrieve: self confidential
+    self assert: result isError
+
+  testWrongAudienceIsRejected =>
+    self.provider claims: #{"aud" => "another-client"}
+    self assert: (self retrieve: self confidential) isError
+
+  testConfiguredTokenError =>
+    self.provider
+      fail: "/token"
+      status: 400
+      body: #{"error" => "invalid_grant", "error_description" => "code expired"}
+    err := OAuthError fromOidcc: (self retrieve: self confidential) error
+    self assert: err code equals: "invalid_grant"
+    self assert: err status equals: 400
+    self assert: err description equals: "code expired"
+
+  testTokenFieldsCanBeRemoved =>
+    self.provider tokenFields: #{"refresh_token" => nil}
+    toks := self assertOk: (self retrieve: self confidential)
+    self assert: (toks at: #refresh_token) equals: nil
+
+  testUserinfoNeedsBearer =>
+    url := "{self.provider issuer}/userinfo"
+    self assert: (HTTPClient get: url) unwrap status equals: 401
+    resp := (HTTPClient get: url headers: #(#("authorization", "Bearer at-1"))) unwrap
+    self assert: resp status equals: 200
+    self assert: ((Json parse: resp body asStringUnchecked) unwrap at: "sub") equals: "user-1"
+
+  // ===== httpc guard =====
+  testGuardCountsCalls =>
+    // The guard's counter, on a function nothing else here calls.
+    HttpcGuard
+      count: #string
+      function: #casefold
+      arity: 1
+    before := HttpcGuard
+      callsTo: #string
+      function: #casefold
+      arity: 1
+    Erlang string casefold: "ABC"
+    self
+      assert: (HttpcGuard
+        callsTo: #string
+        function: #casefold
+        arity: 1)
+      equals: before + 1

@@ -32,17 +32,16 @@ typed Value subclass: OAuthSession
   /// 0 until then.
   field: createdAt :: Integer = 0
 
-  /// A fresh session for `server` (anything answering `issuer`, normally
-  /// an `OAuthServer`) and `reg`: new state, nonce and code verifier from
-  /// `Secrets generate`, and the server's issuer and the registration's
-  /// redirect URI.
-  class newSessionFor: server :: Object client: reg :: ClientRegistration -> OAuthSession =>
+  /// A fresh session for `server` and `reg`: new state, nonce and code
+  /// verifier from `Secrets generate`, and the server's issuer and the
+  /// registration's redirect URI.
+  class newSessionFor: server :: OAuthServer client: reg :: ClientRegistration -> OAuthSession =>
     self
       new: #{
         #state => Secrets generate,
         #nonce => Secrets generate,
         #codeVerifier => Secrets generate,
-        #issuer => (server perform: #issuer),
+        #issuer => server issuer,
         #redirectUri => reg redirectUri
       }
 

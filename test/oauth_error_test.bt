@@ -58,6 +58,25 @@ TestCase subclass: OAuthErrorTest
     self assert: (OAuthError fromOidcc: (self bin: "boom")) code equals: "transport"
     self assert: (OAuthError fromOidcc: {1, 2}) code equals: "transport"
 
+  testHttpClientIsTransport =>
+    e := OAuthError fromOidcc: {#http_client, self bin: "Could not open connection (econnrefused)"}
+    self assert: e code equals: "transport"
+    self assert: e description equals: "Could not open connection (econnrefused)"
+    self assert: (OAuthError fromOidcc: {#http_client, #streaming_request_body}) description equals: "streaming_request_body"
+
+  testInsecureEndpointNamesField =>
+    e := OAuthError fromOidcc: {#insecure_endpoint, #token_endpoint, self bin: "http://a.test/token"}
+    self assert: e code equals: "insecure_endpoint"
+    self assert: e description equals: "token_endpoint must be https: http://a.test/token"
+
+  testFfiErrorIsUnwrapped =>
+    // An FFI {error, R} arrives as an Exception whose reason is R.
+    failed := Erlang beamtalk_oauth_oidcc check_https: #{
+      #issuer => "http://a.test"
+    } with: false
+    self assert: (failed error isKindOf: Exception)
+    self assert: (OAuthError fromOidcc: failed error) code equals: "insecure_endpoint"
+
   testDetailRedactsClaimsMap =>
     claims := (#{} at: (self bin: "sub") put: (self bin: "1234")) at: (self bin: "email") put: (self bin: "alice@example.com")
     e := OAuthError fromOidcc: {#missing_claim, {self bin: "aud", self bin: "app"}, claims}
