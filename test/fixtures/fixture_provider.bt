@@ -13,6 +13,8 @@
 /// | `/jwks`                             | the public half of an ES256 test key   |
 /// | `/token`                            | a token response with a signed ID token|
 /// | `/userinfo`                         | userinfo claims (401 without a bearer) |
+/// | `/revoke`                           | 200 with an empty body (RFC 7009)      |
+/// | `/tokeninfo`, `/oauth/token/info`   | `tokenInfo:` for `at-1`, else 401      |
 ///
 /// Configure it per test: `claims:` (ID-token claims), `tokenFields:`
 /// (token-response members), `discoveryOverrides:`, and
@@ -20,6 +22,13 @@
 /// any of those dictionaries removes the member. `reset` restores the
 /// defaults. `lastTokenRequest` answers the last `/token` request's form
 /// body and headers.
+///
+/// For `/revoke` and `/tokeninfo`, `respond:status:body:contentType:`
+/// answers a raw body (empty, text or JSON) instead, `tokenInfo:` sets the
+/// token-info answer, and `lastRequestTo:` answers the last request's
+/// method, form, query and headers. `/tokeninfo` takes the token as a
+/// bearer header or an `access_token` form parameter. `redirect:to:`
+/// answers a 302 with a `Location`.
 ///
 /// ID tokens are signed with the actor's own P-256 key through `jose`.
 /// `keyId:` names the key (a `kid` in the JWKS and the ID-token header);
@@ -55,6 +64,12 @@ Actor subclass: FixtureProvider
   /// `#{#form => Dictionary, #headers => Dictionary}` of the last `/token`
   /// request, or nil.
   state: lastTokenRequest = nil
+  /// Path -> {status, body String, content type}: answer that raw body.
+  state: responses :: Dictionary = #{}
+  /// Path -> the last request's record, for `/revoke` and `/tokeninfo`.
+  state: requests :: Dictionary = #{}
+  /// The `/tokeninfo` answer for an active token.
+  state: tokenInfo :: Dictionary = #{}
   /// The signing key's `kid`, or nil for none.
   state: keyId :: String | Nil = nil
   /// Path -> number of requests served.
@@ -146,11 +161,36 @@ Actor subclass: FixtureProvider
     self.discoveryOverrides := #{}
     self.failures := #{}
     self.lastTokenRequest := nil
+    self.responses := #{}
+    self.requests := #{}
+    self.tokenInfo := #{}
     nil
 
   /// The last `/token` request: `#{#form => ..., #headers => ...}`, both
   /// with String keys (header names lowercase), or nil.
   lastTokenRequest -> Dictionary | Nil => self.lastTokenRequest
+
+  /// Answer `status` with the raw `body` and `contentType` on `path`
+  /// until `reset`.
+  respond: path :: String status: status :: Integer body: body :: String contentType: contentType :: String -> Nil =>
+    self.responses := self.responses at: path put: {status, body, contentType, #()}
+    nil
+
+  /// Answer a 302 to `location` on `path` until `reset`.
+  redirect: path :: String to: location :: String -> Nil =>
+    self.responses := self.responses at: path put: {302, "", "text/plain", #(#("location", location))}
+    nil
+
+  /// Set the `/tokeninfo` answer for the active token `at-1`.
+  tokenInfo: body :: Dictionary -> Nil =>
+    self.tokenInfo := body
+    nil
+
+  /// The last request to `path` (`/revoke`, `/tokeninfo` or
+  /// `/oauth/token/info`):
+  /// `#{#method, #form, #query, #headers}`, or nil.
+  lastRequestTo: path :: String -> Dictionary | Nil =>
+    self.requests at: path ifAbsent: [nil]
 
   /// Answer one request (the `HTTPHandler` protocol).
   handle: req :: HTTPRequest -> HTTPResponse =>
@@ -160,12 +200,30 @@ Actor subclass: FixtureProvider
     delay > 0 ifTrue: [Erlang timer sleep: delay]
     failure := self.failures at: path ifAbsent: [nil]
     path =:= "/token" ifTrue: [self.lastTokenRequest := self recordOf: req]
+    (#("/revoke", "/tokeninfo", "/oauth/token/info") includes: path)
+      ifTrue: [
+        record := ((self recordOf: req) at: #method put: req method) at: #query put: req queryParams
+        self.requests := self.requests at: path put: record
+      ]
+    raw := self.responses at: path ifAbsent: [nil]
+    raw notNil
+      ifTrue: [
+        ^HTTPResponse
+          new: #{
+            #status => (raw at: 1),
+            #headers => #(#("content-type", raw at: 3)) ++ (raw at: 4),
+            #body => (raw at: 2)
+          }
+      ]
     failure notNil ifTrue: [^self json: (failure at: 2) status: (failure at: 1)]
     path match: [
       "/.well-known/openid-configuration" -> self json: self discoveryDocument status: 200;
       "/jwks" -> self jwksResponse;
       "/token" -> self json: self tokenResponse status: 200;
       "/userinfo" -> self userinfoFor: req;
+      "/revoke" -> HTTPResponse new: #{#status => 200, #body => ""};
+      "/tokeninfo" -> self tokenInfoFor: req;
+      "/oauth/token/info" -> self tokenInfoFor: req;
       _ -> HTTPResponse new: #{#status => 404, #body => "not found"}
     ]
 
@@ -247,6 +305,20 @@ Actor subclass: FixtureProvider
         "email" => "user-1@example.test"
       }
       status: 200
+
+  /// The token-info answer: `tokenInfo:` for the token `at-1`, sent as a
+  /// bearer header or an `access_token` parameter; 401 otherwise.
+  tokenInfoFor: req :: HTTPRequest -> HTTPResponse =>
+    auth := (self headersOf: req) at: "authorization" ifAbsent: [""]
+    token := (auth startsWith: "Bearer ") ifTrue: [
+      auth drop: 7
+    ] ifFalse: [
+      ((self recordOf: req) at: #form) at: "access_token" ifAbsent: [""]
+    ]
+    token =:= "at-1" ifFalse: [
+      ^self json: #{"error" => "invalid_token"} status: 401
+    ]
+    self json: self.tokenInfo status: 200
 
   /// The form body and headers of `req`, for `lastTokenRequest`.
   recordOf: req :: HTTPRequest -> Dictionary =>

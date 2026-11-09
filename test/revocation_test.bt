@@ -1,0 +1,346 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+// TokenRevocation revoke: (RFC 7009) against the fixture provider's
+// /revoke route. No test hits the network, and none may reach httpc.
+
+TestCase subclass: RevocationTest
+  field: provider = nil
+
+  setUp =>
+    HttpcGuard install
+    self.provider := FixtureProvider start
+
+  tearDown =>
+    self.provider stop
+    self assert: HttpcGuard calls equals: 0
+    nil
+
+  server -> OAuthServer =>
+    (OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: #{}
+      options: #{#allowUnsafeHttp => true}) unwrap
+
+  publicClient -> ClientRegistration =>
+    (ClientRegistration forClient: FixtureProvider clientId redirect: "http://127.0.0.1:50278/callback") unwrap
+
+  confidentialClient -> ClientRegistration =>
+    (ClientRegistration
+      forClient: FixtureProvider clientId
+      secret: FixtureProvider clientSecret
+      redirect: "http://127.0.0.1:50278/callback") unwrap
+
+  tokens -> TokenSet =>
+    TokenSet new: #{
+      #accessToken => "at-1",
+      #refreshToken => "rt-1",
+      #expiresIn => 3600
+    }
+
+  revoke: tok :: Object -> Result =>
+    TokenRevocation
+      revoke: self server
+      client: self publicClient
+      token: tok
+
+  lastForm -> Dictionary => (self.provider lastRequestTo: "/revoke") at: #form
+
+  lastHeaders -> Dictionary =>
+    (self.provider lastRequestTo: "/revoke") at: #headers
+
+  // ===== Form fields and hints =====
+  testTokenSetRevokesRefreshToken =>
+    got := self revoke: self tokens
+    self assert: got isOk
+    self assert: got value equals: nil
+    record := self.provider lastRequestTo: "/revoke"
+    self assert: (record at: #method) equals: "POST"
+    self
+      assert: self lastForm
+      equals: #{
+        "token" => "rt-1",
+        "token_type_hint" => "refresh_token",
+        "client_id" => "client-1"
+      }
+    self assert: (self lastHeaders at: "content-type") equals: "application/x-www-form-urlencoded"
+
+  testTokenSetWithoutRefreshRevokesAccessToken =>
+    got := self revoke: (TokenSet new: #{#accessToken => "at-1"})
+    self assert: got isOk
+    self assert: (self lastForm at: "token") equals: "at-1"
+    self assert: (self lastForm at: "token_type_hint") equals: "access_token"
+
+  testHintPicksTokenFromTokenSet =>
+    got := TokenRevocation
+      revoke: self server
+      client: self publicClient
+      token: self tokens
+      hint: #access_token
+    self assert: got isOk
+    self assert: (self lastForm at: "token") equals: "at-1"
+    self assert: (self lastForm at: "token_type_hint") equals: "access_token"
+
+  testRawStringSendsNoHint =>
+    got := self revoke: "raw token/+="
+    self assert: got isOk
+    self assert: self lastForm equals: #{
+      "token" => "raw token/+=",
+      "client_id" => "client-1"
+    }
+
+  testRawStringWithHint =>
+    got := TokenRevocation
+      revoke: self server
+      client: self publicClient
+      token: "rt-9"
+      hint: #refresh_token
+    self assert: got isOk
+    self assert: (self lastForm at: "token_type_hint") equals: "refresh_token"
+
+  testEmptyTokenIsConfigError =>
+    got := self revoke: (TokenSet new: #{#accessToken => ""})
+    self assert: got error code equals: "config"
+    self assert: (self.provider lastRequestTo: "/revoke") equals: nil
+    self assert: (self revoke: nil) error code equals: "config"
+
+  testRefreshHintWithoutRefreshTokenIsConfigError =>
+    got := TokenRevocation
+      revoke: self server
+      client: self publicClient
+      token: (TokenSet new: #{#accessToken => "at-1"})
+      hint: #refresh_token
+    self assert: got error code equals: "config"
+
+  testTokenWithLineBreakIsConfigError =>
+    got := self revoke: "at-1\r\nx-evil: 1"
+    self assert: got error code equals: "config"
+    self deny: (got error printString includesSubstring: "at-1")
+
+  testOversizedResponseIsTransportError =>
+    big := "x" repeat: 1048577
+    self.provider
+      respond: "/revoke"
+      status: 400
+      body: big
+      contentType: "text/plain"
+    err := (self revoke: self tokens) error
+    self assert: err code equals: "transport"
+
+  testUnknownHintIsConfigError =>
+    got := TokenRevocation
+      revoke: self server
+      client: self publicClient
+      token: "at-1"
+      hint: #id_token
+    self assert: got error code equals: "config"
+
+  // ===== Client authentication =====
+  testPublicClientSendsClientIdOnly =>
+    self revoke: self tokens
+    self deny: (self lastHeaders includesKey: "authorization")
+    self deny: (self lastForm includesKey: "client_secret")
+    self assert: (self lastForm at: "client_id") equals: "client-1"
+
+  testConfidentialClientUsesBasicWhenAdvertised =>
+    // The fixture document omits revocation_endpoint_auth_methods_supported;
+    // oidcc defaults it to client_secret_basic (RFC 8414).
+    got := TokenRevocation
+      revoke: self server
+      client: self confidentialClient
+      token: self tokens
+    self assert: got isOk
+    expected := "Basic " ++ "client-1:secret-1" asBase64
+    self assert: (self lastHeaders at: "authorization") equals: expected
+    self assert: self lastForm equals: #{
+      "token" => "rt-1",
+      "token_type_hint" => "refresh_token"
+    }
+
+  testConfidentialClientUsesPostWhenBasicNotAdvertised =>
+    self.provider discoveryOverrides: #{
+      "revocation_endpoint_auth_methods_supported" => #("client_secret_post")
+    }
+    got := TokenRevocation
+      revoke: self server
+      client: self confidentialClient
+      token: self tokens
+    self assert: got isOk
+    self deny: (self lastHeaders includesKey: "authorization")
+    self assert: (self lastForm at: "client_id") equals: "client-1"
+    self assert: (self lastForm at: "client_secret") equals: "secret-1"
+
+  testConfidentialClientWithoutSecretMethodIsConfigError =>
+    self.provider discoveryOverrides: #{
+      "revocation_endpoint_auth_methods_supported" => #("private_key_jwt")
+    }
+    got := TokenRevocation
+      revoke: self server
+      client: self confidentialClient
+      token: self tokens
+    self assert: got error code equals: "config"
+    self assert: (self.provider lastRequestTo: "/revoke") equals: nil
+    self deny: (got error printString includesSubstring: "secret-1")
+
+  testEmptyAuthMethodsMeanBasic =>
+    srv := self server
+    bare := srv withMetadata: ((srv metadata removeKey: #revocation_endpoint_auth_methods_supported) removeKey: #token_endpoint_auth_methods_supported)
+    self assert: (TokenRevocation authMethodFor: bare) equals: "client_secret_basic"
+    self assert: (TokenRevocation authMethodFor: (srv withMetadata: (bare metadata at: #revocation_endpoint_auth_methods_supported put: #()))) equals: "client_secret_basic"
+
+  testFallsBackToTokenEndpointAuthMethods =>
+    srv := self server
+    meta := (srv metadata removeKey: #revocation_endpoint_auth_methods_supported) at: #token_endpoint_auth_methods_supported put: #("client_secret_post")
+    got := TokenRevocation
+      revoke: (srv withMetadata: meta)
+      client: self confidentialClient
+      token: self tokens
+    self assert: got isOk
+    self assert: (self lastForm at: "client_secret") equals: "secret-1"
+    basic := (srv withMetadata: (meta at: #token_endpoint_auth_methods_supported put: #("client_secret_basic")))
+    self assert: (TokenRevocation authMethodsOf: basic) equals: #("client_secret_basic")
+
+  testBasicCredentialsAreFormEncoded =>
+    header := TokenRevocation basic: "id:1" secret: "s p"
+    decoded := (Binary fromBase64: (header drop: 6)) unwrap asStringUnchecked
+    self assert: decoded equals: "id%3A1:s+p"
+
+  // ===== Responses =====
+  testAny200IsSuccess =>
+    self assert: (self revoke: self tokens) isOk
+    self.provider
+      respond: "/revoke"
+      status: 200
+      body: ""
+      contentType: "text/plain"
+    self assert: (self revoke: self tokens) isOk
+    self.provider
+      respond: "/revoke"
+      status: 200
+      body: "revoked, thanks"
+      contentType: "text/plain"
+    self assert: (self revoke: self tokens) isOk
+    self.provider
+      respond: "/revoke"
+      status: 200
+      body: "\{}"
+      contentType: "application/json"
+    self assert: (self revoke: self tokens) isOk
+
+  testUnsupportedTokenType =>
+    self.provider
+      fail: "/revoke"
+      status: 400
+      body: #{
+        "error" => "unsupported_token_type",
+        "error_description" => "this server does not revoke access tokens"
+      }
+    err := (self revoke: self tokens) error
+    self assert: err code equals: "unsupported_token_type"
+    self assert: err status equals: 400
+    self assert: err description equals: "this server does not revoke access tokens"
+
+  testNonJsonErrorIsTransportWithStatus =>
+    self.provider
+      respond: "/revoke"
+      status: 503
+      body: "try later"
+      contentType: "text/plain"
+    err := (self revoke: self tokens) error
+    self assert: err code equals: "transport"
+    self assert: err status equals: 503
+
+  testRedirectIsNotFollowed =>
+    self.provider redirect: "/revoke" to: "{self.provider issuer}/token"
+    err := (self revoke: self tokens) error
+    self assert: err code equals: "transport"
+    self assert: err status equals: 302
+    self assert: (self.provider hits: "/token") equals: 0
+    self assert: self.provider lastTokenRequest equals: nil
+
+  testMissingEndpointIsConfigError =>
+    self.provider discoveryOverrides: #{"revocation_endpoint" => nil}
+    srv := self server
+    self assert: srv revocationEndpoint equals: nil
+    got := TokenRevocation
+      revoke: srv
+      client: self publicClient
+      token: self tokens
+    self assert: got error code equals: "config"
+
+  testPlainHttpEndpointIsRefused =>
+    srv := self server withRevocationEndpoint: "http://example.test/revoke"
+    got := TokenRevocation
+      revoke: srv
+      client: self publicClient
+      token: self tokens
+    self assert: got error code equals: "insecure_endpoint"
+    self deny: (got error printString includesSubstring: "rt-1")
+    self assert: (TokenRevocation checkEndpoint: "https://example.test/revoke") equals: nil
+    // Plain HTTP to loopback passes only because FixtureProvider start set
+    // the test-only flag (the rule is the shim's check_https/2).
+    self assert: (TokenRevocation checkEndpoint: "http://[::1]:8080/revoke") equals: nil
+    self assert: (TokenRevocation checkEndpoint: "ftp://example.test/revoke") code equals: "insecure_endpoint"
+
+  // ===== No token in errors =====
+  testErrorsNeverCarryTheToken =>
+    self.provider
+      fail: "/revoke"
+      status: 400
+      body: #{
+        "error" => "invalid_request",
+        "error_description" => "bad token rt-1",
+        "token" => "rt-1"
+      }
+    err := (self revoke: self tokens) error
+    self assert: err code equals: "invalid_request"
+    self deny: (err printString includesSubstring: "rt-1")
+    self deny: (err asJson printString includesSubstring: "rt-1")
+
+  testErrorsNeverCarryEncodedTokenOrSecret =>
+    self.provider discoveryOverrides: #{
+      "revocation_endpoint_auth_methods_supported" => #("client_secret_post")
+    }
+    self.provider
+      fail: "/revoke"
+      status: 400
+      body: #{
+        "error" => "invalid_client",
+        "error_description" => "bad secret secret-1",
+        "hint" => "token was {"r t/1" urlEncoded}"
+      }
+    err := (TokenRevocation
+      revoke: self server
+      client: self confidentialClient
+      token: "r t/1") error
+    self assert: err code equals: "invalid_client"
+    text := err printString ++ err asJson printString
+    self deny: (text includesSubstring: "secret-1")
+    self deny: (text includesSubstring: "r t/1" urlEncoded)
+
+  testRaisedHttpClientErrorIsFixedTransport =>
+    // Unknown options make HTTPClient raise a type_error whose hint prints
+    // them; send: must answer a fixed transport error instead.
+    got := TokenRevocation
+      send: #post
+      url: "{self.provider issuer}/revoke"
+      options: #{#bogus => "secret-xyz"}
+      secrets: #("secret-xyz")
+    self assert: got error code equals: "transport"
+    self assert: got error detail equals: nil
+    self deny: (got error printString includesSubstring: "secret-xyz")
+
+  testTransportErrorNeverCarriesTheToken =>
+    srv := HTTPServer start: 0 handler: [:req |
+      HTTPResponse new: #{#status => 404}
+    ]
+    port := srv port
+    srv stop
+    closed := self server withRevocationEndpoint: "http://127.0.0.1:{port}/revoke?x=rt-1"
+    err := (TokenRevocation
+      revoke: closed
+      client: self publicClient
+      token: self tokens) error
+    self assert: err code equals: "transport"
+    self deny: (err printString includesSubstring: "rt-1")
+    self deny: (err asJson printString includesSubstring: "rt-1")

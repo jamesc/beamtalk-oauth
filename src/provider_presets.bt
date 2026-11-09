@@ -16,7 +16,8 @@
 ///   GitLab). The absolute endpoints above apply only at `#issuer`; see
 ///   `OAuthServer`;
 /// - `#tokenInfoAuth` — how token info takes the token: `#bearer` (an
-///   `Authorization` header) or `#query` (an `access_token` parameter);
+///   `Authorization` header on a GET) or `#form` (an `access_token` form
+///   parameter on a POST, so the token is never in a URL);
 /// - `#tokenInfoFields` — where the normalized token-info fields
 ///   (`#subject`, `#scopes`, `#expiresIn`) live in the provider's answer;
 /// - `#documentOverrides` — members merged over the discovery document,
@@ -65,7 +66,7 @@ Object subclass: ProviderPresets
 
   /// Google. `access_type=offline` asks for a refresh token and
   /// `prompt=consent` makes Google issue one again on later logins. Token
-  /// info is `GET tokeninfo?access_token=...`. Discovery names the
+  /// info is `POST tokeninfo` with an `access_token` form parameter. Discovery names the
   /// revocation endpoint; the preset repeats it as the fallback.
   class google -> Dictionary =>
     #{
@@ -74,7 +75,7 @@ Object subclass: ProviderPresets
       #authorizeParams => #{"access_type" => "offline", "prompt" => "consent"},
       #revocationEndpoint => "https://oauth2.googleapis.com/revoke",
       #tokenInfoEndpoint => "https://oauth2.googleapis.com/tokeninfo",
-      #tokenInfoAuth => #query,
+      #tokenInfoAuth => #form,
       #tokenInfoFields => #{
         #subject => "sub",
         #scopes => "scope",

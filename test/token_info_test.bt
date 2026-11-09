@@ -1,0 +1,267 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+// TokenRevocation tokenInfo: against the fixture provider's /tokeninfo
+// route, with the GitLab and Google presets pointed at the fixture. No
+// test hits the network, and none may reach httpc.
+
+TestCase subclass: TokenInfoTest
+  field: provider = nil
+
+  setUp =>
+    HttpcGuard install
+    self.provider := FixtureProvider start
+
+  tearDown =>
+    self.provider stop
+    self assert: HttpcGuard calls equals: 0
+    nil
+
+  /// `preset` as if the fixture were its provider: its `#issuer` and
+  /// absolute endpoints pointed at the fixture (preset endpoints apply only
+  /// at the preset's own issuer).
+  local: preset :: Dictionary -> Dictionary =>
+    base := self.provider issuer
+    ((preset at: #issuer put: base) at: #tokenInfoEndpoint put: "{base}/tokeninfo") at: #revocationEndpoint put: "{base}/revoke"
+
+  serverFor: preset :: Dictionary -> OAuthServer =>
+    (OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: (self local: preset)
+      options: #{#allowUnsafeHttp => true}) unwrap
+
+  gitlab -> OAuthServer => self serverFor: ProviderPresets gitlab
+
+  google -> OAuthServer => self serverFor: ProviderPresets google
+
+  client -> ClientRegistration =>
+    (ClientRegistration forClient: FixtureProvider clientId redirect: "http://127.0.0.1:50278/callback") unwrap
+
+  tokens -> TokenSet =>
+    TokenSet new: #{#accessToken => "at-1", #refreshToken => "rt-1"}
+
+  info: server :: OAuthServer token: tok :: Object -> Result =>
+    TokenRevocation
+      tokenInfo: server
+      client: self client
+      token: tok
+
+  lastRequest -> Dictionary => self.provider lastRequestTo: "/tokeninfo"
+
+  // ===== GitLab =====
+  testGitlabNormalization =>
+    self.provider
+      tokenInfo: #{
+        "resource_owner_id" => 42,
+        "scope" => #("openid", "api"),
+        "expires_in" => 7200,
+        "application" => #{"uid" => "client-1"},
+        "created_at" => 1700000000
+      }
+    info := (self info: self gitlab token: self tokens) unwrap
+    self
+      assert: info
+      equals: #{
+        #active => true,
+        #subject => "42",
+        #scopes => #("openid", "api"),
+        #expiresIn => 7200
+      }
+    req := self lastRequest
+    self assert: (req at: #method) equals: "GET"
+    self assert: ((req at: #headers) at: "authorization") equals: "Bearer at-1"
+    self deny: ((req at: #query) includesKey: "access_token")
+
+  testGitlabInvalidTokenIsInactive =>
+    info := (self info: self gitlab token: "bogus") unwrap
+    self assert: (info at: #active) equals: false
+    self assert: (info at: #subject) equals: nil
+    self assert: (info at: #scopes) equals: #()
+    self assert: (info at: #expiresIn) equals: nil
+
+  testSelfHostedGitlabUsesPathUnderIssuer =>
+    // The unmodified GitLab preset at another issuer: token info goes to
+    // {issuer}/oauth/token/info, never to gitlab.com.
+    srv := (OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: ProviderPresets gitlab
+      options: #{#allowUnsafeHttp => true}) unwrap
+    self assert: srv tokenInfoEndpoint equals: "{self.provider issuer}/oauth/token/info"
+    self.provider
+      tokenInfo: #{
+        "resource_owner_id" => 7,
+        "scope" => #("api"),
+        "application" => #{"uid" => "client-1"}
+      }
+    info := (self info: srv token: self tokens) unwrap
+    self assert: (info at: #subject) equals: "7"
+    req := self.provider lastRequestTo: "/oauth/token/info"
+    self assert: ((req at: #headers) at: "authorization") equals: "Bearer at-1"
+
+  testGooglePresetAtAnotherIssuerHasNoTokenInfo =>
+    srv := (OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: ProviderPresets google
+      options: #{#allowUnsafeHttp => true}) unwrap
+    self assert: srv tokenInfoEndpoint equals: nil
+    self assert: (self info: srv token: self tokens) error code equals: "config"
+
+  // ===== Google =====
+  testGoogleNormalization =>
+    self.provider
+      tokenInfo: #{
+        "azp" => "client-1",
+        "aud" => "client-1",
+        "sub" => "1234567890",
+        "scope" => "openid https://www.googleapis.com/auth/userinfo.email",
+        "exp" => "1700003600",
+        "expires_in" => "3599",
+        "email" => "user@example.test"
+      }
+    info := (self info: self google token: self tokens) unwrap
+    self
+      assert: info
+      equals: #{
+        #active => true,
+        #subject => "1234567890",
+        #scopes => #("openid", "https://www.googleapis.com/auth/userinfo.email"),
+        #expiresIn => 3599
+      }
+    req := self lastRequest
+    self assert: (req at: #method) equals: "POST"
+    self assert: ((req at: #form) at: "access_token") equals: "at-1"
+    self deny: ((req at: #query) includesKey: "access_token")
+    self deny: ((req at: #headers) includesKey: "authorization")
+
+  testGoogleInvalidValueIsInactive =>
+    self.provider
+      fail: "/tokeninfo"
+      status: 400
+      body: #{"error_description" => "Invalid Value"}
+    info := (self info: self google token: self tokens) unwrap
+    self assert: (info at: #active) equals: false
+
+  testInvalidTokenErrorIsInactive =>
+    self.provider
+      fail: "/tokeninfo"
+      status: 400
+      body: #{"error" => "invalid_token"}
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
+
+  testActiveMemberIsRespected =>
+    self.provider tokenInfo: #{"active" => false, "sub" => "user-1"}
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
+
+  testGitlabNullFieldsNormalize =>
+    self.provider
+      tokenInfo: #{
+        "resource_owner_id" => nil,
+        "scope" => #("api"),
+        "expires_in" => nil,
+        "application" => #{"uid" => "client-1"}
+      }
+    info := (self info: self gitlab token: self tokens) unwrap
+    self assert: (info at: #active) equals: true
+    self assert: (info at: #subject) equals: nil
+    self assert: (info at: #expiresIn) equals: nil
+
+  testTokenForAnotherClientIsInactive =>
+    self.provider tokenInfo: #{
+      "resource_owner_id" => 42,
+      "application" => #{"uid" => "other-app"}
+    }
+    self assert: ((self info: self gitlab token: self tokens) unwrap at: #active) equals: false
+    self.provider tokenInfo: #{
+      "sub" => "user-1",
+      "azp" => "other-app",
+      "aud" => "other-app"
+    }
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
+    self.provider tokenInfo: #{
+      "sub" => "user-1",
+      "azp" => "client-1",
+      "aud" => "api-audience"
+    }
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: true
+
+  testFailsClosed =>
+    // No binding field at all.
+    self.provider tokenInfo: #{}
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
+    self.provider tokenInfo: #{"sub" => "user-1", "scope" => "openid"}
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
+    // A 200 carrying an error member.
+    self.provider tokenInfo: #{"error" => "invalid_token", "azp" => "client-1"}
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
+    // aud as a List.
+    self.provider tokenInfo: #{"sub" => "user-1", "aud" => #("other")}
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
+    self.provider tokenInfo: #{
+      "sub" => "user-1",
+      "aud" => #("other", "client-1")
+    }
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: true
+    // A matching aud does not override a foreign azp.
+    self.provider tokenInfo: #{
+      "sub" => "user-1",
+      "azp" => "other",
+      "aud" => "client-1"
+    }
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
+
+  // ===== Errors =====
+  testOtherErrorsAreErrors =>
+    self.provider
+      fail: "/tokeninfo"
+      status: 400
+      body: #{"error" => "invalid_request"}
+    err := (self info: self google token: self tokens) error
+    self assert: err code equals: "invalid_request"
+    self assert: err status equals: 400
+    self.provider
+      respond: "/tokeninfo"
+      status: 500
+      body: "oops"
+      contentType: "text/plain"
+    err2 := (self info: self gitlab token: self tokens) error
+    self assert: err2 code equals: "transport"
+    self assert: err2 status equals: 500
+
+  testNonJsonSuccessIsParseError =>
+    self.provider
+      respond: "/tokeninfo"
+      status: 200
+      body: "ok"
+      contentType: "text/plain"
+    self assert: (self info: self gitlab token: self tokens) error code equals: "parse"
+
+  testMissingEndpointIsConfigError =>
+    srv := (OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: #{}
+      options: #{#allowUnsafeHttp => true}) unwrap
+    self assert: (self info: srv token: self tokens) error code equals: "config"
+    self assert: self lastRequest equals: nil
+
+  testPlainHttpEndpointIsRefused =>
+    srv := self google withTokenInfoEndpoint: "http://example.test/tokeninfo"
+    err := (self info: srv token: self tokens) error
+    self assert: err code equals: "insecure_endpoint"
+    self deny: (err printString includesSubstring: "at-1")
+
+  testEmptyTokenIsConfigError =>
+    self assert: (self info: self gitlab token: "") error code equals: "config"
+
+  testErrorsNeverCarryTheToken =>
+    self.provider
+      fail: "/tokeninfo"
+      status: 403
+      body: #{
+        "error" => "insufficient_scope",
+        "error_description" => "token at-1 lacks scope",
+        "access_token" => "at-1"
+      }
+    err := (self info: self google token: self tokens) error
+    self assert: err code equals: "insufficient_scope"
+    self deny: (err printString includesSubstring: "at-1")
+    self deny: (err asJson printString includesSubstring: "at-1")
