@@ -22,8 +22,16 @@ A discovered provider is held as the opaque
 JWKS and the request options. Beamtalk stores it in `OAuthServer` and
 hands it back; it never looks inside.
 
+Every flow entry point (`authorize_url/3`, `retrieve_token/3`,
+`refresh_token/3`, `userinfo/3`) first checks the caller's expected
+`issuer` against the issuer in the provider configuration itself, not
+the copy Beamtalk holds, so a hand-built `OAuthServer` that pairs one
+issuer with another provider's context is refused before any request
+(`{session_mismatch, issuer}`).
+
 Errors are `oidcc`'s own reasons, plus `{insecure_endpoint, Field, Url}`
-from the HTTPS-only check and `{http_client, Reason}` from the adapter.
+from the HTTPS-only check, `{http_client, Reason}` from the adapter,
+`{missing_param, Key}` and `{session_mismatch, issuer}` from this shim.
 `OAuthError fromOidcc:` maps all of them.
 """.
 
@@ -36,7 +44,10 @@ from the HTTPS-only check and `{http_client, Reason}` from the adapter.
     client_context/3,
     call_opts/1,
     check_https/2,
+    authorize_url/3,
     retrieve_token/3,
+    refresh_token/3,
+    userinfo/3,
     token_to_map/1,
     to_beamtalk/1
 ]).
@@ -240,11 +251,71 @@ check_complete(Endpoints) ->
     end.
 
 -doc """
+The authorization-request URL for `Provider`, from
+`oidcc_authorization:create_redirect_url/2` with PKCE always required
+(`require_pkce => true`) and S256 only.
+
+`Client` is `#{client_id, client_secret}`; `Params` is
+`#{issuer, redirect_uri, state, nonce, pkce_verifier, scopes, extra}`,
+where `scopes` is a list of Strings and `extra` a list of
+`{Name, Value}` String pairs appended to the query. The call carries
+`call_opts/1`, so a pushed authorization request (PAR) also goes
+through the adapter.
+
+A provider that does not advertise S256 in
+`code_challenge_methods_supported` answers
+`{error, no_supported_code_challenge}`: `oidcc` would otherwise fall
+back to `plain`.
+""".
+-spec authorize_url(provider(), Client :: map(), Params :: map()) ->
+    {ok, term()} | {error, term()}.
+authorize_url({beamtalk_oauth_provider, #{config := Config}} = Provider, Client, Params) when
+    is_map(Client), is_map(Params)
+->
+    ensure_started(),
+    maybe
+        {ok, [ClientId]} ?= required(Client, [client_id]),
+        {ok, [Issuer, Redirect, State, Nonce, Verifier]} ?=
+            required(Params, [issuer, redirect_uri, state, nonce, pkce_verifier]),
+        ok ?= check_issuer(Provider, Issuer),
+        ok ?= check_s256(Config),
+        Context = client_context(Provider, ClientId, maps:get(client_secret, Client, nil)),
+        Opts = (call_opts(Provider))#{
+            redirect_uri => Redirect,
+            state => State,
+            nonce => Nonce,
+            pkce_verifier => Verifier,
+            require_pkce => true,
+            scopes => [untag(S) || S <- maps:get(scopes, Params, [])],
+            url_extension => [{untag(K), untag(V)} || {K, V} <- maps:get(extra, Params, [])]
+        },
+        {ok, Url} ?= oidcc_authorization:create_redirect_url(Context, Opts),
+        {ok, str(Url)}
+    end;
+authorize_url(_Provider, _Client, _Params) ->
+    {error, invalid_provider}.
+
+check_s256(#oidcc_provider_configuration{code_challenge_methods_supported = Methods}) ->
+    case is_list(Methods) andalso lists:member(<<"S256">>, Methods) of
+        true -> ok;
+        false -> {error, no_supported_code_challenge}
+    end.
+
+%% `ok` when `Expected` is the issuer of `Provider`'s own configuration.
+check_issuer({beamtalk_oauth_provider, #{config := Config}}, Expected) ->
+    case Config#oidcc_provider_configuration.issuer of
+        Expected -> ok;
+        _ -> {error, {session_mismatch, issuer}}
+    end.
+
+-doc """
 Exchange an authorization code at `Provider`'s token endpoint, with the
 ID token validated by `oidcc` and PKCE always required.
 
 `Client` is `#{client_id, client_secret}` (secret `nil` for a public
-client); `Params` is `#{code, redirect_uri, nonce, pkce_verifier}`.
+client); `Params` is `#{issuer, code, redirect_uri, nonce,
+pkce_verifier}`, where `issuer` is the issuer the flow was started for
+(checked against the provider configuration before any request).
 Answers `{ok, token_to_map(Token)}` or `{error, Reason}`.
 """.
 -spec retrieve_token(provider(), Client :: map(), Params :: map()) ->
@@ -255,8 +326,9 @@ retrieve_token({beamtalk_oauth_provider, _} = Provider, Client, Params) when
     ensure_started(),
     maybe
         {ok, [ClientId]} ?= required(Client, [client_id]),
-        {ok, [Code, Redirect, Nonce, Verifier]} ?=
-            required(Params, [code, redirect_uri, nonce, pkce_verifier]),
+        {ok, [Issuer, Code, Redirect, Nonce, Verifier]} ?=
+            required(Params, [issuer, code, redirect_uri, nonce, pkce_verifier]),
+        ok ?= check_issuer(Provider, Issuer),
         Context = client_context(Provider, ClientId, maps:get(client_secret, Client, nil)),
         Opts = (call_opts(Provider))#{
             redirect_uri => Redirect,
@@ -269,6 +341,64 @@ retrieve_token({beamtalk_oauth_provider, _} = Provider, Client, Params) when
     end;
 retrieve_token(_Provider, _Client, _Params) ->
     %% No function_clause: its stacktrace would carry the secret.
+    {error, invalid_provider}.
+
+-doc """
+Refresh at `Provider`'s token endpoint with `oidcc_token:refresh/3`.
+`oidcc` requires the response's ID token and checks that its `sub` is
+`expected_subject` (`{error, sub_invalid}` otherwise).
+
+`Client` is as for `retrieve_token/3`; `Params` is
+`#{issuer, refresh_token, expected_subject}`, where `issuer` is the
+issuer of the original ID token. Answers `{ok, token_to_map(Token)}`.
+""".
+-spec refresh_token(provider(), Client :: map(), Params :: map()) ->
+    {ok, map()} | {error, term()}.
+refresh_token({beamtalk_oauth_provider, _} = Provider, Client, Params) when
+    is_map(Client), is_map(Params)
+->
+    ensure_started(),
+    maybe
+        {ok, [ClientId]} ?= required(Client, [client_id]),
+        {ok, [Issuer, RefreshToken, Subject]} ?=
+            required(Params, [issuer, refresh_token, expected_subject]),
+        ok ?= check_issuer(Provider, Issuer),
+        Context = client_context(Provider, ClientId, maps:get(client_secret, Client, nil)),
+        Opts = (call_opts(Provider))#{expected_subject => Subject},
+        {ok, Token} ?= oidcc_token:refresh(RefreshToken, Context, Opts),
+        {ok, token_to_map(Token)}
+    end;
+refresh_token(_Provider, _Client, _Params) ->
+    {error, invalid_provider}.
+
+-doc """
+Userinfo from `Provider` with `oidcc_userinfo:retrieve/3`, the answer's
+`sub` checked against `expected_subject` (`{error, bad_subject}`
+otherwise).
+
+`Client` is as for `retrieve_token/3` (the id is the expected audience
+of a signed userinfo response); `Params` is
+`#{issuer, access_token, token_type, expected_subject}`. Answers
+`{ok, Claims}` with the claims as Beamtalk values (String keys).
+""".
+-spec userinfo(provider(), Client :: map(), Params :: map()) ->
+    {ok, map()} | {error, term()}.
+userinfo({beamtalk_oauth_provider, _} = Provider, Client, Params) when
+    is_map(Client), is_map(Params)
+->
+    ensure_started(),
+    maybe
+        {ok, [ClientId]} ?= required(Client, [client_id]),
+        {ok, [Issuer, AccessToken, Type, Subject]} ?=
+            required(Params, [issuer, access_token, token_type, expected_subject]),
+        ok ?= check_issuer(Provider, Issuer),
+        Context = client_context(Provider, ClientId, maps:get(client_secret, Client, nil)),
+        Access = #oidcc_token_access{token = AccessToken, type = Type},
+        Opts = (call_opts(Provider))#{expected_subject => Subject},
+        {ok, Claims} ?= oidcc_userinfo:retrieve(Access, Context, Opts),
+        {ok, to_beamtalk(Claims)}
+    end;
+userinfo(_Provider, _Client, _Params) ->
     {error, invalid_provider}.
 
 %% The text values of `Keys` in `Map`, or `{error, {missing_param, Key}}`

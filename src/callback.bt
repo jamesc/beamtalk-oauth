@@ -1,0 +1,38 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+/// Callback — a parsed, accepted authorization callback.
+///
+/// `OAuthFlows handleCallback:store:boundTo:` answers one after it has
+/// parsed the redirect's query, consumed the matching `OAuthSession` from
+/// the `SessionStore` with the user-agent binding, and checked any RFC 9207
+/// `iss` parameter. Pass it to `OAuthFlows exchangeCode:client:callback:`.
+///
+/// `printString` and `asJson` redact the authorization code (and, through
+/// the session, the nonce and code verifier).
+///
+/// ## Examples
+/// ```beamtalk
+/// cb := (OAuthFlows handleCallback: query store: store boundTo: binding) unwrap
+/// cb session issuer      // => "https://gitlab.com"
+/// cb printString         // code shows as [redacted]
+/// ```
+typed Value subclass: Callback
+  /// The authorization code.
+  field: code :: String = ""
+  /// The RFC 9207 `iss` parameter, or nil when the provider sent none.
+  field: iss :: String | Nil = nil
+  /// The session the callback's `state` named, consumed from the store.
+  field: session :: OAuthSession = OAuthSession new
+
+  /// `Callback(code: [redacted], iss: ..., state: ...)`.
+  printString -> String =>
+    "Callback(code: {OAuthError redacted}, iss: {self.iss}, state: {self.session state})"
+
+  /// The JSON shape, with the code redacted.
+  asJson -> Dictionary =>
+    #{
+      "code" => OAuthError redacted,
+      "iss" => self.iss,
+      "session" => self.session asJson
+    }

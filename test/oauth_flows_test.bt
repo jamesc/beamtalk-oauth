@@ -1,0 +1,544 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+// OAuthFlows against the FixtureProvider: the authorization URL, the
+// callback, the code exchange, refresh and userinfo. No test hits the
+// network, and none may reach httpc (HttpcGuard).
+
+TestCase subclass: OAuthFlowsTest
+  field: provider = nil
+  field: server = nil
+  field: reg = nil
+  field: store = nil
+  field: binding = nil
+
+  setUp =>
+    HttpcGuard install
+    self.provider := FixtureProvider start
+    self.server := self discover: #{}
+    self.reg := (ClientRegistration
+      forClient: FixtureProvider clientId
+      secret: FixtureProvider clientSecret
+      redirect: self redirectUri) unwrap
+    self.store := SessionStore spawn
+    self.binding := Secrets generate
+    self
+
+  tearDown =>
+    self.store stop
+    self.provider stop
+    self assert: HttpcGuard calls equals: 0
+    nil
+
+  redirectUri -> String => "http://127.0.0.1:50278/callback"
+
+  // Discover the fixture provider with `preset`.
+  discover: preset :: Dictionary -> OAuthServer =>
+    (OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: preset
+      options: #{#allowUnsafeHttp => true}) unwrap
+
+  // A fresh session for the fixture, stored under the test's binding, with
+  // the fixture's ID token carrying its nonce.
+  newSession -> OAuthSession =>
+    sess := OAuthSession newSessionFor: self.server client: self.reg
+    self.store create: sess boundTo: self.binding
+    self.provider claims: #{"nonce" => sess nonce}
+    sess
+
+  // A callback for `sess` without going through the store.
+  callbackFor: sess :: OAuthSession -> Callback =>
+    Callback
+      code: "code-1"
+      iss: nil
+      session: sess
+
+  // A completed code exchange.
+  exchange -> TokenSet =>
+    sess := self newSession
+    (OAuthFlows
+      exchangeCode: self.server
+      client: self.reg
+      callback: (self callbackFor: sess)) unwrap
+
+  // The query of `url` as a Dictionary.
+  queryOf: url :: String -> Object => OAuthFlows parseQuery: url
+
+  codeOf: result :: Result -> String => result error code
+
+  // ===== Authorization URL =====
+  testAuthorizeUrlContents =>
+    sess := self newSession
+    url := (OAuthFlows
+      authorizeUrl: self.server
+      client: self.reg
+      scopes: #("openid", "profile")
+      session: sess) unwrap
+    self assert: (url startsWith: "{self.provider issuer}/authorize?")
+    q := self queryOf: url
+    self assert: (q at: "response_type") equals: "code"
+    self assert: (q at: "client_id") equals: FixtureProvider clientId
+    self assert: (q at: "redirect_uri") equals: self redirectUri
+    self assert: (q at: "state") equals: sess state
+    self assert: (q at: "nonce") equals: sess nonce
+    self assert: (q at: "scope") equals: "openid profile"
+    self assert: (q at: "code_challenge_method") equals: "S256"
+    challenge := (Erlang crypto hash: #sha256 with: sess codeVerifier) asBase64Url replaceAll: "=" with: ""
+    self assert: (q at: "code_challenge") equals: challenge
+    self deny: (url includesSubstring: sess codeVerifier)
+    // Building the URL makes no request.
+    self assert: self.provider lastTokenRequest equals: nil
+
+  testAuthorizeUrlAddsOpenidAndExtras =>
+    self.server := self discover: #{
+      #authorizeParams => #{"access_type" => "offline", "prompt" => "none"}
+    }
+    sess := self newSession
+    url := (OAuthFlows
+      authorizeUrl: self.server
+      client: self.reg
+      scopes: #("profile")
+      session: sess
+      extraParams: #{#prompt => "consent", "login_hint" => "a@b.test"}) unwrap
+    q := self queryOf: url
+    self assert: (q at: "scope") equals: "openid profile"
+    self assert: (q at: "access_type") equals: "offline"
+    self assert: (q at: "prompt") equals: "consent"
+    self assert: (q at: "login_hint") equals: "a@b.test"
+
+  testAuthorizeUrlRefusesReservedExtras =>
+    sess := self newSession
+    #("state", "code_challenge_method", "nonce", "redirect_uri")
+      do: [:name |
+        got := OAuthFlows
+          authorizeUrl: self.server
+          client: self.reg
+          scopes: #("openid")
+          session: sess
+          extraParams: (#{} at: name put: "x")
+        self assert: (self codeOf: got) equals: "config"
+      ]
+
+  testAuthorizeUrlRequiresS256 =>
+    self.provider discoveryOverrides: #{
+      "code_challenge_methods_supported" => #("plain")
+    }
+    self.server := self discover: #{}
+    got := OAuthFlows
+      authorizeUrl: self.server
+      client: self.reg
+      scopes: #("openid")
+      session: self newSession
+    self assert: (self codeOf: got) equals: "no_supported_code_challenge"
+    self.provider discoveryOverrides: #{
+      "code_challenge_methods_supported" => nil
+    }
+    self.server := self discover: #{}
+    missing := OAuthFlows
+      authorizeUrl: self.server
+      client: self.reg
+      scopes: #("openid")
+      session: self newSession
+    self assert: (self codeOf: missing) equals: "no_supported_code_challenge"
+
+  testAuthorizeUrlChecksSessionAndRedirect =>
+    sess := self newSession
+    other := sess withIssuer: "https://other.test"
+    got := OAuthFlows
+      authorizeUrl: self.server
+      client: self.reg
+      scopes: #("openid")
+      session: other
+    self assert: (self codeOf: got) equals: "session_mismatch"
+    // A registration built without validation is re-checked.
+    bad := self.reg withRedirectUri: "http://localhost/cb"
+    badSess := sess withRedirectUri: "http://localhost/cb"
+    refused := OAuthFlows
+      authorizeUrl: self.server
+      client: bad
+      scopes: #("openid")
+      session: badSess
+    self assert: (self codeOf: refused) equals: "insecure_endpoint"
+
+  // ===== Callback =====
+  testHandleCallback =>
+    sess := self newSession
+    query := #(#("code", "code-9"), #("state", sess state), #("iss", self.provider issuer))
+    cb := (OAuthFlows
+      handleCallback: query
+      store: self.store
+      boundTo: self.binding) unwrap
+    self assert: cb code equals: "code-9"
+    self assert: cb iss equals: self.provider issuer
+    self assert: cb session state equals: sess state
+    self assert: cb session nonce equals: sess nonce
+    self deny: (cb printString includesSubstring: "code-9")
+    // Single use.
+    again := OAuthFlows
+      handleCallback: query
+      store: self.store
+      boundTo: self.binding
+    self assert: (self codeOf: again) equals: "reused_state"
+
+  testHandleCallbackAcceptsQueryStringAndUrl =>
+    sess := self newSession
+    raw := "?code=abc&state={sess state}"
+    cb := (OAuthFlows
+      handleCallback: raw
+      store: self.store
+      boundTo: self.binding) unwrap
+    self assert: cb code equals: "abc"
+    self assert: cb iss equals: nil
+    sess2 := self newSession
+    url := "{self redirectUri}?code=def&state={sess2 state}"
+    cb2 := (OAuthFlows
+      handleCallback: url
+      store: self.store
+      boundTo: self.binding) unwrap
+    self assert: cb2 code equals: "def"
+    sess3 := self newSession
+    dict := #{"code" => "ghi", "state" => sess3 state}
+    cb3 := (OAuthFlows
+      handleCallback: dict
+      store: self.store
+      boundTo: self.binding) unwrap
+    self assert: cb3 code equals: "ghi"
+
+  testDuplicateCallbackParameterIsParseError =>
+    sess := self newSession
+    raw := "code=a&state={sess state}&state={sess state}"
+    got := OAuthFlows
+      handleCallback: raw
+      store: self.store
+      boundTo: self.binding
+    self assert: (self codeOf: got) equals: "parse"
+    dupCode := OAuthFlows
+      handleCallback: #(#("code", "a"), #("code", "b"), #("state", sess state))
+      store: self.store
+      boundTo: self.binding
+    self assert: (self codeOf: dupCode) equals: "parse"
+    // The store was not touched.
+    self assert: self.store size equals: 1
+
+  testMissingCodeOrStateIsParseError =>
+    sess := self newSession
+    noCode := OAuthFlows
+      handleCallback: "state={sess state}"
+      store: self.store
+      boundTo: self.binding
+    self assert: (self codeOf: noCode) equals: "parse"
+    noState := OAuthFlows
+      handleCallback: "code=a"
+      store: self.store
+      boundTo: self.binding
+    self assert: (self codeOf: noState) equals: "parse"
+    emptyCode := OAuthFlows
+      handleCallback: "code=&state={sess state}"
+      store: self.store
+      boundTo: self.binding
+    self assert: (self codeOf: emptyCode) equals: "parse"
+    flag := OAuthFlows
+      handleCallback: "code&state={sess state}"
+      store: self.store
+      boundTo: self.binding
+    self assert: (self codeOf: flag) equals: "parse"
+    self
+      assert: (self
+        codeOf: (OAuthFlows
+          handleCallback: 42
+          store: self.store
+          boundTo: self.binding))
+      equals: "parse"
+    self assert: self.store size equals: 1
+
+  testProviderErrorIsVerbatimAndBurnsSession =>
+    sess := self newSession
+    raw := "error=access_denied&error_description=User%20said%20no&state={sess state}"
+    got := OAuthFlows
+      handleCallback: raw
+      store: self.store
+      boundTo: self.binding
+    err := got error
+    self assert: err code equals: "access_denied"
+    self assert: err description equals: "User said no"
+    self assert: self.store size equals: 0
+
+  testProviderErrorWithWrongBindingIsSessionMismatch =>
+    sess := self newSession
+    raw := "error=access_denied&state={sess state}"
+    got := OAuthFlows
+      handleCallback: raw
+      store: self.store
+      boundTo: Secrets generate
+    self assert: (self codeOf: got) equals: "session_mismatch"
+
+  testMismatchedBindingIsSessionMismatch =>
+    sess := self newSession
+    raw := "code=a&state={sess state}"
+    got := OAuthFlows
+      handleCallback: raw
+      store: self.store
+      boundTo: Secrets generate
+    self assert: (self codeOf: got) equals: "session_mismatch"
+    // The probed session is burned.
+    retry := OAuthFlows
+      handleCallback: raw
+      store: self.store
+      boundTo: self.binding
+    self assert: (self codeOf: retry) equals: "reused_state"
+
+  testCallbackIssMustMatchSession =>
+    sess := self newSession
+    query := #(#("code", "a"), #("state", sess state), #("iss", "https://attacker.test"))
+    got := OAuthFlows
+      handleCallback: query
+      store: self.store
+      boundTo: self.binding
+    self assert: (self codeOf: got) equals: "issuer_mismatch"
+
+  // ===== Code exchange =====
+  testExchangeCode =>
+    before := TokenSet now
+    sess := self newSession
+    toks := (OAuthFlows
+      exchangeCode: self.server
+      client: self.reg
+      callback: (self callbackFor: sess)) unwrap
+    self assert: toks accessToken equals: "at-1"
+    self assert: toks refreshToken equals: "rt-1"
+    self assert: toks expiresIn equals: 3600
+    self assert: toks scope equals: "openid profile email"
+    self assert: toks subject equals: "user-1"
+    self assert: (toks idTokenClaims at: "nonce") equals: sess nonce
+    self assert: (toks idToken startsWith: "eyJ")
+    self assert: toks obtainedAt >= before
+    self assert: toks obtainedAt <= TokenSet now
+
+  testTokenRequestCarriesPkceAndClientAuth =>
+    sess := self newSession
+    (OAuthFlows
+      exchangeCode: self.server
+      client: self.reg
+      callback: (self callbackFor: sess)) unwrap
+    form := self.provider lastTokenRequest at: #form
+    self assert: (form at: "grant_type") equals: "authorization_code"
+    self assert: (form at: "code") equals: "code-1"
+    self assert: (form at: "redirect_uri") equals: self redirectUri
+    self assert: (form at: "code_verifier") equals: sess codeVerifier
+    self assert: (form at: "client_id") equals: FixtureProvider clientId
+    self assert: (form at: "client_secret") equals: FixtureProvider clientSecret
+
+  testFullFlowThroughCallback =>
+    sess := self newSession
+    url := (OAuthFlows
+      authorizeUrl: self.server
+      client: self.reg
+      scopes: #("openid")
+      session: sess) unwrap
+    state := (self queryOf: url) at: "state"
+    cb := (OAuthFlows
+      handleCallback: #(#("code", "code-1"), #("state", state), #("iss", self.provider issuer))
+      store: self.store
+      boundTo: self.binding) unwrap
+    toks := (OAuthFlows
+      exchangeCode: self.server
+      client: self.reg
+      callback: cb) unwrap
+    self assert: toks subject equals: "user-1"
+
+  testNonceMismatchIsMissingClaim =>
+    sess := self newSession
+    self.provider claims: #{"nonce" => "someone-elses"}
+    got := OAuthFlows
+      exchangeCode: self.server
+      client: self.reg
+      callback: (self callbackFor: sess)
+    self assert: (self codeOf: got) equals: "missing_claim"
+    self deny: (got error printString includesSubstring: "someone-elses")
+
+  testWrongIssuerIsRejectedBeforeNetwork =>
+    sess := (self newSession) withIssuer: "https://other.test"
+    got := OAuthFlows
+      exchangeCode: self.server
+      client: self.reg
+      callback: (self callbackFor: sess)
+    self assert: (self codeOf: got) equals: "session_mismatch"
+    self assert: self.provider lastTokenRequest equals: nil
+
+  testWrongRedirectIsRejectedBeforeNetwork =>
+    sess := (self newSession) withRedirectUri: "http://127.0.0.1:9999/callback"
+    got := OAuthFlows
+      exchangeCode: self.server
+      client: self.reg
+      callback: (self callbackFor: sess)
+    self assert: (self codeOf: got) equals: "session_mismatch"
+    self assert: self.provider lastTokenRequest equals: nil
+
+  testInsecureRedirectIsRejectedBeforeNetwork =>
+    uri := "http://example.test/callback"
+    sess := (self newSession) withRedirectUri: uri
+    got := OAuthFlows
+      exchangeCode: self.server
+      client: (self.reg withRedirectUri: uri)
+      callback: (self callbackFor: sess)
+    self assert: (self codeOf: got) equals: "insecure_endpoint"
+    self assert: self.provider lastTokenRequest equals: nil
+
+  testHandBuiltServerIssuerIsCheckedAgainstContext =>
+    // A server pairing one issuer with another provider's context.
+    forged := self.server withIssuer: "https://forged.test"
+    sess := (self newSession) withIssuer: "https://forged.test"
+    got := OAuthFlows
+      exchangeCode: forged
+      client: self.reg
+      callback: (self callbackFor: sess)
+    self assert: (self codeOf: got) equals: "session_mismatch"
+    self assert: self.provider lastTokenRequest equals: nil
+    url := OAuthFlows
+      authorizeUrl: forged
+      client: self.reg
+      scopes: #("openid")
+      session: sess
+    self assert: (self codeOf: url) equals: "session_mismatch"
+
+  testCallbackIssIsCheckedAtExchange =>
+    sess := self newSession
+    cb := Callback
+      code: "code-1"
+      iss: "https://other.test"
+      session: sess
+    got := OAuthFlows
+      exchangeCode: self.server
+      client: self.reg
+      callback: cb
+    self assert: (self codeOf: got) equals: "issuer_mismatch"
+    self assert: self.provider lastTokenRequest equals: nil
+
+  testIssRequiredWhenAdvertised =>
+    self.provider discoveryOverrides: #{
+      "authorization_response_iss_parameter_supported" => true
+    }
+    self.server := self discover: #{}
+    sess := self newSession
+    got := OAuthFlows
+      exchangeCode: self.server
+      client: self.reg
+      callback: (self callbackFor: sess)
+    self assert: (self codeOf: got) equals: "issuer_mismatch"
+    self assert: self.provider lastTokenRequest equals: nil
+    withIss := Callback
+      code: "code-1"
+      iss: self.provider issuer
+      session: sess
+    self
+      assert: (OAuthFlows
+        exchangeCode: self.server
+        client: self.reg
+        callback: withIss) isOk
+
+  testInvalidGrantPassesThrough =>
+    sess := self newSession
+    self.provider
+      fail: "/token"
+      status: 400
+      body: #{"error" => "invalid_grant", "error_description" => "code expired"}
+    err := (OAuthFlows
+      exchangeCode: self.server
+      client: self.reg
+      callback: (self callbackFor: sess)) error
+    self assert: err code equals: "invalid_grant"
+    self assert: err status equals: 400
+    self assert: err description equals: "code expired"
+
+  // ===== Refresh =====
+  testRefreshMergesResponse =>
+    toks := self exchange
+    self.provider tokenFields: #{
+      "access_token" => "at-2",
+      "refresh_token" => nil
+    }
+    fresh := (OAuthFlows
+      refresh: self.server
+      client: self.reg
+      tokenSet: toks) unwrap
+    self assert: fresh accessToken equals: "at-2"
+    // The response omitted a refresh token: the old one carries forward.
+    self assert: fresh refreshToken equals: "rt-1"
+    self assert: fresh subject equals: "user-1"
+    form := self.provider lastTokenRequest at: #form
+    self assert: (form at: "grant_type") equals: "refresh_token"
+    self assert: (form at: "refresh_token") equals: "rt-1"
+    self assert: (form at: "client_secret") equals: FixtureProvider clientSecret
+
+  testRefreshTakesNewRefreshToken =>
+    toks := self exchange
+    self.provider tokenFields: #{"refresh_token" => "rt-2"}
+    fresh := (OAuthFlows
+      refresh: self.server
+      client: self.reg
+      tokenSet: toks) unwrap
+    self assert: fresh refreshToken equals: "rt-2"
+
+  testRefreshRejectsChangedSubject =>
+    toks := self exchange
+    self.provider claims: #{"sub" => "user-2"}
+    got := OAuthFlows
+      refresh: self.server
+      client: self.reg
+      tokenSet: toks
+    self assert: (self codeOf: got) equals: "sub_invalid"
+
+  testRefreshRefusesTokensFromAnotherIssuer =>
+    toks := self exchange
+    claims := toks idTokenClaims at: "iss" put: "https://other.test"
+    self.provider reset
+    got := OAuthFlows
+      refresh: self.server
+      client: self.reg
+      tokenSet: (toks withIdTokenClaims: claims)
+    self assert: (self codeOf: got) equals: "issuer_mismatch"
+    self assert: self.provider lastTokenRequest equals: nil
+
+  testRefreshNeedsRefreshTokenAndSubject =>
+    toks := self exchange
+    self.provider reset
+    noRt := OAuthFlows
+      refresh: self.server
+      client: self.reg
+      tokenSet: (toks withRefreshToken: nil)
+    self assert: (self codeOf: noRt) equals: "config"
+    noClaims := OAuthFlows
+      refresh: self.server
+      client: self.reg
+      tokenSet: (toks withIdTokenClaims: nil)
+    self assert: (self codeOf: noClaims) equals: "config"
+    self assert: self.provider lastTokenRequest equals: nil
+
+  // ===== Userinfo =====
+  testUserInfo =>
+    toks := self exchange
+    info := (OAuthFlows
+      userInfo: self.server
+      client: self.reg
+      tokenSet: toks) unwrap
+    self assert: (info at: "sub") equals: "user-1"
+    self assert: (info at: "name") equals: "Fixture User"
+    // Without the registration, the client id comes from the ID token.
+    again := (OAuthFlows userInfo: self.server tokenSet: toks) unwrap
+    self assert: (again at: "email") equals: "user-1@example.test"
+
+  testUserInfoChecksSubject =>
+    toks := self exchange
+    self.provider claims: #{"sub" => "user-2"}
+    got := OAuthFlows
+      userInfo: self.server
+      client: self.reg
+      tokenSet: toks
+    self assert: (self codeOf: got) equals: "bad_subject"
+
+  testUserInfoRefusesTokensFromAnotherIssuer =>
+    toks := self exchange
+    claims := toks idTokenClaims at: "iss" put: "https://other.test"
+    got := OAuthFlows userInfo: self.server tokenSet: (toks withIdTokenClaims: claims)
+    self assert: (self codeOf: got) equals: "issuer_mismatch"
