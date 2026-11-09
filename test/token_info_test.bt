@@ -249,6 +249,19 @@ TestCase subclass: TokenInfoTest
     self assert: err code equals: "insecure_endpoint"
     self deny: (err printString includesSubstring: "at-1")
 
+  testPresetPlainHttpEndpointIsRefused =>
+    // The preset's absolute endpoint applies (its #issuer is the discovered
+    // one) and is checked when the request is made, like an override.
+    preset := (self local: ProviderPresets google) at: #tokenInfoEndpoint put: "http://example.test/tokeninfo"
+    srv := (OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: preset
+      options: #{#allowUnsafeHttp => true}) unwrap
+    self assert: srv tokenInfoEndpoint equals: "http://example.test/tokeninfo"
+    err := (self info: srv token: self tokens) error
+    self assert: err code equals: "insecure_endpoint"
+    self deny: (err printString includesSubstring: "at-1")
+
   testEmptyTokenIsConfigError =>
     self assert: (self info: self gitlab token: "") error code equals: "config"
 
