@@ -140,10 +140,19 @@ typed Value subclass: OAuthError
 
   /// `{http_client, Reason}` from the HTTP adapter: the request never got
   /// a response (connect, TLS, timeout, body over the cap). Answers
-  /// `transport`, described by `Reason` when it is text.
+  /// `transport`, described by `Reason` when it is text that does not look
+  /// secret (see `looksSecret:`).
   class fromHttpClient: term :: Tuple detail: detail :: Object -> OAuthError =>
     reason := term size >= 2 ifTrue: [term at: 2] ifFalse: [nil]
-    text := (self textOf: reason) ifNil: ["HTTP request failed"]
+    text := self textOf: reason
+    // A Symbol is one of the adapter's fixed reasons; text came from the
+    // HTTP client and is redacted like a detail.
+    (text isNil
+      or: [
+        (reason isKindOf: Symbol) not and: [
+          self looksSecret: (Binary fromIolist: #(text))
+        ]
+      ]) ifTrue: [text := "HTTP request failed"]
     self new: #{#code => "transport", #description => text, #detail => detail}
 
   /// `{http_error, Status, Body}`: the provider's `error` member when the

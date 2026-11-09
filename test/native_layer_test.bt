@@ -102,7 +102,57 @@ TestCase subclass: NativeLayerTest
     self assert: got error reason equals: {#http_client, #streaming_request_body}
     self assert: self.provider lastTokenRequest equals: nil
 
+  testAdapterRefusesMalformedHeadersAndSslOptions =>
+    url := self bin: "{self.provider issuer}/jwks"
+    got := Erlang beamtalk_oauth_http_adapter
+      request: #get
+      with: {url, #(#bogus)}
+      with: #()
+      with: #()
+      with: self adapterConfig
+    self assert: got error reason equals: {#http_client, #malformed_headers}
+    ssl := Erlang beamtalk_oauth_http_adapter
+      request: #get
+      with: {url, #()}
+      with: #({#ssl, #()})
+      with: #()
+      with: self adapterConfig
+    self assert: ssl error reason equals: {#http_client, #unsupported_ssl_options}
+
+  testAdapterCrashCarriesNoRequest =>
+    // A header value that is not iodata crashes inside the adapter; the
+    // crash becomes a fixed reason, not the request.
+    url := self bin: "{self.provider issuer}/token"
+    headers := #({self bin: "authorization", {#secret, self bin: "c2VjcmV0"}})
+    got := Erlang beamtalk_oauth_http_adapter
+      request: #get
+      with: {url, headers}
+      with: #()
+      with: #()
+      with: self adapterConfig
+    self assert: got error reason equals: {#http_client, {#raised, #error}}
+
   // ===== Shim =====
+  testRetrieveRefusesBadInput =>
+    params := self codeParams
+    noProvider := Erlang beamtalk_oauth_oidcc
+      retrieve_token: nil
+      with: self confidential
+      with: params
+    self assert: noProvider error reason equals: #invalid_provider
+    ctx := self server context
+    noCode := Erlang beamtalk_oauth_oidcc
+      retrieve_token: ctx
+      with: self confidential
+      with: (params removeKey: #code)
+    self assert: noCode error reason equals: {#missing_param, #code}
+    nilNonce := Erlang beamtalk_oauth_oidcc
+      retrieve_token: ctx
+      with: self confidential
+      with: (params at: #nonce put: nil)
+    self assert: nilNonce error reason equals: {#missing_param, #nonce}
+    self assert: self.provider lastTokenRequest equals: nil
+
   testHttpsCheck =>
     ok := #{
       #issuer => "https://a.test",
@@ -117,7 +167,22 @@ TestCase subclass: NativeLayerTest
     checked := Erlang beamtalk_oauth_oidcc check_https: bad with: false
     self assert: checked isError
     self assert: (OAuthError fromOidcc: checked error) code equals: "insecure_endpoint"
-    self assert: (Erlang beamtalk_oauth_oidcc check_https: bad with: true) isOk
+    // allowUnsafeHttp admits plain HTTP on loopback hosts only.
+    unsafe := Erlang beamtalk_oauth_oidcc check_https: bad with: true
+    self assert: (OAuthError fromOidcc: unsafe error) code equals: "insecure_endpoint"
+    loopback := #{
+      #token_endpoint => "http://127.0.0.1:8080/token",
+      #jwks_uri => "http://[::1]:8080/jwks"
+    }
+    self assert: (Erlang beamtalk_oauth_oidcc check_https: loopback with: true) isOk
+
+  testHttpsCheckOnDiscoveredMetadata =>
+    // End to end: the fixture's real (plain-HTTP) metadata fails the
+    // check unless the loopback opt-in is given.
+    metadata := self server metadata
+    strict := Erlang beamtalk_oauth_oidcc check_https: metadata with: false
+    self assert: (OAuthError fromOidcc: strict error) code equals: "insecure_endpoint"
+    self assert: (Erlang beamtalk_oauth_oidcc check_https: metadata with: true) isOk
 
   testHttpsCheckCoversAliases =>
     endpoints := #{

@@ -38,8 +38,10 @@ secrets and tokens.
 Perform one `oidcc` request through `HTTPClient request:url:options:`.
 
 `#maxBodyBytes` defaults to 1 MiB and the timeout comes from `oidcc`'s
-`HttpOptions`. A streaming request body is refused with
-`{error, {http_client, streaming_request_body}}`.
+`HttpOptions`. A streaming request body, malformed headers and `ssl`
+options are refused (`{error, {http_client, streaming_request_body |
+malformed_headers | unsupported_ssl_options}}`); any crash answers
+`{error, {http_client, {raised, Class}}}`.
 """.
 -spec request(Method, Request, HttpOptions, RequestOptions, Config) ->
     {ok, {{string(), non_neg_integer(), string()}, [{string(), string()}], binary()}}
@@ -51,39 +53,65 @@ when
     RequestOptions :: oidcc_http_adapter:request_options(),
     Config :: #{client := term(), max_body_bytes => non_neg_integer() | unlimited}.
 request(Method, Request, HttpOptions, _RequestOptions, #{client := Client} = Config) ->
-    case split_request(Request) of
-        {error, Reason} ->
-            {error, {http_client, Reason}};
-        {Url, Headers, Body} ->
-            Opts0 = #{
-                headers => [[str(K), str(V)] || {K, V} <- Headers],
-                timeout => timeout(proplists:get_value(timeout, HttpOptions, ?DEFAULT_TIMEOUT)),
-                maxBodyBytes => maps:get(max_body_bytes, Config, ?DEFAULT_MAX_BODY)
-            },
-            Opts =
-                case Body of
-                    none -> Opts0;
-                    _ -> Opts0#{body => str(Body)}
-                end,
-            send(Client, Method, str(Url), Opts)
-    end.
-
-%% A raise inside `HTTPClient` (a type error on a bad option, a crash in
-%% the transport) must not escape with the request in its stacktrace or
-%% arguments, so it becomes a fixed reason.
-send(Client, Method, Url, Opts) ->
-    try beamtalk_message_dispatch:send(Client, 'request:url:options:', [Method, Url, Opts]) of
-        Result -> from_result(Result)
+    %% Everything runs inside the try: a crash anywhere here (a header
+    %% value that is not iodata, a response of an unexpected shape) must
+    %% not escape with the request in its stacktrace or arguments, where
+    %% oidcc's telemetry span would re-emit it. It becomes a fixed reason.
+    try
+        do_request(Method, Request, HttpOptions, Client, Config)
     catch
         Class:_Reason -> {error, {http_client, {raised, Class}}}
     end.
+
+do_request(Method, Request, HttpOptions, Client, Config) ->
+    maybe
+        ok ?= check_http_options(HttpOptions),
+        {Url, Headers, Body} ?= split_request(Request),
+        {ok, HeaderPairs} ?= headers(Headers),
+        Opts0 = #{
+            headers => HeaderPairs,
+            timeout => timeout(proplists:get_value(timeout, HttpOptions, ?DEFAULT_TIMEOUT)),
+            maxBodyBytes => maps:get(max_body_bytes, Config, ?DEFAULT_MAX_BODY)
+        },
+        Opts =
+            case Body of
+                none -> Opts0;
+                _ -> Opts0#{body => str(Body)}
+            end,
+        from_result(
+            beamtalk_message_dispatch:send(Client, 'request:url:options:', [Method, str(Url), Opts])
+        )
+    else
+        {error, Reason} -> {error, {http_client, Reason}}
+    end.
+
+%% `HTTPClient` has no per-request TLS options, so `ssl` options (custom
+%% CAs, client certificates for `tls_client_auth`) would be silently
+%% dropped. Refuse them instead.
+check_http_options(HttpOptions) ->
+    case proplists:is_defined(ssl, HttpOptions) of
+        true -> {error, unsupported_ssl_options};
+        false -> ok
+    end.
+
+%% Request headers as `[Name, Value]` String pairs; anything that is not
+%% a `{Name, Value}` pair is refused rather than dropped.
+headers(Headers) when is_list(Headers) ->
+    case lists:all(fun(H) -> is_tuple(H) andalso tuple_size(H) =:= 2 end, Headers) of
+        true -> {ok, [[str(K), str(V)] || {K, V} <- Headers]};
+        false -> {error, malformed_headers}
+    end;
+headers(_) ->
+    {error, malformed_headers}.
 
 split_request({Url, Headers}) ->
     {Url, Headers, none};
 split_request({Url, Headers, ContentType, Body}) when is_binary(Body); is_list(Body) ->
     {Url, [{"content-type", ContentType} | Headers], iolist_to_binary(Body)};
 split_request({_Url, _Headers, _ContentType, _StreamingBody}) ->
-    {error, streaming_request_body}.
+    {error, streaming_request_body};
+split_request(_Other) ->
+    {error, malformed_request}.
 
 timeout(T) when is_integer(T), T >= 0 -> T;
 timeout(_) -> ?DEFAULT_TIMEOUT.

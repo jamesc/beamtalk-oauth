@@ -99,8 +99,9 @@ Discovery: load the provider configuration for `Issuer` and its JWKS.
 * `max_body_bytes` — the response cap, default 1 MiB;
 * `timeout` — per-request timeout in milliseconds.
 
-Unless `allow_unsafe_http` is set, the issuer must be HTTPS before any
-request is made, and every endpoint the document names must be HTTPS.
+The issuer must be HTTPS before any request is made, and every endpoint
+the document names must be HTTPS. `allow_unsafe_http` relaxes that to
+plain HTTP on a loopback host (`127.0.0.1`, `::1`, `localhost`) only.
 
 Answers `{ok, #{issuer, context, revocation_endpoint, metadata}}`, where
 `context` is the opaque provider and `metadata` the configuration record
@@ -119,7 +120,9 @@ discover(Issuer0, Opts) when is_map(Opts) ->
         ok ?= check_url(issuer, Issuer, Unsafe),
         {ok, {Config, _ConfigExpiry}} ?=
             oidcc_provider_configuration:load_configuration(Issuer, LoadOpts),
-        ok ?= check_https(config_map(Config), Unsafe),
+        Endpoints = config_map(Config),
+        ok ?= check_complete(Endpoints),
+        ok ?= check_https(Endpoints, Unsafe),
         {ok, {Jwks, _JwksExpiry}} ?=
             oidcc_provider_configuration:load_jwks(
                 Config#oidcc_provider_configuration.jwks_uri, LoadOpts
@@ -143,13 +146,16 @@ client secret, or `nil` (or an empty string) for a public client, which
 """.
 -spec client_context(provider(), ClientId :: term(), Secret :: term()) ->
     oidcc_client_context:t().
-client_context({beamtalk_oauth_provider, #{config := Config, jwks := Jwks}}, ClientId, Secret) ->
-    case secret(Secret) of
-        unauthenticated ->
-            oidcc_client_context:from_manual(Config, Jwks, bin(ClientId), unauthenticated);
-        S ->
-            oidcc_client_context:from_manual(Config, Jwks, bin(ClientId), S)
-    end.
+client_context({beamtalk_oauth_provider, #{config := Config, jwks := Jwks}}, ClientId0, Secret) ->
+    ClientId =
+        case text(ClientId0) of
+            {ok, Id} when Id =/= <<>> -> Id;
+            _ -> erlang:error(invalid_client_id)
+        end,
+    oidcc_client_context:from_manual(Config, Jwks, ClientId, secret(Secret));
+client_context(_NotAProvider, _ClientId, _Secret) ->
+    %% No function_clause: its stacktrace would carry the secret.
+    erlang:error(invalid_provider).
 
 -doc """
 The options every `oidcc` call for `Provider` starts from: the adapter in
@@ -171,52 +177,66 @@ call_opts({beamtalk_oauth_provider, #{config := Config, request_opts := RequestO
 
 -doc """
 `ok` when every URL in `Endpoints` (a map of field name to URL, or to a
-map of URLs, as in `mtls_endpoint_aliases`) is HTTPS, or `AllowUnsafe` is
-true; `{error, {insecure_endpoint, Field, Url}}` for the first that is not.
-Absent fields (`undefined`, `null`, `nil`) are skipped.
+map of URLs, as in `mtls_endpoint_aliases`) is HTTPS;
+`{error, {insecure_endpoint, Field, Url}}` for the first that is not.
+With `AllowUnsafe`, plain HTTP is also accepted on a loopback host
+(`127.0.0.1`, `::1`, `localhost`), never elsewhere. Absent fields
+(`undefined`, `null`, `nil`) are skipped.
 """.
 -spec check_https(Endpoints :: map(), AllowUnsafe :: boolean()) ->
-    ok | {error, {insecure_endpoint, atom() | binary(), binary()}}.
-check_https(_Endpoints, true) ->
-    ok;
-check_https(Endpoints, _AllowUnsafe) ->
+    ok | {error, {insecure_endpoint, atom() | binary(), term()}}.
+check_https(Endpoints, AllowUnsafe) when is_map(Endpoints) ->
     Fields = [F || F <- ?ENDPOINT_FIELDS ++ [mtls_endpoint_aliases], maps:is_key(F, Endpoints)],
-    check_fields(Fields, Endpoints).
+    check_fields(Fields, Endpoints, AllowUnsafe =:= true).
 
-check_fields([], _Endpoints) ->
+check_fields([], _Endpoints, _Unsafe) ->
     ok;
-check_fields([Field | Rest], Endpoints) ->
-    case check_value(Field, maps:get(Field, Endpoints)) of
-        ok -> check_fields(Rest, Endpoints);
+check_fields([Field | Rest], Endpoints, Unsafe) ->
+    case check_value(Field, maps:get(Field, Endpoints), Unsafe) of
+        ok -> check_fields(Rest, Endpoints, Unsafe);
         Error -> Error
     end.
 
-check_value(_Field, Absent) when Absent =:= undefined; Absent =:= null; Absent =:= nil ->
+check_value(_Field, Absent, _Unsafe) when Absent =:= undefined; Absent =:= null; Absent =:= nil ->
     ok;
-check_value(Field, Aliases) when is_map(Aliases) ->
-    check_fields(maps:keys(Aliases), Aliases, Field);
-check_value(Field, Url) ->
-    check_url(Field, bin(Url), false).
+check_value(Field, Aliases, Unsafe) when is_map(Aliases) ->
+    check_aliases(maps:values(Aliases), Field, Unsafe);
+check_value(Field, Url, Unsafe) ->
+    case text(Url) of
+        {ok, Bin} -> check_url(Field, Bin, Unsafe);
+        error -> {error, {insecure_endpoint, Field, Url}}
+    end.
 
-check_fields([], _Aliases, _Parent) ->
+check_aliases([], _Field, _Unsafe) ->
     ok;
-check_fields([Key | Rest], Aliases, Parent) ->
-    case check_value(Parent, maps:get(Key, Aliases)) of
-        ok -> check_fields(Rest, Aliases, Parent);
+check_aliases([Url | Rest], Field, Unsafe) ->
+    case check_value(Field, Url, Unsafe) of
+        ok -> check_aliases(Rest, Field, Unsafe);
         Error -> Error
     end.
 
-check_url(_Field, _Url, true) ->
-    ok;
-check_url(Field, Url, false) ->
+check_url(Field, Url, Unsafe) ->
     case uri_string:parse(Url) of
         #{scheme := Scheme, host := Host} when Host =/= <<>> ->
-            case string:lowercase(Scheme) of
-                <<"https">> -> ok;
+            case {string:lowercase(Scheme), Unsafe andalso is_loopback(Host)} of
+                {<<"https">>, _} -> ok;
+                {<<"http">>, true} -> ok;
                 _ -> {error, {insecure_endpoint, Field, Url}}
             end;
         _ ->
             {error, {insecure_endpoint, Field, Url}}
+    end.
+
+is_loopback(Host) ->
+    lists:member(string:lowercase(Host), [<<"127.0.0.1">>, <<"::1">>, <<"localhost">>]).
+
+%% `config_map/1' zips `record_info' with the compiled record. If the two
+%% ever disagreed (an oidcc upgrade against a stale header), endpoint
+%% fields would go missing and the HTTPS check would pass them unseen.
+check_complete(Endpoints) ->
+    case [F || F <- ?ENDPOINT_FIELDS, not maps:is_key(F, Endpoints)] of
+        [] -> ok;
+        Missing -> {error, {provider_configuration_mismatch, Missing}}
     end.
 
 -doc """
@@ -229,19 +249,45 @@ Answers `{ok, token_to_map(Token)}` or `{error, Reason}`.
 """.
 -spec retrieve_token(provider(), Client :: map(), Params :: map()) ->
     {ok, map()} | {error, term()}.
-retrieve_token(Provider, #{client_id := ClientId} = Client, #{code := Code} = Params) ->
+retrieve_token({beamtalk_oauth_provider, _} = Provider, Client, Params) when
+    is_map(Client), is_map(Params)
+->
     ensure_started(),
-    Context = client_context(Provider, ClientId, maps:get(client_secret, Client, nil)),
-    Opts = (call_opts(Provider))#{
-        redirect_uri => bin(maps:get(redirect_uri, Params)),
-        nonce => bin(maps:get(nonce, Params)),
-        pkce_verifier => bin(maps:get(pkce_verifier, Params)),
-        require_pkce => true
-    },
-    case oidcc_token:retrieve(bin(Code), Context, Opts) of
-        {ok, Token} -> {ok, token_to_map(Token)};
-        {error, Reason} -> {error, Reason}
-    end.
+    maybe
+        {ok, [ClientId]} ?= required(Client, [client_id]),
+        {ok, [Code, Redirect, Nonce, Verifier]} ?=
+            required(Params, [code, redirect_uri, nonce, pkce_verifier]),
+        Context = client_context(Provider, ClientId, maps:get(client_secret, Client, nil)),
+        Opts = (call_opts(Provider))#{
+            redirect_uri => Redirect,
+            nonce => Nonce,
+            pkce_verifier => Verifier,
+            require_pkce => true
+        },
+        {ok, Token} ?= oidcc_token:retrieve(Code, Context, Opts),
+        {ok, token_to_map(Token)}
+    end;
+retrieve_token(_Provider, _Client, _Params) ->
+    %% No function_clause: its stacktrace would carry the secret.
+    {error, invalid_provider}.
+
+%% The text values of `Keys` in `Map`, or `{error, {missing_param, Key}}`
+%% for the first that is absent or not text (nil included).
+required(Map, Keys) ->
+    lists:foldr(
+        fun
+            (_Key, {error, _} = Error) ->
+                Error;
+            (Key, {ok, Acc}) ->
+                case text(maps:get(Key, Map, nil)) of
+                    {ok, <<>>} -> {error, {missing_param, Key}};
+                    {ok, Bin} -> {ok, [Bin | Acc]};
+                    error -> {error, {missing_param, Key}}
+                end
+        end,
+        {ok, []},
+        Keys
+    ).
 
 -doc """
 An `#oidcc_token{}` as a map Beamtalk reads: `access_token`,
@@ -331,17 +377,23 @@ secret(nil) -> unauthenticated;
 secret(undefined) -> unauthenticated;
 secret(unauthenticated) -> unauthenticated;
 secret(S) ->
-    case bin(S) of
-        <<>> -> unauthenticated;
-        B -> B
+    case text(S) of
+        {ok, <<>>} -> unauthenticated;
+        {ok, B} -> B;
+        error -> erlang:error(invalid_client_secret)
     end.
 
 %% Beamtalk Strings nested in a term, unwrapped to raw binaries for oidcc.
 untag({beamtalk_string, B}) when is_binary(B) -> B;
 untag(L) when is_list(L) -> [untag(E) || E <- L];
-untag(M) when is_map(M) -> maps:from_list([{untag(K), untag(V)} || {K, V} <- maps:to_list(M)]);
+untag(M) when is_map(M) -> maps:from_list([{untag_key(K), untag(V)} || {K, V} <- maps:to_list(M)]);
 untag(nil) -> null;
 untag(Other) -> Other.
+
+%% Discovery-document member names are binaries; a Symbol key would never
+%% match one, so it is taken by name.
+untag_key(K) when is_atom(K) -> atom_to_binary(K);
+untag_key(K) -> untag(K).
 
 str(B) when is_binary(B) -> {beamtalk_string, B};
 str(L) when is_list(L) -> {beamtalk_string, iolist_to_binary(L)}.
@@ -353,6 +405,10 @@ opt(undefined) -> nil;
 opt(V) -> V.
 
 bin({beamtalk_string, B}) -> B;
-bin(B) when is_binary(B) -> B;
-bin(L) when is_list(L) -> unicode:characters_to_binary(L);
-bin(A) when is_atom(A) -> atom_to_binary(A).
+bin(B) when is_binary(B) -> B.
+
+%% `{ok, Bin}` for a String or binary, `error` for anything else (nil
+%% included, which `bin/1` must never turn into `<<"nil">>`).
+text({beamtalk_string, B}) when is_binary(B) -> {ok, B};
+text(B) when is_binary(B) -> {ok, B};
+text(_) -> error.

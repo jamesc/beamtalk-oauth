@@ -79,6 +79,13 @@ TestCase subclass: OAuthServerTest
     result := OAuthServer fromDiscovery: "http://example.com"
     self assert: result error code equals: "insecure_endpoint"
 
+  testUnsafeHttpIsLoopbackOnly =>
+    result := OAuthServer
+      fromDiscovery: "http://example.com"
+      preset: #{}
+      options: self unsafe
+    self assert: result error code equals: "insecure_endpoint"
+
   testTransportFailure =>
     // A port nothing listens on: the connection is refused.
     srv := HTTPServer start: 0 handler: [:req |
