@@ -1,0 +1,83 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// ClientRegistration — our side of the relationship with a provider:
+/// the client id, an optional secret and the redirect URI.
+///
+/// There is no "no secret means public client" invariant: Google desktop
+/// clients send a secret that is not confidential. `oidcc` picks the
+/// client authentication method from what the provider advertises and
+/// what the registration holds.
+///
+/// The redirect URI must be HTTPS, or `http` to a loopback IP literal
+/// (`127.0.0.1` or `[::1]`) on any port (RFC 8252 §7.3). `localhost` is
+/// refused (RFC 8252 §8.3), as is a fragment (RFC 6749 §3.1.2).
+///
+/// ## Examples
+/// ```beamtalk
+/// reg := (ClientRegistration forClient: "APP_ID" redirect: "http://127.0.0.1:50278/callback") unwrap
+/// reg clientSecret      // => nil
+/// (ClientRegistration forClient: "APP_ID" redirect: "http://localhost/cb") error code
+/// // => "insecure_endpoint"
+/// ```
+typed Value subclass: ClientRegistration
+  /// The client id the provider issued.
+  field: clientId :: String = ""
+  /// The client secret, or nil for a public client.
+  field: clientSecret :: String | Nil = nil
+  /// Where the provider sends the browser back to.
+  field: redirectUri :: String = ""
+
+  /// A registration without a secret (public client), validated.
+  class forClient: id :: String redirect: uri :: String -> Result(ClientRegistration, OAuthError) =>
+    self
+      forClient: id
+      secret: nil
+      redirect: uri
+
+  /// A registration with a secret (which may be nil), validated.
+  class forClient: id :: String secret: secret :: String | Nil redirect: uri :: String -> Result(ClientRegistration, OAuthError) =>
+    id isEmpty ifTrue: [
+      ^Result error: (OAuthError config: "client id is empty")
+    ]
+    (self checkRedirect: uri) ifNotNil: [:err | ^Result error: err]
+    Result
+      ok: (self
+        clientId: id
+        clientSecret: secret
+        redirectUri: uri)
+
+  /// nil when `uri` is an acceptable redirect URI, the `OAuthError`
+  /// otherwise.
+  class checkRedirect: uri :: String -> OAuthError | Nil =>
+    parsed := Erlang uri_string parse: uri
+    (parsed isKindOf: Dictionary) ifFalse: [
+      ^OAuthError config: "redirect URI is not a valid URI: {uri}"
+    ]
+    (parsed includesKey: #fragment) ifTrue: [
+      ^OAuthError config: "redirect URI must not contain a fragment: {uri}"
+    ]
+    scheme := (parsed at: #scheme ifAbsent: [""]) asStringUnchecked lowercase
+    host := (parsed at: #host ifAbsent: [""]) asStringUnchecked lowercase
+    host isEmpty ifTrue: [^OAuthError config: "redirect URI has no host: {uri}"]
+    scheme =:= "https" ifTrue: [^nil]
+    (scheme =:= "http" and: [
+      host =:= "127.0.0.1" or: [host =:= "::1"]
+    ]) ifTrue: [^nil]
+    OAuthError insecureEndpoint: "redirect URI must be https or http to 127.0.0.1 / [::1]: {uri}"
+
+  /// `ClientRegistration(clientId: ..., clientSecret: [redacted], redirectUri: ...)`.
+  printString -> String =>
+    "ClientRegistration(clientId: {self.clientId}, clientSecret: {self redactedSecret}, redirectUri: {self.redirectUri})"
+
+  /// The JSON shape, with the secret redacted.
+  asJson -> Dictionary =>
+    #{
+      "clientId" => self.clientId,
+      "clientSecret" => self redactedSecret,
+      "redirectUri" => self.redirectUri
+    }
+
+  /// `"[redacted]"` when a secret is set, nil otherwise.
+  redactedSecret -> String | Nil =>
+    self.clientSecret isNil ifTrue: [nil] ifFalse: [OAuthError redacted]

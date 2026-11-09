@@ -1,0 +1,62 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// OAuthSession — one authorization-code flow attempt.
+///
+/// Built by `newSessionFor:client:`, kept single-use in a `SessionStore`,
+/// passed to `authorizeUrl`, then consumed before the code exchange. It
+/// records the issuer and redirect URI so the exchange can refuse a
+/// session minted for a different provider or callback (mix-up defense).
+///
+/// `createdAt` is stamped by the `SessionStore` when the session is
+/// stored; it stays 0 until then.
+///
+/// ## Examples
+/// ```beamtalk
+/// sess := OAuthSession newSessionFor: server client: reg
+/// sess state size      // => 43
+/// sess printString     // nonce and codeVerifier show as [redacted]
+/// ```
+typed Value subclass: OAuthSession
+  /// The `state` parameter: CSRF token and session-store key.
+  field: state :: String = ""
+  /// The OIDC `nonce`, checked by `oidcc` in the ID token.
+  field: nonce :: String = ""
+  /// The PKCE `code_verifier` (S256 challenge computed by `oidcc`).
+  field: codeVerifier :: String = ""
+  /// Issuer of the server the session was created for.
+  field: issuer :: String = ""
+  /// Redirect URI of the registration the session was created for.
+  field: redirectUri :: String = ""
+  /// When the session store accepted the session; 0 until then.
+  field: createdAt :: Integer = 0
+
+  /// A fresh session for `server` (anything answering `issuer`, normally
+  /// an `OAuthServer`) and `reg`: new state, nonce and code verifier from
+  /// `Secrets generate`, and the server's issuer and the registration's
+  /// redirect URI.
+  class newSessionFor: server :: Object client: reg :: ClientRegistration -> OAuthSession =>
+    self
+      new: #{
+        #state => Secrets generate,
+        #nonce => Secrets generate,
+        #codeVerifier => Secrets generate,
+        #issuer => (server perform: #issuer),
+        #redirectUri => reg redirectUri
+      }
+
+  /// `OAuthSession(state: ..., nonce: [redacted], codeVerifier: [redacted], ...)`.
+  printString -> String =>
+    r := OAuthError redacted
+    "OAuthSession(state: {self.state}, nonce: {r}, codeVerifier: {r}, issuer: {self.issuer}, redirectUri: {self.redirectUri}, createdAt: {self.createdAt})"
+
+  /// The JSON shape, with nonce and codeVerifier redacted.
+  asJson -> Dictionary =>
+    #{
+      "state" => self.state,
+      "nonce" => OAuthError redacted,
+      "codeVerifier" => OAuthError redacted,
+      "issuer" => self.issuer,
+      "redirectUri" => self.redirectUri,
+      "createdAt" => self.createdAt
+    }

@@ -1,0 +1,75 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+TestCase subclass: ClientRegistrationTest
+
+  codeFor: uri =>
+    (ClientRegistration forClient: "app" redirect: uri) ifOk: [:reg |
+      "ok"
+    ] ifError: [:e | e code]
+
+  testPublicClientHasNoSecret =>
+    reg := (ClientRegistration forClient: "app" redirect: "https://app.example.com/cb") unwrap
+    self assert: reg clientId equals: "app"
+    self assert: reg clientSecret equals: nil
+    self assert: reg redirectUri equals: "https://app.example.com/cb"
+
+  testConfidentialClientKeepsSecret =>
+    reg := (ClientRegistration
+      forClient: "app"
+      secret: "s3cret-value"
+      redirect: "https://app.example.com/cb") unwrap
+    self assert: reg clientSecret equals: "s3cret-value"
+
+  testHttpsAccepted =>
+    self assert: (self codeFor: "https://app.example.com/cb") equals: "ok"
+    self assert: (self codeFor: "HTTPS://app.example.com/cb") equals: "ok"
+
+  testLoopbackIpv4AnyPortAccepted =>
+    self assert: (self codeFor: "http://127.0.0.1:50278/callback") equals: "ok"
+    self assert: (self codeFor: "http://127.0.0.1:8765/callback") equals: "ok"
+    self assert: (self codeFor: "http://127.0.0.1/callback") equals: "ok"
+
+  testLoopbackIpv6Accepted =>
+    self assert: (self codeFor: "http://[::1]:50524/callback") equals: "ok"
+
+  testLocalhostRejected =>
+    self assert: (self codeFor: "http://localhost:8080/callback") equals: "insecure_endpoint"
+
+  testPlainHttpRejected =>
+    self assert: (self codeFor: "http://app.example.com/cb") equals: "insecure_endpoint"
+    self assert: (self codeFor: "http://127.0.0.2:80/cb") equals: "insecure_endpoint"
+
+  testFragmentRejected =>
+    self assert: (self codeFor: "https://app.example.com/cb#x") equals: "config"
+
+  testMalformedRejected =>
+    self assert: (self codeFor: "ht tp://x") equals: "config"
+    self assert: (self codeFor: "") equals: "config"
+
+  testEmptyClientIdRejected =>
+    result := ClientRegistration forClient: "" redirect: "https://app.example.com/cb"
+    self assert: result error code equals: "config"
+
+  testSecretVariantValidatesRedirect =>
+    result := ClientRegistration
+      forClient: "app"
+      secret: "s"
+      redirect: "http://localhost/cb"
+    self assert: result error code equals: "insecure_endpoint"
+
+  testPrintStringRedactsSecret =>
+    reg := (ClientRegistration
+      forClient: "app"
+      secret: "s3cret-value"
+      redirect: "https://app.example.com/cb") unwrap
+    self deny: (reg printString includesSubstring: "s3cret-value")
+    self assert: (reg printString includesSubstring: "[redacted]")
+    self assert: (reg printString includesSubstring: "app")
+
+  testAsJsonRedactsSecret =>
+    reg := (ClientRegistration
+      forClient: "app"
+      secret: "s3cret-value"
+      redirect: "https://app.example.com/cb") unwrap
+    self deny: ((Json generate: reg) includesSubstring: "s3cret-value")

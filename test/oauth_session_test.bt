@@ -1,0 +1,43 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+TestCase subclass: OAuthSessionTest
+  field: session = nil
+
+  setUp =>
+    server := FakeServer issuer: "https://gitlab.com"
+    reg := (ClientRegistration forClient: "app" redirect: "http://127.0.0.1:50278/callback") unwrap
+    self.session := OAuthSession newSessionFor: server client: reg
+
+  testNewSessionFillsSecrets =>
+    self assert: (self.session state matchesRegex: "^[A-Za-z0-9_-]+$")
+    self assert: self.session state size equals: 43
+    self assert: self.session nonce size equals: 43
+    self assert: self.session codeVerifier size equals: 43
+
+  testNewSessionSecretsAreDistinct =>
+    s := self.session
+    self deny: s state =:= s nonce
+    self deny: s nonce =:= s codeVerifier
+    self deny: s state =:= s codeVerifier
+
+  testNewSessionCopiesIssuerAndRedirect =>
+    self assert: self.session issuer equals: "https://gitlab.com"
+    self assert: self.session redirectUri equals: "http://127.0.0.1:50278/callback"
+
+  testCreatedAtIsUnstamped => self assert: self.session createdAt equals: 0
+
+  testPrintStringRedactsNonceAndVerifier =>
+    s := self.session
+    out := s printString
+    self deny: (out includesSubstring: s nonce)
+    self deny: (out includesSubstring: s codeVerifier)
+    self assert: (out includesSubstring: "[redacted]")
+    self assert: (out includesSubstring: s state)
+
+  testAsJsonRedactsNonceAndVerifier =>
+    s := self.session
+    out := Json generate: s
+    self deny: (out includesSubstring: s nonce)
+    self deny: (out includesSubstring: s codeVerifier)
+    self assert: (out includesSubstring: "https://gitlab.com")

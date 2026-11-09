@@ -1,8 +1,0 @@
-// Copyright 2026 oauth authors
-// SPDX-License-Identifier: Apache-2.0
-
-/// Oauth — main class for the oauth library.
-Object subclass: Oauth
-
-  /// Return a greeting string.
-  class greet => "Hello from oauth!"

@@ -1,0 +1,234 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// OAuthError — the structured error every public operation answers in
+/// a `Result` (language ADR 0060).
+///
+/// `code` is a string from one of three families:
+///
+/// - provider codes, verbatim, from an `oidcc` `{http_error, Status, Body}`
+///   (`invalid_grant`, `invalid_client`, `access_denied`, ...);
+/// - `oidcc` reasons, by atom name (`missing_claim`, `token_expired`,
+///   `no_supported_auth_method`, ...);
+/// - local codes: `transport`, `parse`, `config`, `expired_session`,
+///   `reused_state`, `session_mismatch`, `insecure_endpoint`,
+///   `callback_timeout`.
+///
+/// `detail` keeps the original term for debugging, with every token-like
+/// binary and every claims map replaced by `"[redacted]"`.
+///
+/// ## Examples
+/// ```beamtalk
+/// (OAuthError transport: "connection refused") code   // => "transport"
+/// (OAuthError fromOidcc: #token_expired) code          // => "token_expired"
+/// ```
+typed Value subclass: OAuthError
+  /// Machine-readable error code.
+  field: code :: String = ""
+  /// Human-readable description; may be empty.
+  field: description :: String = ""
+  /// HTTP status when the error came from a provider response.
+  field: status :: Integer | Nil = nil
+  /// The original error term, redacted of secrets.
+  field: detail :: Object = nil
+
+  /// An error with `code` and `description` and no status or detail.
+  class code: code :: String description: description :: String -> OAuthError =>
+    self new: #{#code => code, #description => description}
+
+  /// The network call failed: connect, TLS, timeout, closed connection.
+  class transport: description :: String -> OAuthError =>
+    self code: "transport" description: description
+
+  /// A response or callback could not be parsed.
+  class parse: description :: String -> OAuthError =>
+    self code: "parse" description: description
+
+  /// The caller's configuration is invalid.
+  class config: description :: String -> OAuthError =>
+    self code: "config" description: description
+
+  /// A plain-HTTP endpoint or a non-loopback http redirect was refused.
+  class insecureEndpoint: description :: String -> OAuthError =>
+    self code: "insecure_endpoint" description: description
+
+  /// The session was consumed after its TTL.
+  class expiredSession -> OAuthError =>
+    self code: "expired_session" description: "login session expired"
+
+  /// The session's state was already consumed once.
+  class reusedState -> OAuthError =>
+    self code: "reused_state" description: "login session already used"
+
+  /// The callback came from a different user agent, issuer or redirect.
+  class sessionMismatch -> OAuthError =>
+    self code: "session_mismatch" description: "login session does not match"
+
+  /// No callback arrived before the deadline.
+  class callbackTimeout -> OAuthError =>
+    self code: "callback_timeout" description: "no callback before the timeout"
+
+  /// Map an `oidcc` error reason to an `OAuthError`.
+  ///
+  /// - `{http_error, Status, #{<<"error">> := Code}}` answers the provider
+  ///   code verbatim, with the status and any `error_description`;
+  ///   an `http_error` without an `error` member answers `http_error`.
+  /// - An atom, or a tuple whose first element is an atom, answers that
+  ///   atom's name (`missing_claim`, `token_expired`, ...).
+  /// - Anything else answers `transport`.
+  ///
+  /// A wrapping `{error, Reason}` is unwrapped first. `detail` always holds
+  /// the redacted original term (see `redact:`).
+  class fromOidcc: reason :: Object -> OAuthError =>
+    term := reason
+    ((term isKindOf: Tuple) and: [
+      (term size =:= 2) and: [(term at: 1) =:= #error]
+    ]) ifTrue: [term := term at: 2]
+    detail := self redact: term
+    (term isKindOf: Symbol) ifTrue: [
+      ^self new: #{#code => term asString, #detail => detail}
+    ]
+    ((term isKindOf: Tuple) and: [
+      (term size >= 1) and: [(term at: 1) isKindOf: Symbol]
+    ])
+      ifFalse: [
+        ^self
+          new: #{
+            #code => "transport",
+            #description => "unexpected oidcc error",
+            #detail => detail
+          }
+      ]
+    tag := term at: 1
+    ((tag =:= #http_error) and: [
+      (term size >= 2) and: [(term at: 2) isKindOf: Integer]
+    ]) ifTrue: [^self fromHttpError: term detail: detail]
+    self new: #{#code => tag asString, #detail => detail}
+
+  /// `{http_error, Status, Body}`: the provider's `error` member when the
+  /// body is a map that carries one, `http_error` otherwise.
+  class fromHttpError: term :: Tuple detail: detail :: Object -> OAuthError =>
+    status := term at: 2
+    body := term size >= 3 ifTrue: [term at: 3] ifFalse: [nil]
+    providerCode := nil
+    providerDescription := ""
+    (body isKindOf: Dictionary)
+      ifTrue: [
+        providerCode := self textAt: "error" in: body
+        providerDescription := (self textAt: "error_description" in: body) ifNil: [
+          ""
+        ]
+      ]
+    self
+      new: #{
+        #code => providerCode ifNil: ["http_error"],
+        #description => providerDescription,
+        #status => status,
+        #detail => detail
+      }
+
+  /// The member `key` of `map` as a String, whether the map's keys are
+  /// Strings or raw binaries (`oidcc` answers raw binaries). Answers nil
+  /// when absent or not text.
+  class textAt: key :: String in: map :: Dictionary -> String | Nil =>
+    found := nil
+    // Dictionary keys and values are untyped Erlang terms here.
+    @expect type
+    map
+      keysAndValuesDo: [:k :v |
+        (found isNil and: [
+          (self textOf: k) =:= key
+        ]) ifTrue: [found := self textOf: v]
+      ]
+    found
+
+  /// `value` as a String when it is text (String, raw binary or Symbol),
+  /// nil otherwise. Invalid UTF-8 answers nil.
+  class textOf: value :: Object -> String | Nil =>
+    (value isKindOf: String) ifTrue: [^value]
+    (value isKindOf: Symbol) ifTrue: [^value asString]
+    (value isKindOf: Binary) ifTrue: [
+      ^value asString ifOk: [:text | text] ifError: [:e | nil]
+    ]
+    nil
+
+  /// The marker that replaces redacted values.
+  class redacted -> String => "[redacted]"
+
+  /// `term` with secrets removed, for `detail` and logs.
+  ///
+  /// - a binary or String that looks like a JWT (`eyJ...` with dot-separated
+  ///   base64url segments) or an opaque token (20+ characters of token
+  ///   alphabet with both letters and digits), or that is not valid UTF-8,
+  ///   becomes `"[redacted]"`;
+  /// - a map with a `sub` or `iss` member (an ID-token claims map) becomes
+  ///   `"[redacted]"`;
+  /// - in any other map, the values of `access_token`, `refresh_token`,
+  ///   `id_token`, `code`, `code_verifier`, `client_secret`, `nonce` and
+  ///   `assertion` become `"[redacted]"`;
+  /// - tuples, lists and other map values are redacted recursively;
+  /// - everything else is kept.
+  class redact: term :: Object -> Object =>
+    (term isKindOf: Binary) ifTrue: [
+      ^(self looksSecret: term) ifTrue: [self redacted] ifFalse: [term]
+    ]
+    (term isKindOf: Tuple) ifTrue: [
+      ^Tuple withAll: ((1 to: term size) collect: [:i |
+        self redact: (term at: i)
+      ])
+    ]
+    @expect type
+    (term isKindOf: List) ifTrue: [^term collect: [:each | self redact: each]]
+    (term isKindOf: Dictionary) ifTrue: [^self redactMap: term]
+    term
+
+  /// A claims map becomes the marker; any other map keeps its keys, with
+  /// secret-named members replaced and the rest redacted recursively.
+  class redactMap: map :: Dictionary -> Object =>
+    isClaims := false
+    @expect type
+    map
+      keysAndValuesDo: [:k :v |
+        name := self textOf: k
+        (name =:= "sub" or: [name =:= "iss"]) ifTrue: [isClaims := true]
+      ]
+    isClaims ifTrue: [^self redacted]
+    out := #{}
+    @expect type
+    map
+      keysAndValuesDo: [:k :v |
+        name := self textOf: k
+        secret := name notNil and: [self secretKeys includes: name]
+        out := out at: k put: (secret ifTrue: [
+          self redacted
+        ] ifFalse: [self redact: v])
+      ]
+    out
+
+  /// Member names whose values are always secret.
+  class secretKeys -> List(String) =>
+    #("access_token", "refresh_token", "id_token", "code", "code_verifier", "client_secret", "nonce", "assertion")
+
+  /// True when `bin` looks like a token, a JWT, or is not valid UTF-8.
+  class looksSecret: bin :: Binary -> Boolean =>
+    text := self textOf: bin
+    text isNil ifTrue: [^true]
+    (text matchesRegex: "^eyJ[A-Za-z0-9_-]*([.][A-Za-z0-9_-]*)\{2,4}$") ifTrue: [
+      ^true
+    ]
+    (text size >= 20)
+      and: [
+        (text matchesRegex: "^[A-Za-z0-9._~+/=-]+$") and: [
+          (text matchesRegex: "[0-9]") and: [text matchesRegex: "[A-Za-z]"]
+        ]
+      ]
+
+  /// `OAuthError(code, status: 400): description`. `detail` is not shown.
+  printString -> String =>
+    statusPart := self.status isNil ifTrue: [
+      ""
+    ] ifFalse: [", status: {self.status}"]
+    descPart := self.description isEmpty ifTrue: [
+      ""
+    ] ifFalse: [": {self.description}"]
+    "OAuthError({self.code}{statusPart}){descPart}"

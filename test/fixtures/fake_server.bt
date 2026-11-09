@@ -1,0 +1,7 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// Test stand-in for `OAuthServer` (arrives with BT-4561): anything that
+/// answers `issuer`.
+Value subclass: FakeServer
+  field: issuer :: String = ""

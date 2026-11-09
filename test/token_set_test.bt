@@ -1,0 +1,109 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+TestCase subclass: TokenSetTest
+  field: tokens = nil
+
+  setUp =>
+    self.tokens := TokenSet
+      new: #{
+        #accessToken => "access-AAA111",
+        #expiresIn => 3600,
+        #obtainedAt => 1000,
+        #refreshToken => "refresh-RRR222",
+        #scope => "openid read_user",
+        #idTokenClaims => #{"sub" => "42", "iss" => "https://gitlab.com"},
+        #idToken => "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiI0MiJ9.c2ln"
+      }
+
+  testIsExpiredAtBoundary =>
+    self deny: (self.tokens isExpiredAt: 4599)
+    self assert: (self.tokens isExpiredAt: 4600)
+
+  testNeedsRefreshWithinMargin =>
+    self deny: (self.tokens needsRefreshAt: 4539)
+    self assert: (self.tokens needsRefreshAt: 4540)
+    self assert: (self.tokens needsRefreshAt: 5000)
+
+  testUnknownLifetimeNeverExpires =>
+    t := TokenSet new: #{#accessToken => "a", #obtainedAt => 1000}
+    self deny: (t isExpiredAt: 999999999)
+    self deny: (t needsRefreshAt: 999999999)
+    self assert: t expiresAt equals: nil
+
+  testSystemClockConveniences =>
+    // obtainedAt 1000 is long past
+    self assert: self.tokens isExpired
+    self assert: self.tokens needsRefresh
+    fresh := self.tokens withObtainedAt: TokenSet now
+    self deny: fresh isExpired
+    self deny: fresh needsRefresh
+
+  testBearerHeader =>
+    self assert: self.tokens bearerHeader equals: "Bearer access-AAA111"
+
+  testSubject => self assert: self.tokens subject equals: "42"
+
+  testSubjectWithoutClaims => self assert: TokenSet new subject equals: nil
+
+  testSubjectFromBinaryKeyedClaims =>
+    // oidcc answers claims maps keyed by raw binaries
+    claims := #{} at: (Binary fromIolist: #("sub")) put: (Binary fromIolist: #("77"))
+    self assert: (TokenSet new withIdTokenClaims: claims) subject equals: "77"
+
+  testMergeResponseValuesWin =>
+    response := TokenSet
+      new: #{
+        #accessToken => "access-BBB333",
+        #expiresIn => 7200,
+        #obtainedAt => 5000,
+        #refreshToken => "refresh-NEW",
+        #scope => "openid",
+        #idTokenClaims => #{"sub" => "42", "iat" => 5000},
+        #idToken => "eyJ.new.jwt"
+      }
+    merged := self.tokens mergedWith: response
+    self assert: merged accessToken equals: "access-BBB333"
+    self assert: merged expiresIn equals: 7200
+    self assert: merged obtainedAt equals: 5000
+    self assert: merged refreshToken equals: "refresh-NEW"
+    self assert: merged scope equals: "openid"
+    self assert: merged idToken equals: "eyJ.new.jwt"
+    self assert: (merged idTokenClaims at: "iat") equals: 5000
+
+  testMergeCarriesForwardOmittedValues =>
+    response := TokenSet new: #{
+      #accessToken => "access-BBB333",
+      #expiresIn => 7200,
+      #obtainedAt => 5000
+    }
+    merged := self.tokens mergedWith: response
+    self assert: merged accessToken equals: "access-BBB333"
+    self assert: merged expiresIn equals: 7200
+    self assert: merged refreshToken equals: "refresh-RRR222"
+    self assert: merged scope equals: "openid read_user"
+    self assert: merged subject equals: "42"
+    self assert: merged idToken equals: self.tokens idToken
+
+  testPrintStringRedactsTokens =>
+    out := self.tokens printString
+    self deny: (out includesSubstring: "access-AAA111")
+    self deny: (out includesSubstring: "refresh-RRR222")
+    self deny: (out includesSubstring: "eyJhbGci")
+    self assert: (out includesSubstring: "[redacted]")
+    self assert: (out includesSubstring: "openid read_user")
+
+  testAsJsonRedactsTokens =>
+    json := self.tokens asJson
+    self assert: (json at: "accessToken") equals: "[redacted]"
+    self assert: (json at: "refreshToken") equals: "[redacted]"
+    self assert: (json at: "idToken") equals: "[redacted]"
+    out := Json generate: self.tokens
+    self deny: (out includesSubstring: "access-AAA111")
+    self deny: (out includesSubstring: "refresh-RRR222")
+    self deny: (out includesSubstring: "eyJhbGci")
+
+  testAsJsonKeepsAbsentTokensNil =>
+    json := (TokenSet new: #{#accessToken => "a"}) asJson
+    self assert: (json at: "refreshToken") equals: nil
+    self assert: (json at: "idToken") equals: nil
