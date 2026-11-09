@@ -14,7 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        otp: ["27", "28"]
+        # OTP 28 only: the nightly beamtalk toolchain ships its build worker
+        # compiled for OTP 28 and fails to boot on 27. Add "27" back if the
+        # installer gains per-OTP builds.
+        otp: ["28"]
     steps:
       - uses: actions/checkout@v4
 

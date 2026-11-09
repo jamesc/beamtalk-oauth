@@ -643,7 +643,8 @@ Slice plan (sizes rough, calibrated on `beamtalk-mint` and the
   and `http` 0.3.2; the probe shim is in `native/`.
   - Done: Hex `oidcc` 3.9.2 and `jose` build from `[native.dependencies]`
     with no Elixir and **no `jose` override** on OTP 28 (and 29). OTP 27
-    is not installed locally; CI now runs a 27/28 matrix.
+    is untested: the nightly `beamtalk` toolchain's build worker is
+    compiled for OTP 28 and does not boot on 27, so CI runs OTP 28 only.
   - Done: the generated `oauth.app` lists `oidcc` in `applications`, so
     a release starts it with `jose`, `telemetry` and `inets`. The REPL
     loads modules without starting the package app, so shim entry points
