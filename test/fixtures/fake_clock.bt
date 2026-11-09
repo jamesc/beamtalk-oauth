@@ -1,0 +1,13 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// Test clock: a settable time in milliseconds, read by the block a test
+/// injects as `SessionStore`'s `#now`.
+Actor subclass: FakeClock
+  state: time :: Integer = 0
+
+  time -> Integer => self.time
+
+  time: ms :: Integer -> Nil =>
+    self.time := ms
+    nil

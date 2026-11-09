@@ -1,0 +1,176 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// SessionStore — in-flight `OAuthSession`s, single-use, each bound to the
+/// user agent that started the flow.
+///
+/// `state` alone does not stop login CSRF in a shared store (RFC 6749
+/// §10.12): an attacker can start a login, approve it with their own
+/// account and send the victim the callback URL. So every session is
+/// stored with a binding (an opaque value tied to whoever started the
+/// flow: a per-flow `Secrets generate` held by a native app, or a cookie
+/// value in a server-side web app), and `consume:boundTo:` only answers
+/// the session to a caller presenting the same binding. There is no
+/// `create:` or `consume:` without `boundTo:`, and an empty or nil binding
+/// raises: it is a programming error, not a login failure.
+///
+/// The app spawns the store explicitly; there is no global store. Times
+/// are Unix milliseconds. `spawnWith:` takes `#ttl` (milliseconds, 10
+/// minutes by default) and `#now` (a block answering the current time in
+/// milliseconds, for tests; the system clock by default).
+///
+/// ## Expiry and the sweep
+///
+/// A session is expired once `ttl` has passed since `create:boundTo:`
+/// stamped its `createdAt`. Every `create:boundTo:` and `consume:boundTo:`
+/// first sweeps the store (there is no timer), dropping sessions that
+/// expired more than one further `ttl` ago, so abandoned attempts cannot
+/// accumulate. Within that grace a late callback answers `expired_session`;
+/// after it the state is unknown and answers `reused_state`.
+///
+/// ## Redaction
+///
+/// Beamtalk actors have no `format_status/1` hook, so the store keeps its
+/// sessions sealed inside a closure (`vault`). `sys:get_state/1`,
+/// `sys:get_status/1` and crash reports print a closure as `#Fun<...>`,
+/// so they never show a state, nonce, verifier or binding. Bindings are
+/// kept only as SHA-256 digests. The helpers that open the vault are
+/// `internal`, so no public message answers the stored sessions.
+///
+/// The sealing closure belongs to this module's code. Hot-loading the
+/// module twice purges the version that made it; the store then drops
+/// its in-flight sessions (their consume answers `reused_state`), so it
+/// fails closed.
+///
+/// ## Examples
+/// ```beamtalk
+/// store := SessionStore spawn
+/// binding := Secrets generate
+/// store create: sess boundTo: binding
+/// (store consume: sess state boundTo: binding) unwrap   // => the session
+/// (store consume: sess state boundTo: binding) error code
+/// // => "reused_state"
+/// ```
+typed Actor subclass: SessionStore
+  /// Session lifetime in milliseconds.
+  state: ttl :: Integer = 600000
+  /// The clock, answering Unix milliseconds; nil for the system clock.
+  state: now :: Block(Integer) | Nil = nil
+  /// The sessions, sealed: a block answering a Dictionary from state to
+  /// `{session, bindingDigest}`. See "Redaction".
+  state: vault :: Block(Dictionary) | Nil = nil
+
+  /// The default session lifetime: 10 minutes, in milliseconds.
+  class defaultTtl -> Integer => 600000
+
+  /// Check the configuration and seal an empty store. A `#ttl` that is
+  /// not a positive Integer, or a `#now` that is not a Block, fails the
+  /// spawn.
+  initialize -> Nil =>
+    ((self.ttl isKindOf: Integer) and: [
+      self.ttl > 0
+    ]) ifFalse: [
+      self error: "SessionStore: #ttl must be a positive Integer of milliseconds"
+    ]
+    (self.now isNil or: [
+      self.now isKindOf: Block
+    ]) ifFalse: [
+      self error: "SessionStore: #now must be a Block answering milliseconds"
+    ]
+    self.vault := self seal: #{}
+    nil
+
+  /// Store `sess` under its `state`, bound to `binding`, and stamp its
+  /// `createdAt` with the current time.
+  ///
+  /// Raises when `binding` is nil or empty, when `sess` has no state, or
+  /// when a session with the same state is already stored: each is a
+  /// programming error.
+  create: sess :: OAuthSession boundTo: binding :: String -> Nil =>
+    digest := self digestOf: binding
+    sess state isEmpty ifTrue: [
+      self error: "SessionStore: the session has no state"
+    ]
+    t := self currentTime
+    sessions := self sweptAt: t
+    (sessions includesKey: sess state) ifTrue: [
+      self error: "SessionStore: a session with this state is already stored"
+    ]
+    self.vault := self seal: (sessions at: sess state put: {sess withCreatedAt: t, digest})
+    nil
+
+  /// Take the session stored under `state`, if `binding` matches the one
+  /// it was created with.
+  ///
+  /// Answers the session, removed from the store (single use), or an
+  /// `OAuthError`:
+  ///
+  /// - `reused_state` when no session is stored under `state` (unknown,
+  ///   already consumed, or swept);
+  /// - `expired_session` when the session is past its TTL;
+  /// - `session_mismatch` when `binding` differs, compared in constant
+  ///   time (`crypto:hash_equals/2` over SHA-256 digests).
+  ///
+  /// A session found under `state` is removed whatever the outcome, so a
+  /// probed or expired state cannot be retried. Raises when `binding` is
+  /// nil or empty.
+  consume: state :: String boundTo: binding :: String -> Result(OAuthSession, OAuthError) =>
+    digest := self digestOf: binding
+    t := self currentTime
+    sessions := self sweptAt: t
+    entry := sessions at: state ifAbsent: [nil]
+    entry isNil
+      ifTrue: [
+        self.vault := self seal: sessions
+        ^Result error: OAuthError reusedState
+      ]
+    self.vault := self seal: (sessions removeKey: state)
+    {sess, stored} := entry
+    t >= (sess createdAt + self.ttl) ifTrue: [
+      ^Result error: OAuthError expiredSession
+    ]
+    (Erlang crypto hash_equals: stored with: digest) ifFalse: [
+      ^Result error: OAuthError sessionMismatch
+    ]
+    Result ok: sess
+
+  /// The number of sessions held, including expired ones not yet swept.
+  /// For tests and monitoring.
+  size -> Integer => self sessions size
+
+  /// The time in Unix milliseconds, from the injected clock if any.
+  internal currentTime -> Integer =>
+    self.now isNil ifTrue: [
+      Erlang erlang system_time: #millisecond
+    ] ifFalse: [self.now value]
+
+  /// The stored sessions, unsealed. A vault whose code was purged by hot
+  /// reloading (`badfun`) opens as empty: the store fails closed.
+  internal sessions -> Dictionary =>
+    self.vault isNil ifTrue: [^#{}]
+    [self.vault value] on: Error do: [:e | #{}]
+
+  /// The stored sessions at time `t`, without those that expired more than
+  /// one further TTL ago.
+  internal sweptAt: t :: Integer -> Dictionary =>
+    cutoff := t - (2 * self.ttl)
+    kept := #{}
+    self sessions
+      keysAndValuesDo: [:state :: String :entry :: Tuple |
+        {sess, _} := entry
+        sess createdAt > cutoff ifTrue: [kept := kept at: state put: entry]
+      ]
+    kept
+
+  /// A closure answering `sessions`; prints as `#Fun<...>`.
+  internal seal: sessions :: Dictionary -> Block(Dictionary) => [sessions]
+
+  /// The SHA-256 digest of `binding`. Raises when it is nil, empty or not
+  /// a String.
+  internal digestOf: binding :: String -> Binary =>
+    ((binding isKindOf: String) and: [
+      binding isEmpty not
+    ]) ifFalse: [
+      self error: "SessionStore: a non-empty user-agent binding is required"
+    ]
+    Erlang crypto hash: #sha256 with: binding
