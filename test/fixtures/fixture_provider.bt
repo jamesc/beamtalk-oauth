@@ -10,6 +10,7 @@
 /// | Path                                | Answers                                |
 /// |-------------------------------------|----------------------------------------|
 /// | `/.well-known/openid-configuration` | the discovery document                 |
+/// | `/authorize`                        | a 302 back to `redirect_uri` (below)   |
 /// | `/jwks`                             | the public half of an ES256 test key   |
 /// | `/token`                            | a token response with a signed ID token|
 /// | `/userinfo`                         | userinfo claims (401 without a bearer) |
@@ -29,6 +30,16 @@
 /// method, form, query and headers. `/tokeninfo` takes the token as a
 /// bearer header or an `access_token` form parameter. `redirect:to:`
 /// answers a 302 with a `Location`.
+///
+/// `/authorize` stands in for the user signing in: it answers a 302 to
+/// the request's `redirect_uri` with `code` (`code-1`), the request's
+/// `state` and `iss` (the issuer), and makes the request's `nonce` the
+/// ID-token `nonce` claim from then on, as a real provider binds the
+/// nonce to the code (a later `claims:` replaces it). A request without
+/// `redirect_uri` or `state`, or whose `response_type` is not `code` or
+/// whose `code_challenge_method` is not `S256`, answers 400.
+/// `lastRequestTo: "/authorize"` answers its query (for the PKCE
+/// challenge).
 ///
 /// ID tokens are signed with the actor's own P-256 key through `jose`.
 /// `keyId:` names the key (a `kid` in the JWKS and the ID-token header);
@@ -186,8 +197,8 @@ Actor subclass: FixtureProvider
     self.tokenInfo := body
     nil
 
-  /// The last request to `path` (`/revoke`, `/tokeninfo` or
-  /// `/oauth/token/info`):
+  /// The last request to `path` (`/authorize`, `/revoke`, `/tokeninfo`
+  /// or `/oauth/token/info`):
   /// `#{#method, #form, #query, #headers}`, or nil.
   lastRequestTo: path :: String -> Dictionary | Nil =>
     self.requests at: path ifAbsent: [nil]
@@ -200,7 +211,7 @@ Actor subclass: FixtureProvider
     delay > 0 ifTrue: [Erlang timer sleep: delay]
     failure := self.failures at: path ifAbsent: [nil]
     path =:= "/token" ifTrue: [self.lastTokenRequest := self recordOf: req]
-    (#("/revoke", "/tokeninfo", "/oauth/token/info") includes: path)
+    (#("/authorize", "/revoke", "/tokeninfo", "/oauth/token/info") includes: path)
       ifTrue: [
         record := ((self recordOf: req) at: #method put: req method) at: #query put: req queryParams
         self.requests := self.requests at: path put: record
@@ -218,6 +229,7 @@ Actor subclass: FixtureProvider
     failure notNil ifTrue: [^self json: (failure at: 2) status: (failure at: 1)]
     path match: [
       "/.well-known/openid-configuration" -> self json: self discoveryDocument status: 200;
+      "/authorize" -> self authorizeFor: req;
       "/jwks" -> self jwksResponse;
       "/token" -> self json: self tokenResponse status: 200;
       "/userinfo" -> self userinfoFor: req;
@@ -226,6 +238,37 @@ Actor subclass: FixtureProvider
       "/oauth/token/info" -> self tokenInfoFor: req;
       _ -> HTTPResponse new: #{#status => 404, #body => "not found"}
     ]
+
+  /// The sign-in stand-in: a 302 to the request's `redirect_uri` with
+  /// `code`, `state` and `iss`; the request's `nonce` becomes the ID-token
+  /// `nonce` claim. 400 for a request a real provider would refuse (see
+  /// the class comment).
+  authorizeFor: req :: HTTPRequest -> HTTPResponse =>
+    q := req queryParams
+    redirect := q at: "redirect_uri" ifAbsent: [""]
+    state := q at: "state" ifAbsent: [""]
+    ok := redirect isEmpty not
+      and: [
+        state isEmpty not
+          and: [
+            (q at: "response_type" ifAbsent: [
+              ""
+            ]) =:= "code" and: [
+              (q at: "code_challenge_method" ifAbsent: [""]) =:= "S256"
+            ]
+          ]
+      ]
+    ok ifFalse: [^self json: #{"error" => "invalid_request"} status: 400]
+    nonce := q at: "nonce" ifAbsent: [nil]
+    nonce isNil ifFalse: [self.claims := self.claims at: "nonce" put: nonce]
+    query := "code=code-1&state={state urlEncoded}&iss={self.issuer urlEncoded}"
+    sep := (redirect includesSubstring: "?") ifTrue: ["&"] ifFalse: ["?"]
+    HTTPResponse
+      new: #{
+        #status => 302,
+        #headers => #(#("location", "{redirect}{sep}{query}")),
+        #body => ""
+      }
 
   /// The discovery document, overrides applied.
   discoveryDocument -> Dictionary =>

@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /// OAuthFlows — the grant operations a login uses: the authorization URL,
-/// the callback, the code exchange, refresh and userinfo.
+/// the callback, the code exchange, refresh, userinfo, and (delegating to
+/// `TokenRevocation`) revocation and token info.
 ///
 /// Every identity-sensitive step goes through `oidcc` via the native shim:
 /// the PKCE challenge (S256 only, always required), the token endpoint
@@ -62,6 +63,7 @@
 /// toks subject                              // validated by oidcc
 /// toks := (OAuthFlows refresh: server client: reg tokenSet: toks) unwrap
 /// (OAuthFlows userInfo: server client: reg tokenSet: toks) unwrap
+/// (OAuthFlows revoke: server client: reg token: toks) unwrap
 /// ```
 Object subclass: OAuthFlows
 
@@ -521,6 +523,37 @@ Object subclass: OAuthFlows
     found ifOk: [:claims |
       Result ok: claims
     ] ifError: [:reason | Result error: (OAuthError fromOidcc: reason)]
+
+  // ===== Revocation and token info =====
+
+  /// Revoke `tok` (RFC 7009). `tok` is a `TokenSet`, whose refresh token
+  /// is revoked when present and its access token otherwise, or a raw
+  /// token String. Delegates to `TokenRevocation revoke:client:token:`,
+  /// which documents the client authentication and the answers.
+  class revoke: server :: OAuthServer client: reg :: ClientRegistration token: tok :: Object -> Result(Nil, OAuthError) =>
+    TokenRevocation
+      revoke: server
+      client: reg
+      token: tok
+
+  /// As `revoke:client:token:` with an explicit `hint` (`#refresh_token`,
+  /// `#access_token` or nil). Delegates to
+  /// `TokenRevocation revoke:client:token:hint:`.
+  class revoke: server :: OAuthServer client: reg :: ClientRegistration token: tok :: Object hint: hint :: Symbol | Nil -> Result(Nil, OAuthError) =>
+    TokenRevocation
+      revoke: server
+      client: reg
+      token: tok
+      hint: hint
+
+  /// The provider's token info for `tok` (a `TokenSet` or an access-token
+  /// String), normalized to `#{#active, #subject, #scopes, #expiresIn}`.
+  /// Delegates to `TokenRevocation tokenInfo:client:token:`.
+  class tokenInfo: server :: OAuthServer client: reg :: ClientRegistration token: tok :: Object -> Result(Dictionary, OAuthError) =>
+    TokenRevocation
+      tokenInfo: server
+      client: reg
+      token: tok
 
   // ===== Shared checks =====
 
