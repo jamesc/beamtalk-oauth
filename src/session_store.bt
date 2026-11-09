@@ -43,6 +43,13 @@
 /// grace a late callback answers `expired_session`; after it the state is
 /// unknown and answers `reused_state`.
 ///
+/// ## Callback tickets
+///
+/// `OAuthFlows handleCallback:store:boundTo:` records a single-use ticket
+/// here for the callback it accepted, and `exchangeCode:client:callback:store:`
+/// redeems it before any network call, so a `Callback` built by hand, or
+/// one exchanged twice, is refused. `size` counts sessions only.
+///
 /// ## Redaction
 ///
 /// Beamtalk actors have no `format_status/1` hook, so sessions do not
@@ -75,6 +82,9 @@ typed Actor subclass: SessionStore
   /// The private ETS table of `{stateDigest, stamp, session,
   /// bindingDigest}` rows. See "Redaction".
   state: table :: Object = nil
+  /// The private ETS table of callback tickets: `{ticketDigest, stamp,
+  /// stateDigest}` rows. See "Callback tickets".
+  state: tickets :: Object = nil
 
   /// The default session lifetime: 10 minutes, in milliseconds.
   class defaultTtl -> Integer => 600000
@@ -94,6 +104,7 @@ typed Actor subclass: SessionStore
       self error: "SessionStore: #now must be a Block answering milliseconds"
     ]
     self.table := Erlang ets new: #oauth_session_store with: #(#set, #private)
+    self.tickets := Erlang ets new: #oauth_callback_tickets with: #(#set, #private)
     nil
 
   /// Store `sess` under its `state`, bound to `binding`, and stamp its
@@ -154,6 +165,47 @@ typed Actor subclass: SessionStore
   /// For tests and monitoring.
   size -> Integer => Erlang ets info: self.table with: #size
 
+  /// Record `ticket`, a single-use proof that the session with `state`
+  /// was consumed by `OAuthFlows handleCallback:store:boundTo:`. Kept as
+  /// SHA-256 digests, like sessions, and expiring after the same TTL.
+  /// Raises when `ticket` is nil, empty or already recorded.
+  issueTicket: ticket :: String forState: state :: String -> Nil =>
+    ((ticket isKindOf: String) and: [
+      ticket isEmpty not
+    ]) ifFalse: [
+      self error: "SessionStore: a callback ticket must be a non-empty String"
+    ]
+    stamp := self clock
+    self sweepAt: stamp
+    key := self keyOf: ticket
+    (Erlang ets member: self.tickets with: key) ifTrue: [
+      self error: "SessionStore: this callback ticket is already recorded"
+    ]
+    Erlang ets insert: self.tickets with: {key, stamp, self keyOf: state}
+    nil
+
+  /// Take `ticket`, recorded by `issueTicket:forState:` for `state`.
+  /// Single use: the ticket is removed whatever the outcome. Answers nil,
+  /// or an `OAuthError`:
+  ///
+  /// - `reused_state` when no such ticket is held (never issued, already
+  ///   redeemed, or swept);
+  /// - `session_mismatch` when it was issued for another state;
+  /// - `expired_session` when it is past the TTL.
+  redeemTicket: ticket :: String forState: state :: String -> Result(Nil, OAuthError) =>
+    stamp := self clock
+    self sweepAt: stamp
+    rows := Erlang ets take: self.tickets with: (self keyOf: ticket)
+    rows isEmpty ifTrue: [^Result error: OAuthError reusedState]
+    {_, created, stateKey} := rows first
+    (Erlang crypto hash_equals: stateKey with: (self keyOf: state)) ifFalse: [
+      ^Result error: OAuthError sessionMismatch
+    ]
+    stamp >= (created + self.ttl) ifTrue: [
+      ^Result error: OAuthError expiredSession
+    ]
+    Result ok: nil
+
   /// The TTL clock in milliseconds: the injected clock, or the monotonic
   /// clock.
   internal clock -> Integer =>
@@ -172,6 +224,13 @@ typed Actor subclass: SessionStore
   /// `stamp`.
   internal sweepAt: stamp :: Integer -> Nil =>
     cutoff := stamp - (2 * self.ttl)
+    (Erlang ets tab2list: self.tickets)
+      do: [:ticketRow :: Tuple |
+        {ticketKey, issued, _} := ticketRow
+        issued <= cutoff ifTrue: [
+          Erlang ets delete: self.tickets with: ticketKey
+        ]
+      ]
     (Erlang ets tab2list: self.table)
       do: [:row :: Tuple |
         {key, created, _, _} := row

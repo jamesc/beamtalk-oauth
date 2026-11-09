@@ -17,10 +17,12 @@ TestCase subclass: TokenInfoTest
     self assert: HttpcGuard calls equals: 0
     nil
 
-  /// `preset` with its endpoints pointed at the fixture.
+  /// `preset` as if the fixture were its provider: its `#issuer` and
+  /// absolute endpoints pointed at the fixture (preset endpoints apply only
+  /// at the preset's own issuer).
   local: preset :: Dictionary -> Dictionary =>
     base := self.provider issuer
-    (preset at: #tokenInfoEndpoint put: "{base}/tokeninfo") at: #revocationEndpoint put: "{base}/revoke"
+    ((preset at: #issuer put: base) at: #tokenInfoEndpoint put: "{base}/tokeninfo") at: #revocationEndpoint put: "{base}/revoke"
 
   serverFor: preset :: Dictionary -> OAuthServer =>
     (OAuthServer
@@ -76,6 +78,28 @@ TestCase subclass: TokenInfoTest
     self assert: (info at: #subject) equals: nil
     self assert: (info at: #scopes) equals: #()
     self assert: (info at: #expiresIn) equals: nil
+
+  testSelfHostedGitlabUsesPathUnderIssuer =>
+    // The unmodified GitLab preset at another issuer: token info goes to
+    // {issuer}/oauth/token/info, never to gitlab.com.
+    srv := (OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: ProviderPresets gitlab
+      options: #{#allowUnsafeHttp => true}) unwrap
+    self assert: srv tokenInfoEndpoint equals: "{self.provider issuer}/oauth/token/info"
+    self.provider tokenInfo: #{"resource_owner_id" => 7, "scope" => #("api")}
+    info := (self info: srv token: self tokens) unwrap
+    self assert: (info at: #subject) equals: "7"
+    req := self.provider lastRequestTo: "/oauth/token/info"
+    self assert: ((req at: #headers) at: "authorization") equals: "Bearer at-1"
+
+  testGooglePresetAtAnotherIssuerHasNoTokenInfo =>
+    srv := (OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: ProviderPresets google
+      options: #{#allowUnsafeHttp => true}) unwrap
+    self assert: srv tokenInfoEndpoint equals: nil
+    self assert: (self info: srv token: self tokens) error code equals: "config"
 
   // ===== Google =====
   testGoogleNormalization =>

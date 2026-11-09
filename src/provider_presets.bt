@@ -11,12 +11,18 @@
 /// - `#authorizeParams` — extra authorization-request parameters;
 /// - `#revocationEndpoint` — used when discovery does not name one;
 /// - `#tokenInfoEndpoint` — the provider's (non-standard) token-info URL;
+/// - `#revocationPath`, `#tokenInfoPath` — the same endpoints as paths
+///   (starting with `/`) under the issuer, for a provider discovered at another issuer (self-hosted
+///   GitLab). The absolute endpoints above apply only at `#issuer`; see
+///   `OAuthServer`;
 /// - `#tokenInfoAuth` — how token info takes the token: `#bearer` (an
 ///   `Authorization` header) or `#query` (an `access_token` parameter);
 /// - `#tokenInfoFields` — where the normalized token-info fields
 ///   (`#subject`, `#scopes`, `#expiresIn`) live in the provider's answer;
 /// - `#documentOverrides` — members merged over the discovery document,
-///   for metadata the provider gets wrong.
+///   for metadata the provider gets wrong. They apply at any issuer, so
+///   they must not name endpoint URLs: a URL here would follow the preset
+///   to a self-hosted issuer.
 ///
 /// Pass a preset to `OAuthServer fromPreset:` or `fromDiscovery:preset:`.
 ///
@@ -28,6 +34,9 @@
 Object subclass: ProviderPresets
 
   /// GitLab.com (checked against its discovery document, 2026-11-09).
+  /// Also fits a self-hosted GitLab: `OAuthServer fromDiscovery:
+  /// "https://gitlab.corp" preset: ProviderPresets gitlab` derives the
+  /// revocation and token-info endpoints from that issuer.
   ///
   /// GitLab advertises only `client_secret_basic` and `client_secret_post`
   /// in `token_endpoint_auth_methods_supported`, so a public native
@@ -41,6 +50,8 @@ Object subclass: ProviderPresets
       #authorizeParams => #{},
       #revocationEndpoint => "https://gitlab.com/oauth/revoke",
       #tokenInfoEndpoint => "https://gitlab.com/oauth/token/info",
+      #revocationPath => "/oauth/revoke",
+      #tokenInfoPath => "/oauth/token/info",
       #tokenInfoAuth => #bearer,
       #tokenInfoFields => #{
         #subject => "resource_owner_id",

@@ -13,8 +13,8 @@
 /// preset names the endpoint (`#tokenInfoEndpoint`), how the token is
 /// sent (`#tokenInfoAuth`) and where the fields live (`#tokenInfoFields`).
 ///
-/// Both calls send the token only over HTTPS (or plain HTTP to a
-/// loopback host), cap the response at `maxBodyBytes`, follow no
+/// Both calls send the token only over HTTPS (plain HTTP to a loopback
+/// host only under the test-only flag; see `checkEndpoint:`), cap the response at `maxBodyBytes`, follow no
 /// redirects (`HTTPClient` never does) and never put the token in an
 /// error.
 ///
@@ -373,22 +373,22 @@ Object subclass: TokenRevocation
       message
     ] ifFalse: ["HTTP request failed"])
 
-  /// nil when `url` may carry a token: HTTPS, or plain HTTP to a loopback
-  /// IP literal (`127.0.0.1`, `[::1]`: local test providers).
-  /// Otherwise `insecure_endpoint`, or `config` for a malformed URL.
-  /// Discovery already checks the endpoints it names; this also covers
-  /// a preset's endpoints and servers built by hand.
+  /// nil when `url` may carry a token, otherwise `insecure_endpoint`.
+  ///
+  /// The rule is the shim's and the HTTP adapter's
+  /// (`beamtalk_oauth_oidcc:check_https/2`): HTTPS, or plain HTTP to a
+  /// loopback host only when the test-only application flag
+  /// `beamtalk_oauth` / `allow_unsafe_http_for_tests` is set (as
+  /// `FixtureProvider start` does). Discovery already checks the endpoints
+  /// it names; this also covers a preset's endpoints and servers built by
+  /// hand.
   class checkEndpoint: url :: String -> OAuthError | Nil =>
-    parsed := Erlang uri_string parse: url
-    (parsed isKindOf: Dictionary) ifFalse: [
-      ^OAuthError config: "endpoint is not a valid URI: {url}"
-    ]
-    scheme := (parsed at: #scheme ifAbsent: [""]) asStringUnchecked lowercase
-    host := (parsed at: #host ifAbsent: [""]) asStringUnchecked lowercase
-    scheme =:= "https" ifTrue: [^nil]
-    (scheme =:= "http" and: [
-      #("127.0.0.1", "::1") includes: host
-    ]) ifTrue: [^nil]
+    shim := Erlang beamtalk_oauth_oidcc
+    checked := shim check_https: #{
+      #request_url => url
+    } with: shim unsafe_http_enabled
+    // The shim's bare `ok` arrives as `Result ok: nil`.
+    checked isOk ifTrue: [^nil]
     OAuthError insecureEndpoint: "endpoint must be https: {url}"
 
   /// The response body parsed as JSON, or nil when it is not JSON text.

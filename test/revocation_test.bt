@@ -261,6 +261,8 @@ TestCase subclass: RevocationTest
     self assert: got error code equals: "insecure_endpoint"
     self deny: (got error printString includesSubstring: "rt-1")
     self assert: (TokenRevocation checkEndpoint: "https://example.test/revoke") equals: nil
+    // Plain HTTP to loopback passes only because FixtureProvider start set
+    // the test-only flag (the rule is the shim's check_https/2).
     self assert: (TokenRevocation checkEndpoint: "http://[::1]:8080/revoke") equals: nil
     self assert: (TokenRevocation checkEndpoint: "ftp://example.test/revoke") code equals: "insecure_endpoint"
 

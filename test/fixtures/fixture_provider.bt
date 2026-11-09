@@ -14,7 +14,7 @@
 /// | `/token`                            | a token response with a signed ID token|
 /// | `/userinfo`                         | userinfo claims (401 without a bearer) |
 /// | `/revoke`                           | 200 with an empty body (RFC 7009)      |
-/// | `/tokeninfo`                        | `tokenInfo:` for `at-1`, else 401      |
+/// | `/tokeninfo`, `/oauth/token/info`   | `tokenInfo:` for `at-1`, else 401      |
 ///
 /// Configure it per test: `claims:` (ID-token claims), `tokenFields:`
 /// (token-response members), `discoveryOverrides:`, and
@@ -30,6 +30,10 @@
 /// bearer header or an `access_token` query parameter.
 ///
 /// ID tokens are signed with the actor's own P-256 key through `jose`.
+/// `keyId:` names the key (a `kid` in the JWKS and the ID-token header);
+/// `rotateKeyTo:` replaces it with a new key under a new `kid`, so the
+/// JWKS a client loaded earlier no longer has it. `hits:` counts the
+/// requests made to a path, and `slow:by:` delays its answers.
 /// Default claims: `iss` (the issuer), `sub` `user-1`, `aud` `client-1`,
 /// `nonce` `nonce-1`, `iat` now and `exp` five minutes on.
 ///
@@ -65,10 +69,23 @@ Actor subclass: FixtureProvider
   state: requests :: Dictionary = #{}
   /// The `/tokeninfo` answer for an active token.
   state: tokenInfo :: Dictionary = #{}
+  /// The signing key's `kid`, or nil for none.
+  state: keyId :: String | Nil = nil
+  /// Path -> number of requests served.
+  state: hits :: Dictionary = #{}
+  /// Path -> milliseconds to wait before answering.
+  state: delays :: Dictionary = #{}
 
   /// Start a provider on an ephemeral port. `stop` it when done.
+  ///
+  /// Also sets the test-only application flag that lets
+  /// `#allowUnsafeHttp` work (the fixture is plain HTTP).
   class start -> FixtureProvider =>
     Erlang beamtalk_oauth_oidcc ensure_started
+    Erlang application
+      set_env: #beamtalk_oauth
+      with: #allow_unsafe_http_for_tests
+      with: true
     provider := self spawnWith: #{
       #key => (Erlang jose_jwk generate_key: {#ec, #secp256r1})
     }
@@ -116,6 +133,26 @@ Actor subclass: FixtureProvider
     self.failures := self.failures at: path put: {status, body}
     nil
 
+  /// Name the signing key `kid` (in the JWKS and ID-token headers).
+  keyId: kid :: String -> Nil =>
+    self.keyId := kid
+    nil
+
+  /// Sign with a new P-256 key named `kid` from now on; the JWKS serves
+  /// only the new key.
+  rotateKeyTo: kid :: String -> Nil =>
+    self.key := Erlang jose_jwk generate_key: {#ec, #secp256r1}
+    self.keyId := kid
+    nil
+
+  /// Wait `ms` milliseconds before answering each request on `path`.
+  slow: path :: String by: ms :: Integer -> Nil =>
+    self.delays := self.delays at: path put: ms
+    nil
+
+  /// The number of requests served on `path`.
+  hits: path :: String -> Integer => self.hits at: path ifAbsent: [0]
+
   /// Back to the defaults: no overrides, no failures, no recorded request.
   reset -> Nil =>
     self.claims := #{}
@@ -143,7 +180,8 @@ Actor subclass: FixtureProvider
     self.tokenInfo := body
     nil
 
-  /// The last request to `path` (`/revoke` or `/tokeninfo`):
+  /// The last request to `path` (`/revoke`, `/tokeninfo` or
+  /// `/oauth/token/info`):
   /// `#{#method, #form, #query, #headers}`, or nil.
   lastRequestTo: path :: String -> Dictionary | Nil =>
     self.requests at: path ifAbsent: [nil]
@@ -151,9 +189,12 @@ Actor subclass: FixtureProvider
   /// Answer one request (the `HTTPHandler` protocol).
   handle: req :: HTTPRequest -> HTTPResponse =>
     path := req path
+    self.hits := self.hits at: path put: (self hits: path) + 1
+    delay := self.delays at: path ifAbsent: [0]
+    delay > 0 ifTrue: [Erlang timer sleep: delay]
     failure := self.failures at: path ifAbsent: [nil]
     path =:= "/token" ifTrue: [self.lastTokenRequest := self recordOf: req]
-    (#("/revoke", "/tokeninfo") includes: path)
+    (#("/revoke", "/tokeninfo", "/oauth/token/info") includes: path)
       ifTrue: [
         record := ((self recordOf: req) at: #method put: req method) at: #query put: req queryParams
         self.requests := self.requests at: path put: record
@@ -176,6 +217,7 @@ Actor subclass: FixtureProvider
       "/userinfo" -> self userinfoFor: req;
       "/revoke" -> HTTPResponse new: #{#status => 200, #body => ""};
       "/tokeninfo" -> self tokenInfoFor: req;
+      "/oauth/token/info" -> self tokenInfoFor: req;
       _ -> HTTPResponse new: #{#status => 404, #body => "not found"}
     ]
 
@@ -226,7 +268,9 @@ Actor subclass: FixtureProvider
 
   /// A compact ES256 JWT over `idTokenClaims`, signed with the key.
   idToken -> String =>
-    header := Json generate: #{"alg" => "ES256", "typ" => "JWT"}
+    fields := #{"alg" => "ES256", "typ" => "JWT"}
+    self.keyId isNil ifFalse: [fields := fields at: "kid" put: self.keyId]
+    header := Json generate: fields
     signed := Erlang jose_jwt
       sign: self.key
       with: header
@@ -238,6 +282,7 @@ Actor subclass: FixtureProvider
   jwksResponse -> HTTPResponse =>
     {_, jwk} := Erlang jose_jwk to_binary: (Erlang jose_jwk to_public: self.key)
     public := (Json parse: jwk asStringUnchecked) unwrap
+    self.keyId isNil ifFalse: [public := public at: "kid" put: self.keyId]
     self json: #{"keys" => #(public)} status: 200
 
   /// Userinfo for a request with a bearer token; 401 without one.
