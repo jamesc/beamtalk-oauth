@@ -13,8 +13,10 @@
 /// preset names the endpoint (`#tokenInfoEndpoint`), how the token is
 /// sent (`#tokenInfoAuth`) and where the fields live (`#tokenInfoFields`).
 ///
-/// Both calls cap the response at `maxBodyBytes`, follow no redirects
-/// (`HTTPClient` never does) and never put the token in an error.
+/// Both calls send the token only over HTTPS (or plain HTTP to a
+/// loopback host), cap the response at `maxBodyBytes`, follow no
+/// redirects (`HTTPClient` never does) and never put the token in an
+/// error.
 ///
 /// ## Examples
 /// ```beamtalk
@@ -64,6 +66,7 @@ Object subclass: TokenRevocation
     endpoint isNil ifTrue: [
       ^Result error: (OAuthError config: "the provider has no revocation endpoint")
     ]
+    (self checkEndpoint: endpoint) ifNotNil: [:err | ^Result error: err]
     picked := self pick: tok hint: hint
     (picked isKindOf: OAuthError) ifTrue: [^Result error: picked]
     {token, sentHint} := picked
@@ -175,6 +178,7 @@ Object subclass: TokenRevocation
     endpoint isNil ifTrue: [
       ^Result error: (OAuthError config: "the provider has no token-info endpoint")
     ]
+    (self checkEndpoint: endpoint) ifNotNil: [:err | ^Result error: err]
     token := (tok isKindOf: TokenSet) ifTrue: [tok accessToken] ifFalse: [tok]
     ((token isKindOf: String) and: [
       token isEmpty not
@@ -339,6 +343,24 @@ Object subclass: TokenRevocation
     (err description includesSubstring: token) ifTrue: [
       err withDescription: "HTTP request failed"
     ] ifFalse: [err]
+
+  /// nil when `url` may carry a token: HTTPS, or plain HTTP to a loopback
+  /// host (`127.0.0.1`, `::1`, `localhost`: local test providers).
+  /// Otherwise `insecure_endpoint`, or `config` for a malformed URL.
+  /// Discovery already checks the endpoints it names; this also covers
+  /// a preset's endpoints and servers built by hand.
+  class checkEndpoint: url :: String -> OAuthError | Nil =>
+    parsed := Erlang uri_string parse: url
+    (parsed isKindOf: Dictionary) ifFalse: [
+      ^OAuthError config: "endpoint is not a valid URI: {url}"
+    ]
+    scheme := (parsed at: #scheme ifAbsent: [""]) asStringUnchecked lowercase
+    host := (parsed at: #host ifAbsent: [""]) asStringUnchecked lowercase
+    scheme =:= "https" ifTrue: [^nil]
+    (scheme =:= "http" and: [
+      #("127.0.0.1", "::1", "localhost") includes: host
+    ]) ifTrue: [^nil]
+    OAuthError insecureEndpoint: "endpoint must be https: {url}"
 
   /// The response body parsed as JSON, or nil when it is not JSON text.
   class jsonOf: resp :: HTTPResponse -> Object =>

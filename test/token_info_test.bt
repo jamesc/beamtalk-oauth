@@ -155,6 +155,12 @@ TestCase subclass: TokenInfoTest
     self assert: (self info: srv token: self tokens) error code equals: "config"
     self assert: self lastRequest equals: nil
 
+  testPlainHttpEndpointIsRefused =>
+    srv := self google withTokenInfoEndpoint: "http://example.test/tokeninfo"
+    err := (self info: srv token: self tokens) error
+    self assert: err code equals: "insecure_endpoint"
+    self deny: (err printString includesSubstring: "at-1")
+
   testEmptyTokenIsConfigError =>
     self assert: (self info: self gitlab token: "") error code equals: "config"
 

@@ -229,6 +229,18 @@ TestCase subclass: RevocationTest
       token: self tokens
     self assert: got error code equals: "config"
 
+  testPlainHttpEndpointIsRefused =>
+    srv := self server withRevocationEndpoint: "http://example.test/revoke"
+    got := TokenRevocation
+      revoke: srv
+      client: self publicClient
+      token: self tokens
+    self assert: got error code equals: "insecure_endpoint"
+    self deny: (got error printString includesSubstring: "rt-1")
+    self assert: (TokenRevocation checkEndpoint: "https://example.test/revoke") equals: nil
+    self assert: (TokenRevocation checkEndpoint: "http://[::1]:8080/revoke") equals: nil
+    self assert: (TokenRevocation checkEndpoint: "ftp://example.test/revoke") code equals: "insecure_endpoint"
+
   // ===== No token in errors =====
   testErrorsNeverCarryTheToken =>
     self.provider
