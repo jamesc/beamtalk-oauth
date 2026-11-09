@@ -1,0 +1,130 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// LoopbackReceiver — one-shot loopback callback listener for native apps
+/// (RFC 8252 §7.3).
+///
+/// `start` binds an `HTTPServer` to `127.0.0.1` on an OS-assigned port.
+/// The first `GET /callback` is recorded and answered with a static
+/// "you can close this tab" page that echoes no provider data; any other
+/// path or method, and any later callback, answers 404 without touching
+/// the recorded query. Browsers fetch `/favicon.ico` right after the
+/// redirect, so this matters.
+///
+/// The receiver owns the per-flow `binding` (`Secrets generate`), so a
+/// native app passes `rx binding` to the session store and never makes
+/// one itself.
+///
+/// `awaitCallback:` waits in the calling process, for a message from the
+/// handler, not in an actor call: the user may take minutes, and actor
+/// calls time out at 5 s. That is why the receiver is a `Value` handle
+/// (its methods run in the caller) over two actors, the `HTTPServer` and
+/// its `LoopbackGate` handler, which holds the one-shot state.
+///
+/// The listener stops once `awaitCallback:` answers, either way; `stop`
+/// stops it early and is idempotent. A receiver that is never awaited or
+/// stopped keeps listening.
+///
+/// ## Examples
+/// ```beamtalk
+/// rx := LoopbackReceiver start unwrap
+/// rx redirectUri                       // => "http://127.0.0.1:50278/callback"
+/// rx binding size                      // => 43
+/// query := (rx awaitCallback: 300000) unwrap
+/// query at: "code"                     // => "..."
+/// ```
+typed Value subclass: LoopbackReceiver
+  /// The listening server.
+  field: server :: HTTPServer | Nil = nil
+  /// The server's request handler, holding the one-shot callback state.
+  field: gate :: LoopbackGate | Nil = nil
+  /// The OS-assigned port the server listens on.
+  field: port :: Integer = 0
+  /// The per-flow session binding.
+  field: binding :: String = ""
+
+  /// Start a listener on `127.0.0.1`, port 0 (OS-assigned), with a fresh
+  /// binding. Answers a `transport` error when the listener cannot start.
+  class start -> Result(LoopbackReceiver, OAuthError) =>
+    gate := LoopbackGate spawn
+    outcome := Result
+      tryDo: [
+        HTTPServer
+          start: 0
+          handler: gate
+          options: #{#bind => "127.0.0.1"}
+      ]
+    outcome isError
+      ifTrue: [
+        gate stop
+        ^Result error: (OAuthError transport: "loopback listener failed to start: {outcome error messageText}")
+      ]
+    srv := outcome value
+    Result
+      ok: (self
+        new: #{
+          #server => srv,
+          #gate => gate,
+          #port => srv port,
+          #binding => Secrets generate
+        })
+
+  /// Block the calling process until `{#beamtalk_oauth_callback, tag, query}`
+  /// arrives or `timeoutMs` passes.
+  class await: tag :: Reference timeout: timeoutMs :: Integer -> Result(Dictionary, Symbol) =>
+    // `{ok, Query}` / `{error, timeout}` from the native module.
+    @expect type
+    Erlang beamtalk_oauth_loopback await: tag timeout: timeoutMs
+
+  /// The redirect URI to register with the provider for this flow:
+  /// `http://127.0.0.1:{port}/callback`.
+  redirectUri -> String => "http://127.0.0.1:{self.port}/callback"
+
+  /// Wait up to `timeoutMs` for the callback and answer its raw query
+  /// (`code`, `state`, or `error` and `error_description`), for
+  /// `OAuthFlows handleCallback:store:boundTo:`. A callback that arrived
+  /// before the call is answered at once.
+  ///
+  /// The wait happens in the calling process. The listener is stopped
+  /// before this answers. Errors:
+  ///
+  /// - `callback_timeout`: nothing arrived in time;
+  /// - `config`: a negative timeout, or the receiver was already stopped.
+  awaitCallback: timeoutMs :: Integer -> Result(Dictionary, OAuthError) =>
+    timeoutMs < 0
+      ifTrue: [
+        ^Result error: (OAuthError config: "awaitCallback: timeout must not be negative")
+      ]
+    tag := Reference new
+    registered := Result tryDo: [self.gate awaitFrom: Pid current tag: tag]
+    registered isError
+      ifTrue: [
+        self stop
+        ^Result error: (OAuthError config: "LoopbackReceiver is stopped")
+      ]
+    outcome := self class await: tag timeout: timeoutMs
+    self stop
+    // A callback that raced the timeout may already be in the mailbox:
+    // take it, which also leaves no stray message behind.
+    outcome isError ifTrue: [outcome := self class await: tag timeout: 0]
+    outcome ifOk: [:query |
+      Result ok: query
+    ] ifError: [:e | Result error: OAuthError callbackTimeout]
+
+  /// Stop the listener. Idempotent: answers `#ok` every time, like
+  /// `Actor>>stop`.
+  stop -> Symbol =>
+    self.server isNil ifFalse: [self.server stop]
+    self.gate isNil ifFalse: [self.gate stop]
+    #ok
+
+  /// Whether the listener is still accepting connections.
+  isListening -> Boolean => self.server notNil and: [self.server isAlive]
+
+  /// `LoopbackReceiver(http://127.0.0.1:{port}/callback)`. The binding is
+  /// not shown.
+  printString -> String => "LoopbackReceiver({self redirectUri})"
+
+  /// The JSON shape, with the binding redacted.
+  asJson -> Dictionary =>
+    #{"redirectUri" => self redirectUri, "binding" => OAuthError redacted}

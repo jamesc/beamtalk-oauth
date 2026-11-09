@@ -1,0 +1,76 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// LoopbackGate — the one-shot request handler behind a `LoopbackReceiver`.
+///
+/// It is the `HTTPServer`'s `HTTPHandler`, so every request runs in this
+/// actor's process, one at a time: the first `GET /callback` is recorded
+/// and every other request answers 404 without touching it. Browsers
+/// fetch `/favicon.ico` right after the redirect, so recording every
+/// request would overwrite the callback.
+///
+/// The gate also holds at most one waiter, a `{Pid, Reference}` pair
+/// registered by `awaitFrom:tag:`. When both the query and the waiter are
+/// present, it sends `{#beamtalk_oauth_callback, tag, query}` to the
+/// waiting process and forgets the waiter. The waiter then blocks in its
+/// own mailbox, not in an actor call, so the wait is not bounded by the
+/// 5 s call timeout.
+///
+/// Internal to `LoopbackReceiver`; applications do not use it directly.
+typed Actor subclass: LoopbackGate
+  /// The recorded callback query; nil until the first `GET /callback`.
+  state: query :: Dictionary | Nil = nil
+  /// The process waiting for the query, as `{Pid, Reference}`.
+  state: waiter :: Tuple | Nil = nil
+
+  /// The page shown after the redirect. Static: it echoes no provider data.
+  class closeTabPage -> HTTPResponse =>
+    HTTPResponse
+      new: #{
+        #status => 200,
+        #headers => #(#("content-type", "text/html; charset=utf-8"), #("cache-control", "no-store"), #("referrer-policy", "no-referrer")),
+        #body => "<!doctype html><html><head><meta charset=""utf-8""><title>Signed in</title></head><body><p>Sign-in complete. You can close this tab.</p></body></html>"
+      }
+
+  /// 404 for every request that is not the first `GET /callback`.
+  class notFound -> HTTPResponse =>
+    HTTPResponse
+      new: #{
+        #status => 404,
+        #headers => #(#("content-type", "text/plain; charset=utf-8")),
+        #body => "Not Found"
+      }
+
+  /// Record the first `GET /callback` and answer the static close-this-tab
+  /// page; answer 404 to anything else, including a second callback.
+  handle: req :: HTTPRequest -> HTTPResponse =>
+    isCallback := (req method =:= "GET") and: [req path =:= "/callback"]
+    (isCallback and: [self.query isNil]) ifFalse: [^self class notFound]
+    self.query := req queryParams
+    self notifyWaiter
+    self class closeTabPage
+
+  /// Register the process `pid` to receive the query tagged with `tag`.
+  /// A query that already arrived is sent at once. A later registration
+  /// replaces an earlier one.
+  awaitFrom: pid :: Pid tag: tag :: Reference -> Nil =>
+    self.waiter := {pid, tag}
+    self notifyWaiter
+    nil
+
+  /// Send the query to the waiter when both are present.
+  notifyWaiter -> Nil =>
+    (self.query notNil and: [self.waiter notNil])
+      ifTrue: [
+        {pid, tag} := self.waiter
+        pid send: {#beamtalk_oauth_callback, tag, self.query}
+        self.waiter := nil
+      ]
+    nil
+
+  /// `LoopbackGate(callback: received)` or `LoopbackGate(callback: pending)`.
+  /// The query is never shown: it carries the authorization code.
+  printString -> String =>
+    self.query isNil ifTrue: [
+      "LoopbackGate(callback: pending)"
+    ] ifFalse: ["LoopbackGate(callback: received)"]

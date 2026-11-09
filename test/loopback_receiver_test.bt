@@ -1,0 +1,124 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+// HTTPClient plays the browser.
+TestCase subclass: LoopbackReceiverTest
+  field: rx = nil
+
+  setUp => self.rx := LoopbackReceiver start unwrap
+
+  tearDown =>
+    self.rx stop
+    self
+
+  /// GET `path` (with any query) on the receiver's listener.
+  browse: path => HTTPClient get: "http://127.0.0.1:{self.rx port}{path}"
+
+  testRedirectUriIsLoopbackOnEphemeralPort =>
+    self assert: self.rx port > 0
+    self assert: self.rx redirectUri equals: "http://127.0.0.1:{self.rx port}/callback"
+
+  testEachReceiverGetsItsOwnPort =>
+    other := LoopbackReceiver start unwrap
+    self deny: other port =:= self.rx port
+    other stop
+
+  testBindingIsAFreshSecret =>
+    other := LoopbackReceiver start unwrap
+    self assert: self.rx binding size equals: 43
+    self assert: (self.rx binding matchesRegex: "^[A-Za-z0-9_-]+$")
+    self deny: other binding =:= self.rx binding
+    other stop
+
+  testPrintStringAndJsonHideBinding =>
+    self deny: (self.rx printString includesSubstring: self.rx binding)
+    self deny: ((Json generate: self.rx) includesSubstring: self.rx binding)
+    self assert: (self.rx printString includesSubstring: self.rx redirectUri)
+
+  testCallbackIsDelivered =>
+    resp := (self browse: "/callback?code=abc123&state=xyz") unwrap
+    self assert: resp status equals: 200
+    self assert: (resp body includesSubstring: "close this tab")
+    query := (self.rx awaitCallback: 5000) unwrap
+    self assert: (query at: "code") equals: "abc123"
+    self assert: (query at: "state") equals: "xyz"
+
+  testCloseTabPageEchoesNoProviderData =>
+    resp := (self browse: "/callback?code=SECRETCODE&state=STATEVALUE&error_description=EVIL") unwrap
+    self deny: (resp body includesSubstring: "SECRETCODE")
+    self deny: (resp body includesSubstring: "STATEVALUE")
+    self deny: (resp body includesSubstring: "EVIL")
+
+  testProviderErrorQueryIsDeliveredRaw =>
+    self browse: "/callback?error=access_denied&state=xyz"
+    query := (self.rx awaitCallback: 5000) unwrap
+    self assert: (query at: "error") equals: "access_denied"
+
+  testFaviconBeforeCallbackDoesNotBlockIt =>
+    resp := (self browse: "/favicon.ico") unwrap
+    self assert: resp status equals: 404
+    self browse: "/callback?code=first"
+    query := (self.rx awaitCallback: 5000) unwrap
+    self assert: (query at: "code") equals: "first"
+
+  testFaviconAfterCallbackDoesNotOverwriteIt =>
+    self browse: "/callback?code=first"
+    resp := (self browse: "/favicon.ico?code=second") unwrap
+    self assert: resp status equals: 404
+    query := (self.rx awaitCallback: 5000) unwrap
+    self assert: (query at: "code") equals: "first"
+
+  testSecondCallbackAnswers404 =>
+    self browse: "/callback?code=first"
+    resp := (self browse: "/callback?code=second") unwrap
+    self assert: resp status equals: 404
+    query := (self.rx awaitCallback: 5000) unwrap
+    self assert: (query at: "code") equals: "first"
+
+  testOtherMethodOnCallbackAnswers404 =>
+    resp := (HTTPClient post: "http://127.0.0.1:{self.rx port}/callback?code=posted" body: "") unwrap
+    self assert: resp status equals: 404
+    self browse: "/callback?code=got"
+    query := (self.rx awaitCallback: 5000) unwrap
+    self assert: (query at: "code") equals: "got"
+
+  testAwaitWaitsForALaterCallback =>
+    url := self.rx redirectUri ++ "?code=late"
+    [
+      Timer sleep: 200
+      HTTPClient get: url
+    ] fork
+    query := (self.rx awaitCallback: 5000) unwrap
+    self assert: (query at: "code") equals: "late"
+
+  testTimeoutAnswersCallbackTimeout =>
+    outcome := self.rx awaitCallback: 50
+    self assert: outcome isError
+    self assert: outcome error code equals: "callback_timeout"
+
+  testListenerIsClosedAfterTimeout =>
+    self.rx awaitCallback: 50
+    self deny: self.rx isListening
+    self assert: (self browse: "/callback?code=x") isError
+
+  testListenerIsClosedAfterCallback =>
+    self browse: "/callback?code=x"
+    (self.rx awaitCallback: 5000) unwrap
+    self deny: self.rx isListening
+    self assert: (self browse: "/callback?code=y") isError
+
+  testStopIsIdempotent =>
+    self assert: self.rx isListening
+    self assert: self.rx stop equals: #ok
+    self assert: self.rx stop equals: #ok
+    self deny: self.rx isListening
+
+  testAwaitAfterStopAnswersConfigError =>
+    self.rx stop
+    outcome := self.rx awaitCallback: 50
+    self assert: outcome isError
+    self assert: outcome error code equals: "config"
+
+  testNegativeTimeoutAnswersConfigError =>
+    outcome := self.rx awaitCallback: -1
+    self assert: outcome error code equals: "config"

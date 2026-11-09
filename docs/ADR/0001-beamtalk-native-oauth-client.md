@@ -352,7 +352,11 @@ protocol if a multi-node web deployment needs it.
 // port, accepts exactly one request on /callback, answers a static
 // "you can close this tab" page (no provider data echoed), then stops.
 // It owns the per-flow binding, so native apps never see one.
-Actor subclass: LoopbackReceiver
+// A Value handle, not an Actor: an actor's methods run in the actor, so
+// awaitCallback: could only wait inside a 5s sync call. The one-shot
+// state lives in an internal LoopbackGate actor, the server's
+// HTTPHandler (BT-4560).
+Value subclass: LoopbackReceiver
   class start -> Result(LoopbackReceiver, OAuthError) => ...
   redirectUri -> String => ...      // "http://127.0.0.1:{port}/callback"
   binding -> String => ...
@@ -364,7 +368,7 @@ Actor subclass: LoopbackReceiver
     // Only GET /callback counts: browsers fetch /favicon.ico right after
     // the redirect, and any other path answers 404 without touching the
     // pending result.
-  stop -> Nil => ...
+  stop -> Symbol => ...             // idempotent; #ok, like Actor>>stop
 ```
 
 ```beamtalk
