@@ -64,8 +64,23 @@
 /// its `LoopbackGate` handler, which holds the one-shot state.
 ///
 /// The listener stops once `awaitCallback:` answers, either way; `stop`
-/// stops it early and is idempotent. A receiver that is never awaited or
-/// stopped keeps listening.
+/// stops it early and is idempotent.
+///
+/// ## Lifetime
+///
+/// The listener does not outlive the process that owns it. Until
+/// `awaitCallback:` begins, the owner is the process that called `start`:
+/// if it crashes (exits with any reason but `normal`), the listener stops.
+/// A normal exit leaves it up, since the receiver may have been handed to
+/// another process (or the REPL evaluation that started it has ended).
+/// Once `awaitCallback:` begins, the waiting process is the owner, and
+/// the listener stops if it exits for any reason before the wait answers.
+///
+/// A receiver that nobody awaits stops after `defaultLifetime` (10
+/// minutes), or the lifetime given to `startWithLifetime:`. The wait
+/// itself is bounded only by its own timeout. A listener stopped by its
+/// owner or its lifetime answers a `config` error from `awaitCallback:`
+/// and raises from `expectState:`.
 ///
 /// ## Examples
 /// ```beamtalk
@@ -87,31 +102,45 @@ typed Value subclass: LoopbackReceiver
   /// The per-flow session binding.
   field: binding :: String = ""
 
+  /// How long, in ms, a receiver that is never awaited keeps listening:
+  /// 10 minutes.
+  class defaultLifetime -> Integer => 600000
+
   /// Start a listener on `127.0.0.1`, port 0 (OS-assigned), with a fresh
-  /// binding. Answers a `transport` error when the listener cannot start.
+  /// binding, that stops after `defaultLifetime` unless `awaitCallback:`
+  /// has begun by then. Answers a `transport` error when the listener
+  /// cannot start.
   class start -> Result(LoopbackReceiver, OAuthError) =>
+    self startWithLifetime: self defaultLifetime
+
+  /// Like `start`, but the listener stops after `lifetimeMs` unless
+  /// `awaitCallback:` has begun by then. Answers a `config` error when
+  /// `lifetimeMs` is outside `1..maxTimeout`.
+  class startWithLifetime: lifetimeMs :: Integer -> Result(LoopbackReceiver, OAuthError) =>
+    ((lifetimeMs < 1) or: [lifetimeMs > self maxTimeout])
+      ifTrue: [
+        ^Result error: (OAuthError config: "LoopbackReceiver lifetime must be between 1 and {self maxTimeout} ms")
+      ]
     binding := Secrets generate
-    gate := LoopbackGate spawn
-    srv := nil
+    // The gate monitors this process from its own `initialize`, and
+    // starts the server inside one of its own methods: a `DOWN` that
+    // arrives meanwhile waits in its mailbox until the server is
+    // attached, so a crash at any point here cannot leak the listener.
+    gate := LoopbackGate spawnWith: #{#starter => Pid current}
     outcome := Result
       tryDo: [
-        srv := HTTPServer
-          start: 0
-          handler: (self handlerFor: gate)
-          options: #{#bind => "127.0.0.1"}
-        rx := self new: #{
+        srv := gate listenWith: (self handlerFor: gate) lifetime: lifetimeMs
+        self new: #{
           #server => srv,
           #gate => gate,
           #port => srv port,
           #binding => binding
         }
-        gate expectHost: "127.0.0.1:{rx port}"
-        rx
       ]
     outcome
       ifOk: [:rx | Result ok: rx]
       ifError: [:e |
-        (self new: #{#server => srv, #gate => gate}) stop
+        [gate close] on: Error do: [:ignored | nil]
         Result error: (OAuthError transport: "loopback listener failed to start: {e messageText}")
       ]
 
@@ -170,8 +199,9 @@ typed Value subclass: LoopbackReceiver
   ///   number of callbacks refused for a missing, wrong or repeated
   ///   parameter, also given in the description when it is not 0;
   /// - `config`: a timeout outside `0..maxTimeout`; `expectState:` was
-  ///   never called; the receiver was stopped, before or during the wait;
-  ///   or another process is already waiting on it. Only in the stopped
+  ///   never called; the receiver was stopped (by `stop`, its owner
+  ///   exiting or its lifetime passing), before or during the wait; or
+  ///   another process is already waiting on it. Only in the stopped
   ///   case is the listener gone: otherwise it stays up, and any other
   ///   wait carries on.
   awaitCallback: timeoutMs :: Integer -> Result(Dictionary, OAuthError) =>
@@ -181,7 +211,7 @@ typed Value subclass: LoopbackReceiver
       ]
     tag := Reference new
     registered := Result tryDo: [self.gate awaitFrom: Pid current tag: tag]
-    registered isError
+    (registered isError or: [registered value =:= #closed])
       ifTrue: [
         self stop
         ^Result error: (OAuthError config: "LoopbackReceiver is stopped")

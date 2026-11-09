@@ -361,6 +361,11 @@ protocol if a multi-node web deployment needs it.
 // server's block handler forwards each request to with its raw query.
 Value subclass: LoopbackReceiver
   class start -> Result(LoopbackReceiver, OAuthError) => ...
+    // The gate monitors the owner (the starter until awaitCallback:
+    // begins, then the waiter) and stops the listener if it crashes, so
+    // a port is never left open with no one to read it. A receiver no
+    // one awaits stops after a lifetime (10 min; startWithLifetime:)
+    // (BT-4570).
   redirectUri -> String => ...      // "http://127.0.0.1:{port}/callback"
   binding -> String => ...
   expectState: expected :: String -> LoopbackReceiver => ...
