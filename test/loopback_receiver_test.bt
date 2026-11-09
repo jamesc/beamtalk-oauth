@@ -461,3 +461,39 @@ TestCase subclass: LoopbackReceiverTest
   testLifetimeOutOfRangeAnswersConfigError =>
     self assert: (LoopbackReceiver startWithLifetime: 0) error code equals: "config"
     self assert: (LoopbackReceiver startWithLifetime: LoopbackReceiver maxTimeout + 1) error code equals: "config"
+
+  testListenerClosesWhenStarterCrashesRightAfterStart =>
+    table := Ets new: #bt4570Immediate type: #set
+    rx := self receiverStartedIn: table by: [:started |
+      Erlang erlang exit: #boom
+    ]
+    self assert: (self awaitClosed: rx)
+    table delete
+
+  testStarterDyingDuringListenNeverLeaksTheServer =>
+    // The starter is killed while the gate starts the server: whichever
+    // way the race goes, no server is left listening.
+    10
+      timesRepeat: [
+        starter := [Timer sleep: 60000] fork
+        gate := LoopbackGate spawnWith: #{#starter => starter}
+        Erlang erlang exit: starter with: #kill
+        outcome := Result tryDo: [
+          gate listenWith: (LoopbackReceiver handlerFor: gate) lifetime: 60000
+        ]
+        outcome isOk
+          ifTrue: [
+            srv := outcome value
+            100 timesRepeat: [srv isAlive ifTrue: [Timer sleep: 20]]
+            self deny: srv isAlive
+          ]
+        100 timesRepeat: [gate isAlive ifTrue: [Timer sleep: 20]]
+        self deny: gate isAlive
+      ]
+
+  testGateWithADeadStarterShutsDownBeforeListening =>
+    starter := [nil] fork
+    Timer sleep: 50
+    gate := LoopbackGate spawnWith: #{#starter => starter}
+    100 timesRepeat: [gate isAlive ifTrue: [Timer sleep: 20]]
+    self deny: gate isAlive

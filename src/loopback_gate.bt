@@ -42,7 +42,8 @@
 ///
 /// The gate watches the process that owns the receiver, so a listener
 /// does not outlive a crashed owner (BT-4570). The owner starts as the
-/// process that started the receiver (`watchStarter:`) and moves to the
+/// process that started the receiver (the `starter` given to
+/// `spawnWith:`, monitored from `initialize`) and moves to the
 /// waiter when one registers (`awaitFrom:tag:`). The gate shuts the
 /// listener down, then stops itself, when:
 ///
@@ -76,7 +77,7 @@ typed Server subclass: LoopbackGate
   /// flow armed with the wrong state can be told from a user who never
   /// signed in.
   state: refused :: Integer = 0
-  /// The listener this gate serves; nil until `attachServer:`. Stopped
+  /// The listener this gate serves; nil until `listenWith:lifetime:`. Stopped
   /// when the owner goes away.
   state: server :: HTTPServer | Nil = nil
   /// The monitor on the owning process (the starter, then the waiter).
@@ -89,6 +90,9 @@ typed Server subclass: LoopbackGate
   state: awaited :: Boolean = false
   /// Set when the gate shuts down: every later request answers 404.
   state: closed :: Boolean = false
+  /// The process that started the receiver, monitored from `initialize`
+  /// so no crash of it goes unseen; nil for a gate spawned bare.
+  state: starter :: Pid | Nil = nil
 
   /// The callback parameters that must appear at most once (RFC 6749
   /// §3.1, RFC 9207 for `iss`).
@@ -112,6 +116,11 @@ typed Server subclass: LoopbackGate
         #headers => #(#("content-type", "text/plain; charset=utf-8")),
         #body => "Not Found"
       }
+
+  /// Monitor `starter`, when given, before any other message is handled.
+  initialize -> Nil =>
+    self.starter isNil ifFalse: [self watchOwner: self.starter asWaiter: false]
+    nil
 
   /// Record the first `GET /callback` that passes the host, state and
   /// duplicate-parameter checks, and answer the static close-this-tab
@@ -231,15 +240,28 @@ typed Server subclass: LoopbackGate
     self notifyWaiter
     #ok
 
-  /// Watch `pid`, the process that started the receiver: shut the
-  /// listener down if it exits abnormally before a waiter registers.
-  watchStarter: pid :: Pid -> Nil =>
-    self watchOwner: pid asWaiter: false
-    nil
-
-  /// The listener to stop when the owner goes away.
-  attachServer: srv :: HTTPServer -> Nil =>
+  /// Start the listener on `127.0.0.1`, port 0 (OS-assigned), with
+  /// `handler`; accept only its own `Host` from then on, and shut down
+  /// after `lifetimeMs` unless a waiter has registered by then. Answers
+  /// the server.
+  ///
+  /// The server is started here, in the gate, rather than by the caller:
+  /// a `DOWN` from the starter that arrives meanwhile is handled only
+  /// after the server is attached, so `shutDown` always finds it.
+  listenWith: handler :: Block lifetime: lifetimeMs :: Integer -> HTTPServer =>
+    self.closed ifTrue: [self error: "LoopbackGate: closed"]
+    srv := HTTPServer
+      start: 0
+      handler: handler
+      options: #{#bind => "127.0.0.1"}
     self.server := srv
+    self.host := "127.0.0.1:{srv port}"
+    self expireAfter: lifetimeMs
+    srv
+
+  /// Stop the listener, if any, then this gate. Idempotent.
+  close -> Nil =>
+    self shutDown
     nil
 
   /// Shut down after `ms` unless a waiter has registered by then.

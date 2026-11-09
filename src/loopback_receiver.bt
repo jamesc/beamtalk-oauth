@@ -122,30 +122,25 @@ typed Value subclass: LoopbackReceiver
         ^Result error: (OAuthError config: "LoopbackReceiver lifetime must be between 1 and {self maxTimeout} ms")
       ]
     binding := Secrets generate
-    gate := LoopbackGate spawn
-    gate watchStarter: Pid current
-    srv := nil
+    // The gate monitors this process from its own `initialize`, and
+    // starts the server inside one of its own methods: a `DOWN` that
+    // arrives meanwhile waits in its mailbox until the server is
+    // attached, so a crash at any point here cannot leak the listener.
+    gate := LoopbackGate spawnWith: #{#starter => Pid current}
     outcome := Result
       tryDo: [
-        srv := HTTPServer
-          start: 0
-          handler: (self handlerFor: gate)
-          options: #{#bind => "127.0.0.1"}
-        rx := self new: #{
+        srv := gate listenWith: (self handlerFor: gate) lifetime: lifetimeMs
+        self new: #{
           #server => srv,
           #gate => gate,
           #port => srv port,
           #binding => binding
         }
-        gate attachServer: srv;
-          expectHost: "127.0.0.1:{rx port}";
-          expireAfter: lifetimeMs
-        rx
       ]
     outcome
       ifOk: [:rx | Result ok: rx]
       ifError: [:e |
-        (self new: #{#server => srv, #gate => gate}) stop
+        [gate close] on: Error do: [:ignored | nil]
         Result error: (OAuthError transport: "loopback listener failed to start: {e messageText}")
       ]
 
