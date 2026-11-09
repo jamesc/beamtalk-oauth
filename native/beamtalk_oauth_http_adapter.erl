@@ -23,11 +23,30 @@ Every failure answers `{error, {http_client, Reason}}`, where `Reason` is
 the `HTTPClient` error's message (a binary) or a fixed atom. It never
 carries the request: no URL query, headers or body, which hold codes,
 secrets and tokens.
+
+With `capture => true` in the config, the body of each successful `POST`
+response is also kept in the calling process's dictionary under
+`beamtalk_oauth_captured_body` (see `take_captured/0`). The shim uses
+this for refresh: `oidcc_token:refresh/3` discards a response that has
+no ID token, and the shim must still read it.
 """.
 
 -behaviour(oidcc_http_adapter).
 
--export([request/5]).
+-export([request/5, take_captured/0]).
+
+-define(CAPTURE_KEY, beamtalk_oauth_captured_body).
+
+-doc """
+The last captured `POST` response body, removed from the process
+dictionary, or `none`.
+""".
+-spec take_captured() -> binary() | none.
+take_captured() ->
+    case erase(?CAPTURE_KEY) of
+        undefined -> none;
+        Body -> Body
+    end.
 
 -define(DEFAULT_MAX_BODY, 1048576).
 %% oidcc's own default; used when oidcc passes `infinity`, which
@@ -78,12 +97,20 @@ do_request(Method, Request, HttpOptions, Client, Config) ->
                 none -> Opts0;
                 _ -> Opts0#{body => str(Body)}
             end,
-        from_result(
+        Answer = from_result(
             beamtalk_message_dispatch:send(Client, 'request:url:options:', [Method, str(Url), Opts])
-        )
+        ),
+        capture(Method, Answer, Config),
+        Answer
     else
         {error, Reason} -> {error, {http_client, Reason}}
     end.
+
+capture(post, {ok, {_Status, _Headers, Body}}, #{capture := true}) ->
+    put(?CAPTURE_KEY, Body),
+    ok;
+capture(_Method, _Answer, _Config) ->
+    ok.
 
 %% `HTTPClient` has no per-request TLS options, so `ssl` options (custom
 %% CAs, client certificates for `tls_client_auth`) would be silently

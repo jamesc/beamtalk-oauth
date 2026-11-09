@@ -1,0 +1,584 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+/// OAuthFlows — the grant operations a login uses: the authorization URL,
+/// the callback, the code exchange, refresh and userinfo.
+///
+/// Every identity-sensitive step goes through `oidcc` via the native shim:
+/// the PKCE challenge (S256 only, always required), the token endpoint
+/// and client authentication, ID-token validation (issuer, audience,
+/// nonce, expiry, signature), the subject check on refresh and the
+/// subject check on userinfo. Every `oidcc` call goes through the
+/// package's `HTTPClient`, never `httpc`, and every `oidcc` error is
+/// mapped by `OAuthError fromOidcc:` (redacted).
+///
+/// This class owns what `oidcc` leaves to the caller: callback parsing,
+/// consuming the session with the user-agent binding, the mix-up checks
+/// (the session's issuer and redirect URI must match the server and the
+/// registration, checked before any network call) and the refresh merge.
+///
+/// Failures answer `Result error:` an `OAuthError`. Codes these methods
+/// add themselves:
+///
+/// - `parse` — a callback with a missing, empty, non-text or duplicated
+///   parameter, or a malformed `error` code;
+/// - `provider_error` — the callback carried an `error` code that is not
+///   a registered authorization-error code (the provider's code is in
+///   `detail`), so it can never pose as one of this library's codes;
+/// - `reused_state` — also for a `Callback` that `handleCallback` did not
+///   make, or one already exchanged;
+/// - `session_mismatch` — the session belongs to another issuer or
+///   redirect URI, or the server's own `oidcc` configuration names a
+///   different issuer than `server issuer`; also from the store, for a
+///   callback presented with the wrong binding;
+/// - `issuer_mismatch` — a callback `iss` (RFC 9207) or a token set's
+///   issuer differs from the expected one, or the provider advertises
+///   `iss` and the callback lacks it;
+/// - `missing_id_token` — the token response carried no ID token;
+/// - `no_userinfo_endpoint` — the provider names no userinfo endpoint;
+/// - `oidcc_crash` — `oidcc` raised on a malformed provider answer (the
+///   exception is dropped: its stacktrace could hold secrets);
+/// - `config` — the registration's redirect URI is not acceptable (see
+///   `ClientRegistration checkRedirect:`), a reserved authorization
+///   parameter was overridden, or a token set lacks what the call needs.
+///
+/// ## Native app flow
+///
+/// The `LoopbackReceiver` only accepts a callback whose `state` it was told
+/// to expect, so call `expectState:` before opening the URL:
+///
+/// ```beamtalk
+/// server := (OAuthServer fromPreset: ProviderPresets gitlab) unwrap
+/// rx := LoopbackReceiver start unwrap
+/// reg := (ClientRegistration forClient: "APP_ID" redirect: rx redirectUri) unwrap
+/// store := SessionStore spawn
+/// sess := OAuthSession newSessionFor: server client: reg
+/// store create: sess boundTo: rx binding
+/// rx expectState: sess state
+/// url := (OAuthFlows authorizeUrl: server client: reg scopes: #("openid", "read_user") session: sess) unwrap
+/// query := (rx awaitCallback: 300000) unwrap
+/// cb := (OAuthFlows handleCallback: query store: store boundTo: rx binding) unwrap
+/// toks := (OAuthFlows exchangeCode: server client: reg callback: cb store: store) unwrap
+/// toks subject                              // validated by oidcc
+/// toks := (OAuthFlows refresh: server client: reg tokenSet: toks) unwrap
+/// (OAuthFlows userInfo: server client: reg tokenSet: toks) unwrap
+/// ```
+Object subclass: OAuthFlows
+
+  /// Authorization parameters that the flow sets itself and that extra
+  /// parameters (from the preset or the caller) may not override. The JWT
+  /// claim names are included because `oidcc` merges extras over the
+  /// claims of a signed request object.
+  class reservedParams -> List(String) =>
+    #("response_type", "client_id", "redirect_uri", "state", "nonce", "scope", "code_challenge", "code_challenge_method", "request", "request_uri", "response_mode", "dpop_jkt", "purpose", "iss", "aud", "exp", "nbf", "iat", "jti")
+
+  // ===== Authorization URL =====
+
+  /// The URL to send the browser to, for `sess`. As
+  /// `authorizeUrl:client:scopes:session:extraParams:` with no extras.
+  class authorizeUrl: server :: OAuthServer client: reg :: ClientRegistration scopes: scopes :: List(String) session: sess :: OAuthSession -> Result(String, OAuthError) =>
+    self
+      authorizeUrl: server
+      client: reg
+      scopes: scopes
+      session: sess
+      extraParams: #{}
+
+  /// The URL to send the browser to, for `sess` (which the app stores in
+  /// its `SessionStore` first).
+  ///
+  /// Built by `oidcc` with the session's state, nonce and PKCE verifier,
+  /// `require_pkce` always on and S256 only: a provider that does not
+  /// advertise S256 answers `no_supported_code_challenge`. `openid` is
+  /// added to `scopes` when missing. The preset's `#authorizeParams`
+  /// (e.g. Google's `access_type=offline`) are added, then `extra`
+  /// (String or Symbol keys, String values; `extra` wins on a clash). An
+  /// extra naming a parameter the flow sets itself (`state`, `nonce`,
+  /// `code_challenge`, ...; see `reservedParams`), in any letter case,
+  /// answers `config`.
+  ///
+  /// The session's issuer and redirect URI must match `server` and
+  /// `reg` (`session_mismatch`), and the redirect URI must pass
+  /// `ClientRegistration checkRedirect:`.
+  class authorizeUrl: server :: OAuthServer client: reg :: ClientRegistration scopes: scopes :: List(String) session: sess :: OAuthSession extraParams: extra :: Dictionary -> Result(String, OAuthError) =>
+    (self
+      checkSession: sess
+      server: server
+      client: reg) ifNotNil: [:err | ^Result error: err]
+    pairs := self extraPairsFor: server extra: extra
+    (pairs isKindOf: OAuthError) ifTrue: [^Result error: pairs]
+    wanted := (scopes includes: "openid") ifTrue: [
+      scopes
+    ] ifFalse: [#("openid") ++ scopes]
+    params := #{
+      #issuer => sess issuer,
+      #redirect_uri => sess redirectUri,
+      #state => sess state,
+      #nonce => sess nonce,
+      #pkce_verifier => sess codeVerifier,
+      #scopes => wanted,
+      #extra => pairs
+    }
+    found := Erlang beamtalk_oauth_oidcc
+      authorize_url: server context
+      with: (self clientOf: reg)
+      with: params
+    found ifOk: [:url |
+      Result ok: url
+    ] ifError: [:reason | Result error: (OAuthError fromOidcc: reason)]
+
+  /// The preset's `#authorizeParams` overlaid with `extra`, as a list of
+  /// `{name, value}` String pairs; or the `OAuthError` for a non-text or
+  /// reserved parameter.
+  class extraPairsFor: server :: OAuthServer extra: extra :: Dictionary -> List | OAuthError =>
+    merged := #{}
+    presetParams := server preset at: #authorizeParams ifAbsent: [#{}]
+    sources := #(presetParams, extra)
+    sources
+      do: [:source :: Dictionary |
+        source
+          keysAndValuesDo: [:k :v |
+            name := OAuthError textOf: k
+            value := OAuthError textOf: v
+            (name isNil or: [
+              value isNil
+            ]) ifTrue: [
+              ^OAuthError config: "authorization parameters must be text: {k printString}"
+            ]
+            (self reservedParams includes: name lowercase)
+              ifTrue: [
+                ^OAuthError config: "authorization parameter {name} is set by the flow and cannot be overridden"
+              ]
+            merged := merged at: name put: value
+          ]
+      ]
+    pairs := #()
+    merged keysAndValuesDo: [:k :v | pairs := pairs ++ #({k, v})]
+    pairs
+
+  // ===== Callback =====
+
+  /// Accept the redirect back from the provider.
+  ///
+  /// `query` is the callback's query: a raw query String (a leading `?`
+  /// or a whole callback URL is fine), a List of `{name, value}` pairs, or
+  /// a Dictionary. Only the first two can show a duplicated parameter; a
+  /// Dictionary has already collapsed duplicates, so prefer the raw query
+  /// where the web framework offers it. (`LoopbackReceiver` answers a
+  /// Dictionary, but its gate has already refused repeated parameters in
+  /// the raw query.)
+  ///
+  /// Every failure burns the session the callback names: any text `state`
+  /// value found in the query, even a malformed one, is consumed from
+  /// `store` with `binding` before the error is answered, so a probed or
+  /// broken callback cannot be retried.
+  ///
+  /// - A missing or empty `code` or `state`, a parameter that is not text,
+  ///   or any parameter given twice (RFC 6749 §3.1) answers `parse`.
+  /// - A provider `error` answers an `OAuthError` with its
+  ///   `error_description`. A registered authorization-error code
+  ///   (`access_denied`, `login_required`, ...; see `providerErrorCodes`)
+  ///   is kept verbatim as the code; any other code answers
+  ///   `provider_error` with the provider's code as `detail`; an empty code
+  ///   or one outside the RFC 6749 error charset answers `parse`. A failed
+  ///   consume (wrong binding, unknown state) answers that error instead.
+  /// - Otherwise the session is consumed from `store` with `binding`
+  ///   (`SessionStore consume:boundTo:`: `session_mismatch`,
+  ///   `reused_state`, `expired_session`), and an `iss` parameter
+  ///   (RFC 9207) must equal the session's issuer (`issuer_mismatch`).
+  ///
+  /// Text taken from the callback (`iss`, `error_description`, an
+  /// unregistered error code) is stripped of control characters and cut
+  /// to `maxEchoSize` characters before it goes into an error.
+  ///
+  /// Answers a `Callback` for `exchangeCode:client:callback:store:`, with a
+  /// single-use ticket recorded in `store`.
+  class handleCallback: query :: Object store: store :: SessionStore boundTo: binding :: String -> Result(Callback, OAuthError) =>
+    parsed := self parseQuery: query
+    (parsed isKindOf: OAuthError)
+      ifTrue: [
+        self
+          burnStatesIn: query
+          store: store
+          boundTo: binding
+        ^Result error: parsed
+      ]
+    state := parsed at: "state" ifAbsent: [""]
+    burned := state isEmpty ifTrue: [
+      nil
+    ] ifFalse: [store consume: state boundTo: binding]
+    providerError := parsed at: "error" ifAbsent: [nil]
+    providerError notNil
+      ifTrue: [
+        (providerError matchesRegex: self errorCodePattern) ifFalse: [
+          ^Result error: (OAuthError parse: "callback error code is empty or malformed")
+        ]
+        (burned notNil and: [
+          burned isError
+        ]) ifTrue: [^Result error: burned error]
+        ^Result
+          error: (self providerError: providerError description: (parsed at: "error_description" ifAbsent: [
+            ""
+          ]))
+      ]
+    code := parsed at: "code" ifAbsent: [""]
+    code isEmpty ifTrue: [
+      ^Result error: (OAuthError parse: "callback has no code")
+    ]
+    burned isNil ifTrue: [
+      ^Result error: (OAuthError parse: "callback has no state")
+    ]
+    burned isError ifTrue: [^Result error: burned error]
+    sess := burned value
+    iss := parsed at: "iss" ifAbsent: [nil]
+    (iss notNil and: [iss =/= sess issuer])
+      ifTrue: [
+        ^Result error: (OAuthError code: "issuer_mismatch" description: "callback iss {self echo: iss} is not the session's issuer {sess issuer}")
+      ]
+    ticket := Secrets generate
+    store issueTicket: ticket forState: sess state
+    Result
+      ok: (Callback
+        code: code
+        iss: iss
+        session: sess
+        ticket: ticket)
+
+  /// Consume, ignoring the outcome, every session named by a text `state`
+  /// value in `query`, however malformed the rest of it is.
+  class burnStatesIn: query :: Object store: store :: SessionStore boundTo: binding :: String -> Nil =>
+    pairs := self pairsOf: query
+    pairs isNil ifTrue: [^nil]
+    pairs
+      do: [:pair |
+        (((pair isKindOf: Tuple) or: [
+          pair isKindOf: List
+        ]) and: [pair size =:= 2])
+          ifTrue: [
+            name := self paramText: (pair at: 1)
+            value := (self paramText: (pair at: 2)) ifNil: [""]
+            ((name =:= "state") and: [
+              value isEmpty not
+            ]) ifTrue: [store consume: value boundTo: binding]
+          ]
+      ]
+    nil
+
+  /// The authorization-error codes kept verbatim from a callback: RFC 6749
+  /// §4.1.2.1 and OpenID Connect Core §3.1.2.6.
+  class providerErrorCodes -> List(String) =>
+    #("invalid_request", "unauthorized_client", "access_denied", "unsupported_response_type", "invalid_scope", "server_error", "temporarily_unavailable", "interaction_required", "login_required", "account_selection_required", "consent_required", "invalid_request_uri", "invalid_request_object", "request_not_supported", "request_uri_not_supported", "registration_not_supported")
+
+  /// The error for a callback `error` code: the code itself when it is a
+  /// registered one, `provider_error` with the code as `detail` otherwise.
+  class providerError: code :: String description: description :: String -> OAuthError =>
+    text := self echo: description
+    (self providerErrorCodes includes: code) ifTrue: [
+      ^OAuthError code: code description: text
+    ]
+    shown := self echo: code
+    suffix := text isEmpty ifTrue: [""] ifFalse: [": {text}"]
+    OAuthError
+      new: #{
+        #code => "provider_error",
+        #description => "provider error {shown}{suffix}",
+        #detail => shown
+      }
+
+  /// The most characters of callback text echoed into an error.
+  class maxEchoSize -> Integer => 200
+
+  /// `text` from a callback, safe to put in an error: control characters
+  /// removed and cut to `maxEchoSize` characters.
+  class echo: text :: String -> String =>
+    clean := text replaceAllRegex: "[[:cntrl:]]" with: ""
+    clean size > self maxEchoSize ifTrue: [
+      clean take: self maxEchoSize
+    ] ifFalse: [clean]
+
+  /// RFC 6749 §4.1.2.1: an `error` value is one or more characters in
+  /// %x20-21 / %x23-5B / %x5D-7E (printable ASCII but `"` and `\`).
+  class errorCodePattern -> String => "^[ !#-\\[\\]-~]+$"
+
+  /// The callback parameters as a Dictionary of String to String, or the
+  /// `parse` error for a malformed, non-text or duplicated parameter.
+  class parseQuery: query :: Object -> Dictionary | OAuthError =>
+    pairs := self pairsOf: query
+    pairs isNil
+      ifTrue: [
+        ^OAuthError parse: "callback query is not a query string, pair list or Dictionary"
+      ]
+    out := #{}
+    pairs
+      do: [:pair |
+        ok := ((pair isKindOf: Tuple) or: [
+          pair isKindOf: List
+        ]) and: [pair size =:= 2]
+        ok ifFalse: [
+          ^OAuthError parse: "callback parameter is not a name/value pair"
+        ]
+        name := self paramText: (pair at: 1)
+        value := self paramText: (pair at: 2)
+        (name isNil or: [
+          value isNil
+        ]) ifTrue: [^OAuthError parse: "callback parameter is not text"]
+        (out includesKey: name) ifTrue: [
+          ^OAuthError parse: "callback parameter {name} is duplicated"
+        ]
+        out := out at: name put: value
+      ]
+    out
+
+  /// `value` as a String when it is a String or a valid UTF-8 Binary; nil
+  /// otherwise. Symbols are refused: `uri_string:dissect_query` answers
+  /// `true` for a parameter with no `=`, which must not read as "true".
+  class paramText: value :: Object -> String | Nil =>
+    ((value isKindOf: String) or: [value isKindOf: Binary]) ifFalse: [^nil]
+    OAuthError textOf: value
+
+  /// `query` as a list of pairs, or nil when it is none of the accepted
+  /// shapes.
+  class pairsOf: query :: Object -> List | Nil =>
+    (query isKindOf: Dictionary)
+      ifTrue: [
+        pairs := #()
+        query keysAndValuesDo: [:k :v | pairs := pairs ++ #({k, v})]
+        ^pairs
+      ]
+    (query isKindOf: List) ifTrue: [^query]
+    (query isKindOf: String) ifFalse: [^nil]
+    raw := query
+    parsed := Erlang uri_string parse: query
+    ((parsed isKindOf: Dictionary) and: [
+      parsed includesKey: #scheme
+    ]) ifTrue: [raw := (parsed at: #query ifAbsent: [""]) asStringUnchecked]
+    (raw startsWith: "?") ifTrue: [raw := raw drop: 1]
+    raw isEmpty ifTrue: [^#()]
+    dissected := Erlang uri_string dissect_query: raw
+    (dissected isKindOf: List) ifTrue: [dissected] ifFalse: [nil]
+
+  // ===== Code exchange =====
+
+  /// Exchange the callback's code for tokens.
+  ///
+  /// First the callback's single-use ticket is redeemed from `store` (the
+  /// store `handleCallback` used): a `Callback` that `handleCallback` did
+  /// not make, or one already exchanged, answers `reused_state`; one whose
+  /// session was swapped answers `session_mismatch`. The ticket is spent
+  /// whatever happens next.
+  ///
+  /// Then, still before any network call: the redirect URI must pass
+  /// `ClientRegistration checkRedirect:`; the session's issuer must equal
+  /// `server issuer` and its redirect URI `reg redirectUri`
+  /// (`session_mismatch`, the mix-up defence). The shim then checks,
+  /// against the server's own `oidcc` configuration rather than the
+  /// Beamtalk-side copy, that the issuer matches (`session_mismatch`) and
+  /// that a callback `iss` equals it and is present when the provider
+  /// advertises `authorization_response_iss_parameter_supported`
+  /// (`issuer_mismatch`).
+  ///
+  /// Then `oidcc_token:retrieve` sends the code with the PKCE verifier and
+  /// client authentication, and validates the ID token, including the
+  /// session's nonce (`missing_claim` on a mismatch) and audience. Provider
+  /// errors pass through verbatim (`invalid_grant`, ...). A response
+  /// without an ID token answers `missing_id_token`. Answers a `TokenSet`
+  /// with the validated `idTokenClaims`, the raw `idToken`, and
+  /// `obtainedAt` stamped when the request was sent.
+  class exchangeCode: server :: OAuthServer client: reg :: ClientRegistration callback: cb :: Callback store: store :: SessionStore -> Result(TokenSet, OAuthError) =>
+    sess := cb session
+    redeemed := store redeemTicket: cb ticket forState: sess state
+    redeemed isError ifTrue: [^Result error: redeemed error]
+    (self
+      checkSession: sess
+      server: server
+      client: reg) ifNotNil: [:err | ^Result error: err]
+    params := #{
+      #issuer => sess issuer,
+      #iss => cb iss,
+      #code => cb code,
+      #redirect_uri => sess redirectUri,
+      #nonce => sess nonce,
+      #pkce_verifier => sess codeVerifier
+    }
+    sentAt := TokenSet now
+    found := Erlang beamtalk_oauth_oidcc
+      retrieve_token: server context
+      with: (self clientOf: reg)
+      with: params
+    found ifOk: [:toks |
+      Result ok: (self tokenSetFrom: toks obtainedAt: sentAt)
+    ] ifError: [:reason | Result error: (OAuthError fromOidcc: reason)]
+
+  // ===== Refresh =====
+
+  /// Refresh `toks` with its refresh token.
+  ///
+  /// `toks` must carry a refresh token and validated ID-token claims whose
+  /// `iss` is `server issuer` and whose `aud` names `reg clientId`
+  /// (`config` / `issuer_mismatch` / `session_mismatch`, before any
+  /// network call): the refresh token is never sent to another provider
+  /// or under another client's credentials.
+  ///
+  /// The response may omit the ID token (OpenID Connect Core §12.2). When
+  /// it has one, `oidcc` validates it (signature, `iss`, `aud`, expiry)
+  /// and requires its `sub` to equal `toks subject` (`sub_invalid`
+  /// otherwise). Refresh does not depend on the provider listing
+  /// `refresh_token` in `grant_types_supported`.
+  ///
+  /// Answers `toks mergedWith:` the response: new values win, and the old
+  /// refresh token, scope and ID token (raw JWT and claims together) carry
+  /// forward when the response omits them. Store the answer; the old
+  /// refresh token may be spent.
+  class refresh: server :: OAuthServer client: reg :: ClientRegistration tokenSet: toks :: TokenSet -> Result(TokenSet, OAuthError) =>
+    refreshToken := toks refreshToken
+    (refreshToken isNil or: [
+      refreshToken isEmpty
+    ]) ifTrue: [
+      ^Result error: (OAuthError config: "the token set has no refresh token")
+    ]
+    (self
+      checkTokens: toks
+      server: server
+      client: reg) ifNotNil: [:err | ^Result error: err]
+    params := #{
+      #issuer => server issuer,
+      #refresh_token => refreshToken,
+      #expected_subject => toks subject
+    }
+    sentAt := TokenSet now
+    found := Erlang beamtalk_oauth_oidcc
+      refresh_token: server context
+      with: (self clientOf: reg)
+      with: params
+    found
+      ifOk: [:fresh |
+        Result ok: (toks mergedWith: (self tokenSetFrom: fresh obtainedAt: sentAt))
+      ]
+      ifError: [:reason | Result error: (OAuthError fromOidcc: reason)]
+
+  // ===== Userinfo =====
+
+  /// The userinfo claims for `toks`. As `userInfo:client:tokenSet:`, with
+  /// the client id taken from the validated ID token (`azp`, else a
+  /// single `aud`), and no client secret.
+  ///
+  /// This variant has no client binding: the client id comes from the
+  /// tokens themselves, so it cannot tell that `toks` was issued to this
+  /// app. Prefer `userInfo:client:tokenSet:`, which also checks the ID
+  /// token's `aud` against the registration, and which a provider that
+  /// signs userinfo with the client secret needs.
+  class userInfo: server :: OAuthServer tokenSet: toks :: TokenSet -> Result(Dictionary, OAuthError) =>
+    claims := toks idTokenClaims
+    claims isNil ifTrue: [
+      ^Result error: (OAuthError config: "the token set has no ID-token claims")
+    ]
+    clientId := (OAuthError textAt: "azp" in: claims) ifNil: [
+      OAuthError textAt: "aud" in: claims
+    ]
+    clientId isNil
+      ifTrue: [
+        aud := claims at: "aud" ifAbsent: [nil]
+        ((aud isKindOf: List) and: [
+          aud size =:= 1
+        ]) ifTrue: [clientId := OAuthError textOf: aud first]
+      ]
+    clientId isNil
+      ifTrue: [
+        ^Result error: (OAuthError config: "cannot tell the client id from the ID token; use userInfo:client:tokenSet:")
+      ]
+    reg := ClientRegistration new: #{#clientId => clientId}
+    self
+      userInfo: server
+      client: reg
+      tokenSet: toks
+
+  /// The userinfo claims for `toks`, from `oidcc_userinfo:retrieve`.
+  ///
+  /// `toks` must carry an access token and validated ID-token claims whose
+  /// `iss` is `server issuer` and whose `aud` names `reg clientId`
+  /// (`config` / `issuer_mismatch` / `session_mismatch`, before any
+  /// network call). A provider without a userinfo endpoint answers
+  /// `no_userinfo_endpoint`. The answer's `sub` must equal `toks subject`
+  /// (`bad_subject` otherwise). Answers the claims with String keys.
+  class userInfo: server :: OAuthServer client: reg :: ClientRegistration tokenSet: toks :: TokenSet -> Result(Dictionary, OAuthError) =>
+    toks accessToken isEmpty ifTrue: [
+      ^Result error: (OAuthError config: "the token set has no access token")
+    ]
+    (self
+      checkTokens: toks
+      server: server
+      client: reg) ifNotNil: [:err | ^Result error: err]
+    params := #{
+      #issuer => server issuer,
+      #access_token => toks accessToken,
+      #token_type => toks tokenType,
+      #expected_subject => toks subject
+    }
+    found := Erlang beamtalk_oauth_oidcc
+      userinfo: server context
+      with: (self clientOf: reg)
+      with: params
+    found ifOk: [:claims |
+      Result ok: claims
+    ] ifError: [:reason | Result error: (OAuthError fromOidcc: reason)]
+
+  // ===== Shared checks =====
+
+  /// nil when `sess` was started for `server` and `reg` and the
+  /// registration's redirect URI is acceptable; the `OAuthError`
+  /// otherwise.
+  class checkSession: sess :: OAuthSession server: server :: OAuthServer client: reg :: ClientRegistration -> OAuthError | Nil =>
+    (ClientRegistration checkRedirect: reg redirectUri) ifNotNil: [:err | ^err]
+    sess issuer =:= server issuer
+      ifFalse: [
+        ^OAuthError code: "session_mismatch" description: "the session was started for issuer {sess issuer}, not {server issuer}"
+      ]
+    sess redirectUri =:= reg redirectUri
+      ifFalse: [
+        ^OAuthError code: "session_mismatch" description: "the session was started for redirect URI {sess redirectUri}, not {reg redirectUri}"
+      ]
+    nil
+
+  /// nil when `toks` has a validated subject issued by `server` to `reg`
+  /// (its client id is the ID token's `aud` or one of them); the
+  /// `OAuthError` otherwise.
+  class checkTokens: toks :: TokenSet server: server :: OAuthServer client: reg :: ClientRegistration -> OAuthError | Nil =>
+    claims := toks idTokenClaims
+    claims isNil ifTrue: [
+      ^OAuthError config: "the token set has no ID-token claims"
+    ]
+    toks subject isNil ifTrue: [
+      ^OAuthError config: "the token set has no ID-token subject"
+    ]
+    issuer := OAuthError textAt: "iss" in: claims
+    issuer =:= server issuer
+      ifFalse: [
+        ^OAuthError code: "issuer_mismatch" description: "the tokens were issued by {issuer}, not {server issuer}"
+      ]
+    aud := claims at: "aud" ifAbsent: [nil]
+    audiences := (aud isKindOf: List) ifTrue: [
+      aud collect: [:a | OAuthError textOf: a]
+    ] ifFalse: [#(OAuthError textOf: aud)]
+    (audiences includes: reg clientId)
+      ifFalse: [
+        ^OAuthError code: "session_mismatch" description: "the tokens were not issued to client {reg clientId}"
+      ]
+    nil
+
+  /// The shim's client map for `reg`.
+  class clientOf: reg :: ClientRegistration -> Dictionary =>
+    #{#client_id => reg clientId, #client_secret => reg clientSecret}
+
+  /// A `TokenSet` from the shim's token map, obtained at `sentAt`.
+  class tokenSetFrom: toks :: Dictionary obtainedAt: sentAt :: Integer -> TokenSet =>
+    TokenSet
+      new: #{
+        #accessToken => (toks at: #access_token) ifNil: [""],
+        #tokenType => (toks at: #token_type) ifNil: ["bearer"],
+        #expiresIn => (toks at: #expires_in),
+        #obtainedAt => sentAt,
+        #refreshToken => (toks at: #refresh_token),
+        #scope => (toks at: #scope),
+        #idTokenClaims => (toks at: #id_token_claims),
+        #idToken => (toks at: #id_token)
+      }
