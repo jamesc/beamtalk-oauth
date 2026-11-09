@@ -38,8 +38,29 @@
 /// own mailbox, not in an actor call, so the wait is not bounded by the
 /// 5 s call timeout.
 ///
+/// ## Owner monitoring
+///
+/// The gate watches the process that owns the receiver, so a listener
+/// does not outlive a crashed owner (BT-4570). The owner starts as the
+/// process that started the receiver (`watchStarter:`) and moves to the
+/// waiter when one registers (`awaitFrom:tag:`). The gate shuts the
+/// listener down, then stops itself, when:
+///
+/// - the starter exits abnormally before anyone waits. A normal exit is
+///   not a crash: a REPL evaluation or a process that hands the receiver
+///   to another one ends normally, and the receiver is still in use;
+/// - the waiter exits for any reason while it owns the receiver: a waiter
+///   blocks in `awaitCallback:` until it stops the listener itself, so
+///   any other exit leaves no one to read the callback;
+/// - the lifetime set by `expireAfter:` passes before anyone waits. This
+///   bounds a receiver that is never awaited, whose starter ended
+///   normally.
+///
+/// A gate that shuts down answers 404 to every later request; a later
+/// `awaitFrom:tag:` answers `#closed`.
+///
 /// Internal to `LoopbackReceiver`; applications do not use it directly.
-typed Actor subclass: LoopbackGate
+typed Server subclass: LoopbackGate
   /// The recorded callback query; nil until the first accepted callback.
   state: query :: Dictionary | Nil = nil
   /// The process waiting for the query, as `{Pid, Reference}`.
@@ -55,6 +76,19 @@ typed Actor subclass: LoopbackGate
   /// flow armed with the wrong state can be told from a user who never
   /// signed in.
   state: refused :: Integer = 0
+  /// The listener this gate serves; nil until `attachServer:`. Stopped
+  /// when the owner goes away.
+  state: server :: HTTPServer | Nil = nil
+  /// The monitor on the owning process (the starter, then the waiter).
+  state: ownerRef :: Reference | Nil = nil
+  /// Whether the owner is a waiter (any exit shuts down) rather than the
+  /// starter (only an abnormal exit does).
+  state: ownerIsWaiter :: Boolean = false
+  /// Whether a waiter ever registered: the lifetime set by `expireAfter:`
+  /// no longer applies once one has.
+  state: awaited :: Boolean = false
+  /// Set when the gate shuts down: every later request answers 404.
+  state: closed :: Boolean = false
 
   /// The callback parameters that must appear at most once (RFC 6749
   /// §3.1, RFC 9207 for `iss`).
@@ -91,7 +125,7 @@ typed Actor subclass: LoopbackGate
   handle: req :: HTTPRequest rawQuery: raw :: String | Nil -> HTTPResponse =>
     isCallback := (req method =:= "GET") and: [req path =:= "/callback"]
     (isCallback and: [
-      self.query isNil and: [self acceptsHostOf: req]
+      self.closed not and: [self.query isNil and: [self acceptsHostOf: req]]
     ]) ifFalse: [^self class notFound]
     params := QueryParser parse: raw
     ok := params notNil
@@ -177,8 +211,14 @@ typed Actor subclass: LoopbackGate
   /// - `#busy` while another live process is waiting: the receiver has a
   ///   single consumer;
   /// - `#noState` when `expectState:` was never called, so no callback
-  ///   could ever be recorded.
+  ///   could ever be recorded;
+  /// - `#closed` when the gate has shut down (its owner went away or its
+  ///   lifetime passed).
+  ///
+  /// On `#ok`, `pid` becomes the owner: the gate stops watching the
+  /// previous owner and shuts down if `pid` exits.
   awaitFrom: pid :: Pid tag: tag :: Reference -> Symbol =>
+    self.closed ifTrue: [^#closed]
     self.stateDigest isNil ifTrue: [^#noState]
     self.waiter isNil
       ifFalse: [
@@ -186,8 +226,69 @@ typed Actor subclass: LoopbackGate
         ((other =/= pid) and: [other isAlive]) ifTrue: [^#busy]
       ]
     self.waiter := {pid, tag}
+    self.awaited := true
+    self watchOwner: pid asWaiter: true
     self notifyWaiter
     #ok
+
+  /// Watch `pid`, the process that started the receiver: shut the
+  /// listener down if it exits abnormally before a waiter registers.
+  watchStarter: pid :: Pid -> Nil =>
+    self watchOwner: pid asWaiter: false
+    nil
+
+  /// The listener to stop when the owner goes away.
+  attachServer: srv :: HTTPServer -> Nil =>
+    self.server := srv
+    nil
+
+  /// Shut down after `ms` unless a waiter has registered by then.
+  expireAfter: ms :: Integer -> Nil =>
+    Timer
+      send: #beamtalk_oauth_loopback_expire
+      to: self
+      after: ms
+    nil
+
+  /// Make `pid` the owner, dropping the monitor on the previous one.
+  internal watchOwner: pid :: Pid asWaiter: isWaiter :: Boolean -> Nil =>
+    self.ownerRef isNil ifFalse: [self.ownerRef demonitor]
+    self.ownerRef := pid monitor
+    self.ownerIsWaiter := isWaiter
+    nil
+
+  /// The owner's `DOWN` and the lifetime expiry; anything else is ignored.
+  handleInfo: msg :: Object -> Nil =>
+    msg match: [
+      {#DOWN, ref, #process, _, reason} -> self ownerDown: ref reason: reason;
+      #beamtalk_oauth_loopback_expire -> self.awaited ifFalse: [self shutDown];
+      _ -> nil
+    ]
+    nil
+
+  /// The monitored process behind `ref` exited with `reason`.
+  internal ownerDown: ref :: Reference reason: reason :: Object -> Nil =>
+    ref =:= self.ownerRef
+      ifTrue: [
+        self.ownerRef := nil
+        (self.ownerIsWaiter or: [reason =/= #normal]) ifTrue: [self shutDown]
+      ]
+    nil
+
+  /// Close the gate, stop the listener from a separate process (a
+  /// connection may be mid-call to this gate, so stopping the server from
+  /// here could wait on it), then stop this gate once the current message
+  /// is handled. A waiter still alive sees the gate exit and answers
+  /// `#stopped`.
+  internal shutDown -> Nil =>
+    self.closed ifTrue: [^nil]
+    self.closed := true
+    srv := self.server
+    srv isNil ifFalse: [
+      [[srv stopWith: #normal timeout: 10000] on: Error do: [:e | nil]] fork
+    ]
+    self stop
+    nil
 
   /// Send the query to the waiter when both are present.
   notifyWaiter -> Nil =>

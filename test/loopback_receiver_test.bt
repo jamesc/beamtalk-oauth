@@ -374,3 +374,90 @@ TestCase subclass: LoopbackReceiverTest
     outcome := self.rx awaitCallback: 20
     self assert: outcome error code equals: "callback_timeout"
     self assert: outcome error detail equals: 0
+
+  // --- BT-4570: the listener does not outlive a crashed owner ---
+
+  /// Poll until `rx` stops listening, for up to about 2 s.
+  awaitClosed: rx =>
+    100 timesRepeat: [rx isListening ifTrue: [Timer sleep: 20]]
+    rx isListening not
+
+  /// Fork `body` with a receiver it starts and publishes in `table` under
+  /// `#rx`; answer the receiver once published.
+  receiverStartedIn: table by: body =>
+    [
+      started := LoopbackReceiver start unwrap
+      table at: #rx put: started
+      body value: started
+    ] fork
+    100 timesRepeat: [(table at: #rx) isNil ifTrue: [Timer sleep: 10]]
+    table at: #rx
+
+  testListenerClosesWhenStarterCrashes =>
+    table := Ets new: #bt4570Crash type: #set
+    rx := self
+      receiverStartedIn: table
+      by: [:started |
+        Timer sleep: 100
+        Erlang erlang exit: #boom
+      ]
+    self assert: rx notNil
+    self assert: (self awaitClosed: rx)
+    self assert: (HTTPClient get: rx redirectUri ++ "?code=x&state=s") isError
+    self assert: (rx awaitCallback: 50) error code equals: "config"
+    table delete
+
+  testListenerSurvivesStarterExitingNormally =>
+    table := Ets new: #bt4570Normal type: #set
+    rx := self receiverStartedIn: table by: [:started | nil]
+    Timer sleep: 100
+    self assert: rx isListening
+    rx expectState: "handed-over"
+    HTTPClient get: rx redirectUri ++ "?code=kept&state=handed-over"
+    self assert: ((rx awaitCallback: 5000) unwrap at: "code") equals: "kept"
+    table delete
+
+  testListenerClosesWhenWaiterIsKilled =>
+    rx := self.rx
+    waiter := [rx awaitCallback: 30000] fork
+    Timer sleep: 100
+    self assert: rx isListening
+    Erlang erlang exit: waiter with: #kill
+    self assert: (self awaitClosed: rx)
+
+  testWaiterOwnsTheReceiverOnceWaiting =>
+    // The starter crashing does not cut off a wait already under way.
+    table := Ets new: #bt4570Waiter type: #set
+    rx := self
+      receiverStartedIn: table
+      by: [:started |
+        started expectState: "w"
+        table at: #armed put: true
+        Timer sleep: 300
+        Erlang erlang exit: #boom
+      ]
+    100 timesRepeat: [(table at: #armed) isNil ifTrue: [Timer sleep: 10]]
+    [
+      Timer sleep: 600
+      HTTPClient get: rx redirectUri ++ "?code=waited&state=w"
+    ] fork
+    self assert: ((rx awaitCallback: 5000) unwrap at: "code") equals: "waited"
+    table delete
+
+  testUnawaitedReceiverStopsAfterItsLifetime =>
+    other := (LoopbackReceiver startWithLifetime: 100) unwrap
+    self assert: other isListening
+    self assert: (self awaitClosed: other)
+
+  testAwaitedReceiverOutlivesItsLifetime =>
+    other := (LoopbackReceiver startWithLifetime: 100) unwrap
+    other expectState: "slow"
+    [
+      Timer sleep: 400
+      HTTPClient get: other redirectUri ++ "?code=slow&state=slow"
+    ] fork
+    self assert: ((other awaitCallback: 5000) unwrap at: "code") equals: "slow"
+
+  testLifetimeOutOfRangeAnswersConfigError =>
+    self assert: (LoopbackReceiver startWithLifetime: 0) error code equals: "config"
+    self assert: (LoopbackReceiver startWithLifetime: LoopbackReceiver maxTimeout + 1) error code equals: "config"
