@@ -143,8 +143,8 @@ TestCase subclass: RevocationTest
     self assert: (self lastForm at: "client_id") equals: "client-1"
 
   testConfidentialClientUsesBasicWhenAdvertised =>
-    // The fixture document omits revocation_endpoint_auth_methods_supported;
-    // oidcc defaults it to client_secret_basic (RFC 8414).
+    // The fixture document omits revocation_endpoint_auth_methods_supported,
+    // so the token endpoint's methods apply; they list client_secret_basic.
     got := TokenRevocation
       revoke: self server
       client: self confidentialClient
@@ -199,6 +199,162 @@ TestCase subclass: RevocationTest
     self assert: (self lastForm at: "client_secret") equals: "secret-1"
     basic := (srv withMetadata: (meta at: #token_endpoint_auth_methods_supported put: #("client_secret_basic")))
     self assert: (TokenRevocation authMethodsOf: basic) equals: #("client_secret_basic")
+
+  // ===== Revocation auth methods from discovery (BT-4590) =====
+  testDiscoveryWithoutRevocationMethodsUsesTokenMethods =>
+    // oidcc fills the absent revocation field with client_secret_basic;
+    // the provider only takes client_secret_post, so that default must
+    // not win over the token endpoint's methods.
+    self.provider discoveryOverrides: #{
+      "token_endpoint_auth_methods_supported" => #("client_secret_post")
+    }
+    srv := self server
+    self assert: (srv metadata at: #revocation_endpoint_auth_methods_advertised) equals: false
+    self assert: (TokenRevocation authMethodsOf: srv) equals: #("client_secret_post")
+    got := TokenRevocation
+      revoke: srv
+      client: self confidentialClient
+      token: self tokens
+    self assert: got isOk
+    self deny: (self lastHeaders includesKey: "authorization")
+    self assert: (self lastForm at: "client_id") equals: "client-1"
+    self assert: (self lastForm at: "client_secret") equals: "secret-1"
+
+  testAbsentRevocationMethodsWithNoSecretTokenMethodIsConfigError =>
+    // Strict fallback: no Basic guess when the token endpoint names
+    // neither secret method.
+    self.provider discoveryOverrides: #{
+      "token_endpoint_auth_methods_supported" => #("private_key_jwt")
+    }
+    got := TokenRevocation
+      revoke: self server
+      client: self confidentialClient
+      token: self tokens
+    self assert: got error code equals: "config"
+    self assert: (self.provider lastRequestTo: "/revoke") equals: nil
+
+  testMarkDiscoveryOnlyMarksDiscoveryDocuments =>
+    shim := Erlang beamtalk_oauth_oidcc
+    url := self bin: "https://idp.test/tenant/.well-known/openid-configuration"
+    plain := self bin: "\{""a"":1}"
+    marked := (shim
+      mark_discovery: #get
+      with: url
+      with: plain) asStringUnchecked
+    self assert: (marked includesSubstring: "beamtalk_oauth_revocation_auth_methods_absent")
+    named := self bin: "\{""revocation_endpoint_auth_methods_supported"":[]}"
+    self
+      assert: (shim
+        mark_discovery: #get
+        with: url
+        with: named)
+      equals: named
+    self
+      assert: (shim
+        mark_discovery: #post
+        with: url
+        with: plain)
+      equals: plain
+    jwks := self bin: "https://idp.test/jwks"
+    self
+      assert: (shim
+        mark_discovery: #get
+        with: jwks
+        with: plain)
+      equals: plain
+    #("[1]", "null", "not json")
+      do: [:text |
+        body := self bin: text
+        self
+          assert: (shim
+            mark_discovery: #get
+            with: url
+            with: body)
+          equals: body
+      ]
+
+  testDiscoveryErrorBodyIsNotMarked =>
+    self.provider
+      fail: "/.well-known/openid-configuration"
+      status: 500
+      body: #{"error" => "server_error"}
+    got := OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: #{}
+      options: #{#allowUnsafeHttp => true}
+    self assert: got isError
+    self deny: (got error printString includesSubstring: "beamtalk_oauth")
+    self deny: (got error asJson printString includesSubstring: "beamtalk_oauth")
+
+  // A raw Erlang binary, as the adapter passes (distinct from a String).
+  bin: text :: String -> Binary => Binary fromIolist: #(text)
+
+  testAdvertisedRevocationMethodsWinOverTokenMethods =>
+    self.provider
+      discoveryOverrides: #{
+        "revocation_endpoint_auth_methods_supported" => #("client_secret_basic"),
+        "token_endpoint_auth_methods_supported" => #("client_secret_post")
+      }
+    srv := self server
+    self assert: (srv metadata at: #revocation_endpoint_auth_methods_advertised) equals: true
+    got := TokenRevocation
+      revoke: srv
+      client: self confidentialClient
+      token: self tokens
+    self assert: got isOk
+    expected := "Basic " ++ "client-1:secret-1" asBase64
+    self assert: (self lastHeaders at: "authorization") equals: expected
+    self deny: (self lastForm includesKey: "client_secret")
+
+  testPresetOverrideCountsAsAdvertised =>
+    self.provider discoveryOverrides: #{
+      "token_endpoint_auth_methods_supported" => #("client_secret_post")
+    }
+    srv := (OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: #{
+        #documentOverrides => #{
+          "revocation_endpoint_auth_methods_supported" => #("client_secret_basic")
+        }
+      }
+      options: #{#allowUnsafeHttp => true}) unwrap
+    self assert: (srv metadata at: #revocation_endpoint_auth_methods_advertised) equals: true
+    self assert: (TokenRevocation authMethodFor: srv) equals: "client_secret_basic"
+
+  testProviderCannotSetTheAbsentMarker =>
+    marker := "beamtalk_oauth_revocation_auth_methods_absent"
+    self.provider discoveryOverrides: (#{} at: marker put: false)
+    srv := self server
+    self assert: (srv metadata at: #revocation_endpoint_auth_methods_advertised) equals: false
+    self deny: ((srv metadata at: #extra_fields) includesKey: marker)
+    self.provider
+      discoveryOverrides: #{
+        "beamtalk_oauth_revocation_auth_methods_absent" => true,
+        "revocation_endpoint_auth_methods_supported" => #("client_secret_post")
+      }
+    srv2 := self server
+    self assert: (srv2 metadata at: #revocation_endpoint_auth_methods_advertised) equals: true
+    self deny: ((srv2 metadata at: #extra_fields) includesKey: marker)
+
+  testWorkerServerRecordsAbsentRevocationMethods =>
+    self.provider discoveryOverrides: #{
+      "token_endpoint_auth_methods_supported" => #("client_secret_post")
+    }
+    worker := (ProviderWorker
+      issuer: self.provider issuer
+      preset: #{}
+      options: #{#allowUnsafeHttp => true}) unwrap
+    srv := worker server unwrap
+    worker stop
+    self assert: (srv metadata at: #revocation_endpoint_auth_methods_advertised) equals: false
+    self assert: (TokenRevocation authMethodFor: srv) equals: "client_secret_post"
+
+  testHandBuiltServerKeepsRevocationMethods =>
+    // No advertised flag (a server built by hand): the revocation field,
+    // when present, still wins over the token endpoint's methods.
+    srv := self server
+    meta := ((srv metadata removeKey: #revocation_endpoint_auth_methods_advertised) at: #revocation_endpoint_auth_methods_supported put: #("client_secret_post")) at: #token_endpoint_auth_methods_supported put: #("client_secret_basic")
+    self assert: (TokenRevocation authMethodsOf: (srv withMetadata: meta)) equals: #("client_secret_post")
 
   testBasicCredentialsAreFormEncoded =>
     header := TokenRevocation basic: "id:1" secret: "s p"

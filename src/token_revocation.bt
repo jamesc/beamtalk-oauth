@@ -136,12 +136,28 @@ Object subclass: TokenRevocation
   /// `token_endpoint_auth_methods_supported`, else none.
   ///
   /// `oidcc` fills an absent `revocation_endpoint_auth_methods_supported`
-  /// with RFC 8414's default, `client_secret_basic`, so a discovered server
-  /// always has the first; the fallback covers servers built by hand.
+  /// with RFC 8414's default, `client_secret_basic`, so the shim records
+  /// whether the discovery document (or a preset's `#documentOverrides`)
+  /// actually named it: metadata
+  /// `#revocation_endpoint_auth_methods_advertised`. When that is false
+  /// the filled-in default is ignored and the token endpoint's methods
+  /// apply, so a provider that accepts only `client_secret_post` and
+  /// omits the revocation field gets its credentials in the body. This
+  /// departs from RFC 8414 §2 (absent means `client_secret_basic`) on
+  /// purpose (BT-4590): token methods with neither secret method (only
+  /// `private_key_jwt`, say) then answer `config` rather than guessing
+  /// Basic. A
+  /// server built by hand, with no flag, uses whichever fields its
+  /// metadata holds.
   class authMethodsOf: server :: OAuthServer -> List(String) =>
     meta := server metadata
-    methods := meta at: #revocation_endpoint_auth_methods_supported ifAbsent: [
+    advertised := meta at: #revocation_endpoint_auth_methods_advertised ifAbsent: [
+      true
+    ]
+    methods := advertised =:= false ifTrue: [
       nil
+    ] ifFalse: [
+      meta at: #revocation_endpoint_auth_methods_supported ifAbsent: [nil]
     ]
     methods isNil ifTrue: [
       methods := meta at: #token_endpoint_auth_methods_supported ifAbsent: [nil]

@@ -16,8 +16,8 @@ design is in [ADR 0001](docs/ADR/0001-beamtalk-native-oauth-client.md).
 
 ## Requirements
 
-- Erlang/OTP 27 or newer for the library (`oidcc` needs 27). The
-  current Beamtalk nightly toolchain itself needs OTP 28, so CI runs 28.
+- Erlang/OTP 28 or newer. That is Beamtalk's support window (28 and 29);
+  CI tests both.
 - No Elixir runtime: `oidcc`, `jose` and `telemetry` build with rebar3
   from `[native.dependencies]`.
 
@@ -56,7 +56,7 @@ rx := LoopbackReceiver start unwrap
 reg := (ClientRegistration forClient: "APP_ID" redirect: rx redirectUri) unwrap
 store := SessionStore spawn
 sess := OAuthSession newSessionFor: server client: reg
-store create: sess boundTo: rx binding
+(store create: sess boundTo: rx binding) unwrap
 rx expectState: sess state                // before the URL is opened
 url := (OAuthFlows authorizeUrl: server client: reg scopes: #("openid") session: sess) unwrap
 Transcript showCr: url                    // or open the system browser
@@ -113,7 +113,9 @@ browser that started it.
 
 1. Login request: make a fresh binding with `Secrets generate`, set it as
    a cookie, then `store create: sess boundTo: binding` and redirect to
-   `authorizeUrl`.
+   `authorizeUrl`. `create:boundTo:` answers a `Result`: it fails with
+   `session_store_full` when the store already holds `#maxSessions`
+   sessions (10,000 by default), so answer 503 rather than raise.
 2. Callback request: read the cookie back and call
    `OAuthFlows handleCallback: rawQuery store: store boundTo: cookieValue`.
 
@@ -128,6 +130,13 @@ parameter is caught. The library never sets or reads cookies itself.
 A callback presented with another binding answers `session_mismatch` and
 burns the session, so it cannot be retried. Show the user one generic
 failure and log the specific code.
+
+A web app creates a session on an unauthenticated request, so an
+attacker can start logins without limit. The store is capped
+(`SessionStore spawnWith: #{#maxSessions => n}`, 10,000 by default) and,
+when full, refuses new logins rather than dropping ones already in
+flight; monitor `session_store_full` and `store size`. The cap is a
+backstop: rate-limit `GET /login` in the web layer.
 
 ## Providers
 
