@@ -18,12 +18,6 @@ TestCase subclass: E2eNativeLoginTest
   setUp =>
     HttpcGuard install
     self.provider := FixtureProvider start
-    // A public native client, as on GitLab: the provider must accept
-    // `none` at the token endpoint (the gitlab preset's override).
-    self.provider
-      discoveryOverrides: #{
-        "token_endpoint_auth_methods_supported" => #("none", "client_secret_basic", "client_secret_post")
-      }
     // Steps 2 and 4: the loopback receiver and the session store.
     self.rx := LoopbackReceiver start unwrap
     self.store := SessionStore spawn
@@ -38,18 +32,25 @@ TestCase subclass: E2eNativeLoginTest
 
   unsafe -> Dictionary => #{#allowUnsafeHttp => true}
 
+  // The client is public, as a native app's is on GitLab. The fixture
+  // advertises only client_secret_basic/post, so the exchange works only
+  // if the gitlab preset's document override (adding `none`) reaches
+  // oidcc.
+  preset -> Dictionary =>
+    #{#documentOverrides => (ProviderPresets gitlab at: #documentOverrides)}
+
   // Step 1, one-shot: discover the provider.
   discovered -> OAuthServer =>
     (OAuthServer
       fromDiscovery: self.provider issuer
-      preset: #{}
+      preset: self preset
       options: self unsafe) unwrap
 
   // Step 1, long-running: a ProviderWorker (the caller stops it).
   startWorker -> ProviderWorker =>
     (ProviderWorker
       issuer: self.provider issuer
-      preset: #{}
+      preset: self preset
       options: self unsafe) unwrap
 
   // The value of header `name` in `resp`, or "" when it has none.
@@ -63,16 +64,21 @@ TestCase subclass: E2eNativeLoginTest
     ""
 
   // Step 6, the browser hop: GET the authorize URL, follow its 302 to the
-  // loopback receiver, then fetch /favicon.ico as browsers do. Answers the
-  // receiver's status for the callback.
+  // loopback receiver, with the stray requests a receiver sees around it:
+  // a /favicon.ico and a /callback with the wrong state before the real
+  // callback (neither may take the one-shot slot), another /favicon.ico
+  // after. Answers the receiver's status for the real callback.
   browse: url :: String -> Integer =>
     authorize := (HTTPClient get: url) unwrap
     self assert: authorize status equals: 302
     location := self header: "location" in: authorize
     self assert: (location startsWith: "{self.rx redirectUri}?")
+    base := "http://127.0.0.1:{self.rx port}"
+    self assert: (HTTPClient get: "{base}/favicon.ico") unwrap status equals: 404
+    junk := (HTTPClient get: "{base}/callback?code=evil&state=wrong") unwrap
+    self assert: junk status equals: 404
     landed := (HTTPClient get: location) unwrap
-    favicon := (HTTPClient get: "http://127.0.0.1:{self.rx port}/favicon.ico") unwrap
-    self assert: favicon status equals: 404
+    self assert: (HTTPClient get: "{base}/favicon.ico") unwrap status equals: 404
     landed status
 
   // Steps 3-7 up to the raw callback query: registration, session,
@@ -120,6 +126,9 @@ TestCase subclass: E2eNativeLoginTest
     verifier := form at: "code_verifier"
     self assert: verifier equals: sess codeVerifier
     self assert: ((Erlang crypto hash: #sha256 with: verifier) asBase64Url replaceAll: "=" with: "") equals: challenge
+    self assert: (form at: "grant_type") equals: "authorization_code"
+    self assert: (form at: "code") equals: "code-1"
+    self assert: (form at: "redirect_uri") equals: self.rx redirectUri
     self assert: (form at: "client_id") equals: FixtureProvider clientId
     self deny: (form includesKey: "client_secret")
     self deny: ((self.provider lastTokenRequest at: #headers) includesKey: "authorization")
@@ -164,6 +173,16 @@ TestCase subclass: E2eNativeLoginTest
     self assert: (revoked at: "token") equals: "rt-1"
     self assert: (revoked at: "token_type_hint") equals: "refresh_token"
     self assert: (revoked at: "client_id") equals: FixtureProvider clientId
+    // The access token too, with an explicit hint.
+    self
+      assert: (OAuthFlows
+        revoke: server
+        client: reg
+        token: fresh
+        hint: #access_token) isOk
+    revoked := (self.provider lastRequestTo: "/revoke") at: #form
+    self assert: (revoked at: "token") equals: "at-2"
+    self assert: (revoked at: "token_type_hint") equals: "access_token"
     // The callback is spent: neither it nor its query can be used again.
     again := OAuthFlows
       exchangeCode: server

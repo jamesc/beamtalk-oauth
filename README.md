@@ -16,8 +16,8 @@ design is in [ADR 0001](docs/ADR/0001-beamtalk-native-oauth-client.md).
 
 ## Requirements
 
-- Erlang/OTP 27 or newer (`oidcc` needs 27; CI currently runs OTP 28).
-- Beamtalk 0.4 or newer.
+- Erlang/OTP 27 or newer for the library (`oidcc` needs 27). The
+  current Beamtalk nightly toolchain itself needs OTP 28, so CI runs 28.
 - No Elixir runtime: `oidcc`, `jose` and `telemetry` build with rebar3
   from `[native.dependencies]`.
 
@@ -37,10 +37,18 @@ Either way it pulls in `http` and the native `oidcc` dependency.
 ## Native app quick start
 
 A CLI or desktop app opens the system browser and receives the redirect
-on a loopback listener it runs itself (RFC 8252). Register an application
-with the provider as a public (non-confidential) client and the redirect
-URI `http://127.0.0.1:8765/callback`; GitLab and Google accept a loopback
-redirect on any port for it, so the receiver's OS-assigned port works.
+on a loopback listener it runs itself (RFC 8252).
+
+- **GitLab**: register a non-confidential application with the `openid`
+  scope and the redirect URI `http://127.0.0.1:8765/callback`. GitLab
+  accepts a loopback redirect on any port for it, so the receiver's
+  OS-assigned port works.
+- **Google**: create a "Desktop app" OAuth client. It has no registered
+  redirect URI (any loopback port is accepted), but it does get a client
+  secret the token endpoint requires, so register it with
+  `ClientRegistration forClient: id secret: secret redirect: rx redirectUri`.
+  The secret is not confidential in a desktop app; PKCE and the session
+  store protect the flow.
 
 ```beamtalk
 server := (OAuthServer fromPreset: ProviderPresets gitlab) unwrap
@@ -50,7 +58,7 @@ store := SessionStore spawn
 sess := OAuthSession newSessionFor: server client: reg
 store create: sess boundTo: rx binding
 rx expectState: sess state                // before the URL is opened
-url := (OAuthFlows authorizeUrl: server client: reg scopes: #("openid", "read_user") session: sess) unwrap
+url := (OAuthFlows authorizeUrl: server client: reg scopes: #("openid") session: sess) unwrap
 Transcript showCr: url                    // or open the system browser
 query := (rx awaitCallback: 300000) unwrap
 cb := (OAuthFlows handleCallback: query store: store boundTo: rx binding) unwrap
@@ -68,7 +76,8 @@ Things to know:
   receiver records only a `GET /callback` carrying that state, so the
   browser's `/favicon.ico` request or a junk request from a web page
   cannot use up its one slot. It stops listening once `awaitCallback:`
-  answers.
+  answers; call `rx stop` yourself if the flow is abandoned earlier
+  (`examples/native_login.bt` uses `ensure:`).
 - `awaitCallback:` blocks the calling process while the user signs in.
   Call it from a plain or forked process, not inside an actor method.
 - `handleCallback:` consumes the session, so a callback works once.
@@ -90,7 +99,7 @@ NativeLogin run
 
 For a long-running service, start a `ProviderWorker` (in your supervision
 tree) instead of `fromPreset:`/`fromDiscovery:`. It keeps the provider
-configuration and JWKS fresh, and `worker server` answers an
+configuration and JWKS fresh, and `worker server unwrap` answers an
 `OAuthServer` for the same calls.
 
 ## Server-side web apps
@@ -148,14 +157,17 @@ instead.
 | provider codes, verbatim | `invalid_grant`, `invalid_client`, `access_denied`, `login_required`, ... |
 | `provider_error` | the callback carried an unregistered error code (in `detail`) |
 | `oidcc` reasons | `missing_claim`, `token_expired`, `sub_invalid`, `no_supported_auth_method`, `no_supported_code_challenge`, ... |
-| `transport` | the request failed: connect, TLS, timeout |
+| `transport` | the request failed (connect, TLS, timeout), or revocation / token info got an error answer that is not JSON |
+| `http_error` | the provider answered an error status whose body has no `error` member |
+| `oidcc_crash` | `oidcc` raised on a malformed provider answer |
+| `bad_subject` | the userinfo `sub` is not the ID token's subject |
 | `parse` | a malformed response or callback |
 | `config` | invalid configuration or a token set missing what the call needs |
 | `insecure_endpoint` | a plain-HTTP endpoint or a non-loopback `http` redirect URI |
-| `session_mismatch` | wrong binding, or a session or tokens for another issuer, redirect URI or client |
-| `reused_state` | the session or callback was already used, or is unknown to this store |
-| `expired_session` | the session outlived its TTL (10 minutes by default) |
-| `issuer_mismatch` | a callback `iss` or token issuer is not the expected one |
+| `session_mismatch` | wrong binding; a session for another issuer or redirect URI; tokens issued to another client |
+| `reused_state` | the session or callback ticket was already used, or is unknown to this store |
+| `expired_session` | the session or callback ticket outlived its TTL (10 minutes by default) |
+| `issuer_mismatch` | a callback `iss` or the tokens' issuer is not the expected one |
 | `missing_id_token` | the token response had no ID token |
 | `no_userinfo_endpoint` | the provider has no userinfo endpoint |
 | `callback_timeout` | no matching callback reached the `LoopbackReceiver` in time |

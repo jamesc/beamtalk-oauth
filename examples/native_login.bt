@@ -5,8 +5,8 @@
 /// loopback redirect, PKCE, a validated ID token, then userinfo.
 ///
 /// Register a GitLab application (User settings > Applications) that is
-/// not confidential, with the `openid` scope (add `read_user` for more
-/// profile claims) and the redirect URI `http://127.0.0.1:8765/callback`.
+/// not confidential, with the `openid` scope and the redirect URI
+/// `http://127.0.0.1:8765/callback`.
 /// GitLab accepts a loopback redirect on any port for it, so the
 /// receiver's OS-assigned port works. Then, from a REPL in this package:
 ///
@@ -18,7 +18,7 @@
 ///
 /// `run` prints the authorize URL and waits up to five minutes for the
 /// browser to come back. It prints who signed in, never a token, and
-/// revokes the tokens at the end.
+/// revokes the tokens at the end, even when a later step fails.
 Object subclass: NativeLogin
 
   /// The environment variable holding the GitLab application id.
@@ -55,7 +55,7 @@ Object subclass: NativeLogin
     url := (OAuthFlows
       authorizeUrl: server
       client: reg
-      scopes: #("openid", "read_user")
+      scopes: #("openid")
       session: sess) unwrap
     Transcript showCr: "Open this URL in your browser and sign in:"
     Transcript showCr: url
@@ -69,16 +69,21 @@ Object subclass: NativeLogin
       client: reg
       callback: cb
       store: store) unwrap
-    // `toks subject` comes from an ID token oidcc has validated.
-    info := (OAuthFlows
-      userInfo: server
-      client: reg
-      tokenSet: toks) unwrap
-    name := info at: "nickname" ifAbsent: [info at: "name" ifAbsent: ["?"]]
-    Transcript showCr: "Signed in as {name} (GitLab user {toks subject})"
+    // From here on the tokens are live: revoke them whatever happens.
+    outcome := Result
+      tryDo: [
+        // `toks subject` comes from an ID token oidcc has validated.
+        info := (OAuthFlows
+          userInfo: server
+          client: reg
+          tokenSet: toks) unwrap
+        name := info at: "nickname" ifAbsent: [info at: "name" ifAbsent: ["?"]]
+        Transcript showCr: "Signed in as {name} (GitLab user {toks subject})"
+        toks subject
+      ]
     (OAuthFlows
       revoke: server
       client: reg
       token: toks) unwrap
     Transcript showCr: "Tokens revoked."
-    toks subject
+    outcome unwrap

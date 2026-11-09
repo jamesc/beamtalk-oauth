@@ -35,7 +35,9 @@
 /// the request's `redirect_uri` with `code` (`code-1`), the request's
 /// `state` and `iss` (the issuer), and makes the request's `nonce` the
 /// ID-token `nonce` claim from then on, as a real provider binds the
-/// nonce to the code. A request without `redirect_uri` answers 400.
+/// nonce to the code (a later `claims:` replaces it). A request without
+/// `redirect_uri` or `state`, or whose `response_type` is not `code` or
+/// whose `code_challenge_method` is not `S256`, answers 400.
 /// `lastRequestTo: "/authorize"` answers its query (for the PKCE
 /// challenge).
 ///
@@ -239,16 +241,26 @@ Actor subclass: FixtureProvider
 
   /// The sign-in stand-in: a 302 to the request's `redirect_uri` with
   /// `code`, `state` and `iss`; the request's `nonce` becomes the ID-token
-  /// `nonce` claim. 400 without a `redirect_uri`.
+  /// `nonce` claim. 400 for a request a real provider would refuse (see
+  /// the class comment).
   authorizeFor: req :: HTTPRequest -> HTTPResponse =>
     q := req queryParams
     redirect := q at: "redirect_uri" ifAbsent: [""]
-    redirect isEmpty ifTrue: [
-      ^self json: #{"error" => "invalid_request"} status: 400
-    ]
+    state := q at: "state" ifAbsent: [""]
+    ok := redirect isEmpty not
+      and: [
+        state isEmpty not
+          and: [
+            (q at: "response_type" ifAbsent: [
+              ""
+            ]) =:= "code" and: [
+              (q at: "code_challenge_method" ifAbsent: [""]) =:= "S256"
+            ]
+          ]
+      ]
+    ok ifFalse: [^self json: #{"error" => "invalid_request"} status: 400]
     nonce := q at: "nonce" ifAbsent: [nil]
     nonce isNil ifFalse: [self.claims := self.claims at: "nonce" put: nonce]
-    state := q at: "state" ifAbsent: [""]
     query := "code=code-1&state={state urlEncoded}&iss={self.issuer urlEncoded}"
     sep := (redirect includesSubstring: "?") ifTrue: ["&"] ifFalse: ["?"]
     HTTPResponse
