@@ -16,8 +16,8 @@ design is in [ADR 0001](docs/ADR/0001-beamtalk-native-oauth-client.md).
 
 ## Requirements
 
-- Erlang/OTP 27 or newer for the library (`oidcc` needs 27). The
-  current Beamtalk nightly toolchain itself needs OTP 28, so CI runs 28.
+- Erlang/OTP 28 or newer. That is Beamtalk's support window (28 and 29);
+  CI tests both.
 - No Elixir runtime: `oidcc`, `jose` and `telemetry` build with rebar3
   from `[native.dependencies]`.
 
