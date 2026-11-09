@@ -32,6 +32,7 @@ from the HTTPS-only check and `{http_client, Reason}` from the adapter.
 
 -export([
     ensure_started/0,
+    unsafe_http_enabled/0,
     discover/2,
     load_opts/1,
     provider_info/4,
@@ -51,7 +52,7 @@ from the HTTPS-only check and `{http_client, Reason}` from the adapter.
     config := oidcc_provider_configuration:t(),
     jwks := jose_jwk:key(),
     request_opts := oidcc_http_util:request_opts(),
-    worker => pid()
+    provider_worker => pid()
 }}.
 
 %% `oidcc` checks ID-token `iat`/`exp`/`nbf` with no tolerance by default;
@@ -59,7 +60,7 @@ from the HTTPS-only check and `{http_client, Reason}` from the adapter.
 -define(MAX_CLOCK_SKEW, 60).
 
 %% How long token validation waits for a `ProviderWorker`'s JWKS reload
-%% before loading the keys itself.
+%% before going on with the keys it has.
 -define(WORKER_JWKS_TIMEOUT, 3000).
 
 %% Endpoint fields of the provider configuration that must be HTTPS.
@@ -103,7 +104,8 @@ Discovery: load the provider configuration for `Issuer` and its JWKS.
 * `document_overrides` — a map merged over the discovery document
   (`oidcc`'s `quirks => #{document_overrides => ...}`);
 * `allow_unsafe_http` — `true` to accept `http` endpoints. Test-only: the
-  fixture provider is plain HTTP;
+  fixture provider is plain HTTP. Refused (`unsafe_http_disabled`) unless
+  `unsafe_http_enabled/0`;
 * `max_body_bytes` — the response cap, default 1 MiB;
 * `timeout` — per-request timeout in milliseconds.
 
@@ -122,6 +124,7 @@ discover(Issuer0, Opts) when is_map(Opts) ->
     Unsafe = maps:get(allow_unsafe_http, Opts, false) =:= true,
     LoadOpts = #{request_opts := RequestOpts} = load_opts(Opts),
     maybe
+        ok ?= check_unsafe_allowed(Unsafe),
         ok ?= check_url(issuer, Issuer, Unsafe),
         {ok, {Config, _ConfigExpiry}} ?=
             oidcc_provider_configuration:load_configuration(Issuer, LoadOpts),
@@ -131,6 +134,24 @@ discover(Issuer0, Opts) when is_map(Opts) ->
                 Config#oidcc_provider_configuration.jwks_uri, LoadOpts
             ),
         {ok, provider_info(Config, Jwks, RequestOpts, undefined)}
+    end.
+
+-doc """
+Whether the test-only `allow_unsafe_http` option may be used: the
+application env `beamtalk_oauth` / `allow_unsafe_http_for_tests` is
+`true`. Only the test suite sets it (`FixtureProvider start`), so a
+production config that asks for plain HTTP is refused rather than obeyed.
+""".
+-spec unsafe_http_enabled() -> boolean().
+unsafe_http_enabled() ->
+    application:get_env(beamtalk_oauth, allow_unsafe_http_for_tests, false) =:= true.
+
+check_unsafe_allowed(false) ->
+    ok;
+check_unsafe_allowed(true) ->
+    case unsafe_http_enabled() of
+        true -> ok;
+        false -> {error, unsafe_http_disabled}
     end.
 
 -doc """
@@ -144,7 +165,7 @@ options never reaches `httpc`. `ProviderWorker` hands them to
 """.
 -spec load_opts(Opts :: map()) -> #{request_opts := map(), quirks := map()}.
 load_opts(Opts) when is_map(Opts) ->
-    Unsafe = maps:get(allow_unsafe_http, Opts, false) =:= true,
+    Unsafe = maps:get(allow_unsafe_http, Opts, false) =:= true andalso unsafe_http_enabled(),
     Overrides = untag(maps:get(document_overrides, Opts, #{})),
     #{
         request_opts => request_opts(Opts),
@@ -171,10 +192,10 @@ configuration and JWKS: `#{issuer, context, revocation_endpoint,
 metadata}`. `context` is the opaque provider; `metadata` the
 configuration record as a map.
 
-`Worker` is the `oidcc_provider_configuration_worker` the configuration
-came from, or `undefined`. With a worker, the context's `refresh_jwks`
-callback asks the worker to reload, so the new keys are kept for every
-later caller (see `call_opts/1`).
+`Worker` is the `ProviderWorker` process (`beamtalk_oauth_provider_worker`)
+the configuration came from, or `undefined`. With a worker, the context's
+`refresh_jwks` callback asks the worker to reload, so the new keys are
+kept for every later caller (see `call_opts/1`).
 """.
 -spec provider_info(
     oidcc_provider_configuration:t(),
@@ -186,7 +207,7 @@ provider_info(Config, Jwks, RequestOpts, Worker) ->
     Context0 = #{config => Config, jwks => Jwks, request_opts => RequestOpts},
     Context =
         case is_pid(Worker) of
-            true -> Context0#{worker => Worker};
+            true -> Context0#{provider_worker => Worker};
             false -> Context0
         end,
     #{
@@ -221,9 +242,11 @@ unknown `kid`.
 
 A provider from `discover/2` reloads the JWKS through the adapter itself;
 the new keys last for that one call. A provider from a `ProviderWorker`
-asks the worker to reload instead, so the worker keeps the new keys for
-every later caller; if the worker has gone, it falls back to reloading
-directly.
+asks the worker to reload instead (rate-limited there), so the worker
+keeps the new keys for every later caller. If the worker has gone, or has
+no keys yet, it reloads directly; if the worker is busy past 3 s, it goes
+on with the keys it has, and validation fails rather than overrunning the
+caller's 5 s actor-call budget.
 """.
 -spec call_opts(provider()) -> map().
 call_opts({beamtalk_oauth_provider, #{config := Config, request_opts := RequestOpts} = Ctx}) ->
@@ -238,26 +261,29 @@ call_opts({beamtalk_oauth_provider, #{config := Config, request_opts := RequestO
     end,
     Refresh =
         case Ctx of
-            #{worker := Worker} -> fun(_Jwks, Kid) -> worker_jwks(Worker, Kid, Direct) end;
+            #{provider_worker := Worker} ->
+                fun(Jwks, Kid) -> worker_jwks(Worker, Kid, Jwks, Direct) end;
             _ -> fun(_Jwks, _Kid) -> Direct() end
         end,
     #{request_opts => RequestOpts, refresh_jwks => Refresh}.
 
-%% Ask the worker to reload its JWKS for `Kid' (it skips the reload when it
-%% already has that key) and answer its keys. A worker that has stopped,
-%% has no keys or does not answer within ?WORKER_JWKS_TIMEOUT falls back
-%% to `Direct'.
+%% Ask the `ProviderWorker' to reload its JWKS for `Kid' and answer its
+%% keys. The oidcc worker behind it skips the reload when it already has
+%% that key. A worker that has stopped or has no keys yet falls back to
+%% `Direct'; one that does not answer within ?WORKER_JWKS_TIMEOUT (busy
+%% with a slow load) leaves validation with the keys it already has.
 %%
-%% The cast is what `oidcc_provider_configuration_worker:
-%% refresh_jwks_for_unknown_kid/2' sends; that function then waits with
-%% the default 5 s call timeout, too long inside a Beamtalk actor call.
-%% The worker handles the cast before the `get_jwks' call.
-worker_jwks(Worker, Kid, Direct) ->
-    gen_server:cast(Worker, {refresh_jwks_for_unknown_kid, Kid}),
-    try gen_server:call(Worker, get_jwks, ?WORKER_JWKS_TIMEOUT) of
+%% oidcc drops an unknown-kid refresh that is queued while a load runs
+%% (`drop_queued_unknown_kid_refreshes/0'): the load that just ran is taken
+%% to cover it. If that load started before the provider rotated, the new
+%% key is missed once; the next token naming it triggers another reload.
+worker_jwks(Worker, Kid, Current, Direct) ->
+    try gen_server:call(Worker, {beamtalk_oauth_unknown_kid, Kid}, ?WORKER_JWKS_TIMEOUT) of
         undefined -> Direct();
+        busy -> {ok, Current};
         Jwks -> {ok, Jwks}
     catch
+        exit:{timeout, _} -> {ok, Current};
         exit:_ -> Direct()
     end.
 
@@ -453,7 +479,8 @@ config_map(Config) ->
 request_opts(Opts) ->
     AdapterCfg0 = #{
         client => maps:get(client, Opts),
-        allow_unsafe_http => maps:get(allow_unsafe_http, Opts, false) =:= true
+        allow_unsafe_http =>
+            maps:get(allow_unsafe_http, Opts, false) =:= true andalso unsafe_http_enabled()
     },
     AdapterCfg =
         case maps:find(max_body_bytes, Opts) of

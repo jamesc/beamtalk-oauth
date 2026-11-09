@@ -25,7 +25,7 @@
 /// `keyId:` names the key (a `kid` in the JWKS and the ID-token header);
 /// `rotateKeyTo:` replaces it with a new key under a new `kid`, so the
 /// JWKS a client loaded earlier no longer has it. `hits:` counts the
-/// requests made to a path.
+/// requests made to a path, and `slow:by:` delays its answers.
 /// Default claims: `iss` (the issuer), `sub` `user-1`, `aud` `client-1`,
 /// `nonce` `nonce-1`, `iat` now and `exp` five minutes on.
 ///
@@ -59,10 +59,19 @@ Actor subclass: FixtureProvider
   state: keyId :: String | Nil = nil
   /// Path -> number of requests served.
   state: hits :: Dictionary = #{}
+  /// Path -> milliseconds to wait before answering.
+  state: delays :: Dictionary = #{}
 
   /// Start a provider on an ephemeral port. `stop` it when done.
+  ///
+  /// Also sets the test-only application flag that lets
+  /// `#allowUnsafeHttp` work (the fixture is plain HTTP).
   class start -> FixtureProvider =>
     Erlang beamtalk_oauth_oidcc ensure_started
+    Erlang application
+      set_env: #beamtalk_oauth
+      with: #allow_unsafe_http_for_tests
+      with: true
     provider := self spawnWith: #{
       #key => (Erlang jose_jwk generate_key: {#ec, #secp256r1})
     }
@@ -122,6 +131,11 @@ Actor subclass: FixtureProvider
     self.keyId := kid
     nil
 
+  /// Wait `ms` milliseconds before answering each request on `path`.
+  slow: path :: String by: ms :: Integer -> Nil =>
+    self.delays := self.delays at: path put: ms
+    nil
+
   /// The number of requests served on `path`.
   hits: path :: String -> Integer => self.hits at: path ifAbsent: [0]
 
@@ -142,6 +156,8 @@ Actor subclass: FixtureProvider
   handle: req :: HTTPRequest -> HTTPResponse =>
     path := req path
     self.hits := self.hits at: path put: (self hits: path) + 1
+    delay := self.delays at: path ifAbsent: [0]
+    delay > 0 ifTrue: [Erlang timer sleep: delay]
     failure := self.failures at: path ifAbsent: [nil]
     path =:= "/token" ifTrue: [self.lastTokenRequest := self recordOf: req]
     failure notNil ifTrue: [^self json: (failure at: 2) status: (failure at: 1)]

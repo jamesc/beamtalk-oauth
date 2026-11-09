@@ -163,9 +163,15 @@ TestCase subclass: ProviderWorkerTest
     self assert: err code equals: "config"
 
   testPlainHttpJwksIsNeverFetched =>
-    // oidcc accepts a plain-HTTP jwks_uri and its worker fetches it at
-    // once; the adapter refuses the request.
-    self.provider discoveryOverrides: #{"jwks_uri" => "http://example.com/jwks"}
+    // oidcc accepts a plain-HTTP jwks_uri and its worker fetches it as soon
+    // as the configuration loads; the adapter refuses that request. The
+    // host is under .invalid (RFC 2606), so nothing could be contacted even
+    // if the refusal broke; the refusal event proves the adapter stopped it.
+    log := EventLog spawn
+    log listenTo: #(#beamtalk_oauth, #http_adapter, #refused)
+    self.provider discoveryOverrides: #{
+      "jwks_uri" => "http://jwks.invalid/jwks"
+    }
     self.worker := (ProviderWorker
       issuer: self.provider issuer
       preset: #{}
@@ -174,8 +180,73 @@ TestCase subclass: ProviderWorkerTest
         #backoffMin => 60000,
         #backoffMax => 60000
       }) unwrap
+    tries := 0
+    [log events isEmpty and: [tries < 100]]
+      whileTrue: [
+        tries := tries + 1
+        Erlang timer sleep: 20
+      ]
+    log detach
+    self assert: log events equals: #(#{#reason => #insecure_url})
+    self assert: (Erlang gen_server call: self.worker oidccWorker with: #get_jwks) equals: #undefined
     self assert: self.worker server error code equals: "insecure_endpoint"
     self assert: self.worker isAlive
+    log stop
+
+  testServerAnswersFromCacheDuringReload =>
+    worker := self start: #{}
+    self assertOk: worker server
+    // A reload against a slow provider: the oidcc worker answers nothing
+    // until it finishes.
+    self.provider slow: "/.well-known/openid-configuration" by: 3000
+    Erlang gen_server cast: worker oidccWorker with: #refresh_configuration
+    Erlang timer sleep: 200
+    before := Erlang erlang monotonic_time: #millisecond
+    server := self assertOk: worker server
+    elapsed := (Erlang erlang monotonic_time: #millisecond) - before
+    self assert: elapsed < 1000
+    self exchange: server
+
+  testRefreshIsRateLimited =>
+    self.worker := (ProviderWorker
+      issuer: self.provider issuer
+      preset: #{}
+      options: #{
+        #allowUnsafeHttp => true,
+        #backoffMin => 60000,
+        #backoffMax => 60000
+      }) unwrap
+    self assertOk: self.worker server
+    self.worker refresh
+    self.worker refresh
+    self assert: (self.provider hits: "/.well-known/openid-configuration") equals: 2
+
+  testUnsafeHttpNeedsTestFlag =>
+    unset := [
+      Erlang application
+        set_env: #beamtalk_oauth
+        with: #allow_unsafe_http_for_tests
+        with: false
+    ]
+    restore := [
+      Erlang application
+        set_env: #beamtalk_oauth
+        with: #allow_unsafe_http_for_tests
+        with: true
+    ]
+    unset value
+    [
+      worker := ProviderWorker
+        issuer: self.provider issuer
+        preset: #{}
+        options: self unsafe
+      self assert: worker error code equals: "config"
+      server := OAuthServer
+        fromDiscovery: self.provider issuer
+        preset: #{}
+        options: self unsafe
+      self assert: server error code equals: "unsafe_http_disabled"
+    ] ensure: restore
 
   // A worker for a closed port, retrying only once a minute.
   unreachableWorker -> ProviderWorker =>
@@ -202,6 +273,11 @@ TestCase subclass: ProviderWorkerTest
     self deny: (text includesSubstring: FixtureProvider clientSecret)
     self deny: (text includesSubstring: "request_opts")
     self deny: (text includesSubstring: "document_overrides")
+    // The oidcc worker holds the load options and the public configuration
+    // and keys; no client credential ever reaches it.
+    inner := self render: (Erlang sys get_status: worker oidccWorker)
+    self assert: (inner includesSubstring: "127.0.0.1")
+    self deny: (inner includesSubstring: FixtureProvider clientSecret)
 
   testStopStopsOidccWorker =>
     worker := self start: #{}

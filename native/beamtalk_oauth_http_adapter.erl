@@ -29,7 +29,9 @@ otherwise), whatever `oidcc` accepted: `oidcc` itself takes a plain-HTTP
 `jwks_uri`, and an `oidcc_provider_configuration_worker` fetches it
 before Beamtalk code sees the configuration. `allow_unsafe_http` (tests
 only) also admits plain HTTP on a loopback host, as
-`beamtalk_oauth_oidcc:check_https/2` does.
+`beamtalk_oauth_oidcc:check_https/2` does. Each refusal emits the
+telemetry event `[beamtalk_oauth, http_adapter, refused]` (metadata
+`#{reason => insecure_url}`), so a refused background load is visible.
 """.
 
 -behaviour(oidcc_http_adapter).
@@ -37,6 +39,10 @@ only) also admits plain HTTP on a loopback host, as
 -export([request/5]).
 
 -define(DEFAULT_MAX_BODY, 1048576).
+
+%% Emitted for every refused request, with `#{reason => insecure_url}' as
+%% metadata (never the URL).
+-define(REFUSED_EVENT, [beamtalk_oauth, http_adapter, refused]).
 %% oidcc's own default; used when oidcc passes `infinity`, which
 %% `HTTPClient` does not accept.
 -define(DEFAULT_TIMEOUT, 60000).
@@ -79,7 +85,7 @@ do_request(Method, Request, HttpOptions, Client, Config) ->
         ok ?= check_http_options(HttpOptions),
         {Url, Headers, Body} ?= split_request(Request),
         {ok, HeaderPairs} ?= headers(Headers),
-        ok ?= check_url(Url, maps:get(allow_unsafe_http, Config, false) =:= true),
+        ok ?= check_url(Url, unsafe(Config)),
         Opts0 = #{
             headers => HeaderPairs,
             timeout => timeout(proplists:get_value(timeout, HttpOptions, ?DEFAULT_TIMEOUT)),
@@ -97,12 +103,19 @@ do_request(Method, Request, HttpOptions, Client, Config) ->
         {error, Reason} -> {error, {http_client, Reason}}
     end.
 
+%% The opt-in counts only while the test-only application flag is set.
+unsafe(Config) ->
+    maps:get(allow_unsafe_http, Config, false) =:= true andalso
+        beamtalk_oauth_oidcc:unsafe_http_enabled().
+
 %% HTTPS only (plain HTTP on loopback with the test-only opt-in). The
 %% reason never carries the URL.
 check_url(Url, Unsafe) ->
     case beamtalk_oauth_oidcc:check_https(#{request_url => iolist_to_binary(Url)}, Unsafe) of
         ok -> ok;
-        {error, _} -> {error, insecure_url}
+        {error, _} ->
+            telemetry:execute(?REFUSED_EVENT, #{count => 1}, #{reason => insecure_url}),
+            {error, insecure_url}
     end.
 
 %% `HTTPClient` has no per-request TLS options, so `ssl` options (custom

@@ -22,14 +22,22 @@
 /// processes of its own; the app owns this one.
 ///
 /// Every load goes through the `http` package's `HTTPClient`, never
-/// `httpc`. The issuer and every endpoint must be HTTPS. A failed load is
-/// retried with backoff (1 s to 30 s by default), and `server` answers
-/// `provider_unavailable` until a load succeeds. The worker holds no
-/// secrets; `sys:get_status` shows only its issuer and the `oidcc`
-/// worker's pid.
+/// `httpc`, and each request times out after 10 s by default. The issuer
+/// and every endpoint must be HTTPS. A failed load is retried with backoff
+/// (1 s to 30 s by default), and `server` answers `provider_unavailable`
+/// until a load succeeds.
+///
+/// `server` never waits on a reload: the worker answers from the last
+/// configuration and keys it read, and picks up the `oidcc` worker's newer
+/// ones in the background. Reloads asked for by `refresh` or by an unknown
+/// key are rate-limited to one per `#backoffMin`.
+///
+/// The worker holds no secrets; `sys:get_status` shows only its issuer and
+/// the `oidcc` worker's pid.
 ///
 /// Options, as for `OAuthServer fromDiscovery:preset:options:`
-/// (`#maxBodyBytes`, `#timeout`, test-only `#allowUnsafeHttp`), plus
+/// (`#maxBodyBytes`, `#timeout`, test-only `#allowUnsafeHttp`, which
+/// also needs the test flag described there), plus
 /// `#backoffMin` and `#backoffMax` (ms) and `#backoffType`
 /// (`#exponential`, `#random`, `#random_exponential`) for failed loads.
 ///
@@ -132,15 +140,18 @@ Actor subclass: ProviderWorker native: beamtalk_oauth_provider_worker
     ] ifFalse: [OAuthError fromOidcc: problem]
 
   /// An `OAuthServer` from the worker's current configuration and JWKS.
-  /// Waits for the first load; answers `provider_unavailable` while no
-  /// load has succeeded, and `insecure_endpoint` if the configuration
-  /// names a non-HTTPS endpoint.
+  /// Answers at once from the last configuration and keys read; only
+  /// before the first one does it wait (up to 4.5 s) for a load. Answers
+  /// `provider_unavailable` while no load has succeeded, and
+  /// `insecure_endpoint` if the configuration names a non-HTTPS endpoint.
   server -> Result(OAuthServer, OAuthError) => self delegate
 
   /// Reload the configuration and JWKS now, waiting up to 4.5 s for both.
-  /// Normally the worker reloads on its own when they expire. A failed
-  /// reload is not reported here: the worker keeps its current
-  /// configuration and keys and retries with backoff.
+  /// Normally the worker reloads on its own when they expire. Within
+  /// `#backoffMin` of the last reload this starts none. A failed reload
+  /// is not reported here: the worker keeps its current configuration and
+  /// keys, `oidcc` retries the load with backoff, and the failure is
+  /// logged.
   refresh -> Nil => self delegate
 
   /// The issuer the worker was started with.

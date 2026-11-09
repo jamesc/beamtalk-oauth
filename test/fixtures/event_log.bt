@@ -1,0 +1,49 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+/// EventLog — records the telemetry events a test listens for.
+///
+/// `listenTo:` attaches a handler for one event name; each event's
+/// metadata is appended to `events`. `detach` removes the handler. The
+/// handler runs in whichever process emits the event (an `oidcc` worker,
+/// say), so the log is an actor.
+///
+/// ## Examples
+/// ```beamtalk
+/// log := EventLog spawn
+/// log listenTo: #(#beamtalk_oauth, #http_adapter, #refused)
+/// // ... provider calls ...
+/// log events      // => #(#{#reason => #insecure_url})
+/// log detach
+/// ```
+Actor subclass: EventLog
+  /// Metadata of each event seen, oldest first.
+  state: events :: List = #()
+  /// The telemetry handler id, or nil when not attached.
+  state: handlerId = nil
+
+  /// Attach a handler for `eventName` (a List of Symbols).
+  listenTo: eventName :: List -> Nil =>
+    log := self
+    id := "event-log-{Erlang erlang unique_integer: #(#positive)}"
+    self.handlerId := id
+    Erlang telemetry
+      attach: id
+      with: eventName
+      with: [:event :measurements :metadata :config | log add: metadata]
+      with: nil
+    nil
+
+  /// Record one event's metadata.
+  add: metadata :: Object -> Nil =>
+    self.events := self.events add: metadata
+    nil
+
+  /// Metadata of each event seen, oldest first.
+  events -> List => self.events
+
+  /// Remove the handler.
+  detach -> Nil =>
+    self.handlerId isNil ifFalse: [Erlang telemetry detach: self.handlerId]
+    self.handlerId := nil
+    nil
