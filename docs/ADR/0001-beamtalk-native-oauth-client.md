@@ -253,6 +253,10 @@ Object subclass: OAuthFlows
   class exchangeCode: server client: reg callback: cb store: store -> Result(TokenSet, OAuthError) => ...
     // oidcc_token:retrieve; asserts the session's issuer and redirect URI
     // match server and reg; nonce and ID token checked by oidcc
+  class completeLoopbackLogin: rx server: server client: reg store: store timeout: ms -> Result(TokenSet, OAuthError) => ...
+    // the native-login helper: rx awaitCallback, handleCallback,
+    // exchangeCode in a loop that re-arms after a forged callback (see
+    // "Forged loopback callbacks: re-arm"). maxRearms: variant; default 3
   class refresh: server client: reg tokenSet: toks -> Result(TokenSet, OAuthError) => ...
     // oidcc_token:refresh with expected_subject from toks. Answers a
     // merged TokenSet: response values win, and the old refreshToken
@@ -378,9 +382,10 @@ Value subclass: LoopbackReceiver
     // cannot use it up (BT-4569). A setter, not awaitCallback:state:,
     // because the redirect can beat the await. One flow per receiver:
     // a second expectState: raises. A timeout reports how many
-    // callbacks were refused. Known limit: state is visible to local
-    // processes (browser argv, history), so one that reads it can still
-    // use up the slot; it cannot get a forged code accepted.
+    // callbacks were refused. State is visible to local processes
+    // (browser argv, history), so one that reads it can still take the
+    // slot with a junk code; it cannot get that code accepted, and the
+    // flow re-arms (BT-4572, "Forged loopback callbacks: re-arm").
   awaitCallback: timeoutMs :: Integer -> Result(Dictionary, OAuthError) => ...
     // the raw query, for handleCallback:store:boundTo:. Waits in the
     // caller's process for a message from the handler, NOT a sync actor
@@ -389,6 +394,11 @@ Value subclass: LoopbackReceiver
     // Only GET /callback counts: browsers fetch /favicon.ico right after
     // the redirect, and any other path answers 404 without touching the
     // pending result.
+  awaitCallback: timeoutMs keepListening: keep -> Result(Dictionary, OAuthError) => ...
+  rearm -> Result(LoopbackReceiver, OAuthError) => ...
+    // keepListening: true leaves the listener up after a callback, still
+    // owned by the waiter (its exit stops the listener, BT-4570); rearm
+    // clears the slot, keeping port and expected state (BT-4572)
   stop -> Symbol => ...             // idempotent; #ok, like Actor>>stop
 ```
 
@@ -408,6 +418,42 @@ typed Value subclass: OAuthError
   field: status :: Integer | Nil = nil
   field: detail = nil
 ```
+
+#### Forged loopback callbacks: re-arm
+
+`state` gates the loopback slot (BT-4569), but it is not secret on the
+local machine: the authorize URL shows up in the argv of the process
+that opens the browser and in browser history. A local process that
+reads it can send `/callback?code=junk&state=<real>` before the
+provider's redirect. The junk code is never accepted (PKCE, the
+session store), but it used to end the login twice over: the receiver
+stopped listening, and `handleCallback:` burned the session.
+
+Decision (BT-4572, 2026-11-09): **re-arm on a failed exchange**.
+`OAuthFlows completeLoopbackLogin:server:client:store:timeout:` runs
+await, `handleCallback:` and `exchangeCode:`. When the token endpoint
+answers `invalid_grant`, it puts the same session back
+(`SessionStore restore:boundTo:`: same verifier, nonce and binding,
+original expiry, so a re-arm never extends a session) and re-arms the
+receiver on the same port for the same state
+(`LoopbackReceiver rearm`, after an `awaitCallback:keepListening:`),
+then waits again for the time left. Only `invalid_grant` re-arms; a
+provider `error=` callback, any callback failure, any other exchange
+error and a timeout end the login as before. Re-arms are capped (3 by
+default), all within the one overall timeout; past either limit the
+last error is answered. The waiter stays the receiver's owner between
+the callback and the re-arm, so the BT-4570 guarantee holds: if it
+exits, the listener stops.
+
+Residual limit: a local attacker can still delay the login until the
+cap or the timeout, or end it with a forged `error=` callback (which
+looks the same as the provider's and is never retried), and a real
+redirect that lands while a junk callback holds the slot answers 404
+and is lost. None of these hijack the login.
+
+Considered and not chosen: keeping the URL out of argv (handing it to
+the browser another way). It is platform-specific, and the URL still
+lands in browser history.
 
 ### Seams and rules
 
@@ -470,9 +516,7 @@ sess := OAuthSession newSessionFor: server client: reg
 rx expectState: sess state                // before the URL is opened
 url := (OAuthFlows authorizeUrl: server client: reg scopes: #("openid", "read_user") session: sess) unwrap
 Transcript showCr: url                    // or open the system browser
-query := (rx awaitCallback: 300000) unwrap
-cb := (OAuthFlows handleCallback: query store: store boundTo: rx binding) unwrap
-toks := (OAuthFlows exchangeCode: server client: reg callback: cb store: store) unwrap
+toks := (OAuthFlows completeLoopbackLogin: rx server: server client: reg store: store timeout: 300000) unwrap
 toks subject                              // validated by oidcc
 (OAuthFlows userInfo: server client: reg tokenSet: toks) unwrap
 toks := (OAuthFlows refresh: server client: reg tokenSet: toks) unwrap

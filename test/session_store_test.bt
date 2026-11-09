@@ -320,6 +320,14 @@ TestCase subclass: SessionStoreTest
     // Nothing was stored for the refused login.
     self assert: (store consume: extra state boundTo: self.binding) error code equals: "reused_state"
 
+  testFullStoreWithCodePointStampsRefuses =>
+    // Stamps that are all Unicode code points once crossed the FFI as a
+    // charlist (a String) when the full store looked for its oldest row.
+    clock := FakeClock spawnWith: #{#time => 1000}
+    store := self storeWith: clock options: #{#maxSessions => 1}
+    store create: self.session boundTo: self.binding
+    self assert: (store create: self otherSession boundTo: self.binding) error code equals: "session_store_full"
+
   testCapKeepsLiveSessions =>
     clock := FakeClock spawnWith: #{#time => 0}
     store := self storeWith: clock options: #{#maxSessions => 1}
@@ -467,3 +475,77 @@ TestCase subclass: SessionStoreTest
     self assert: (Erlang ets info: table with: #size) equals: 1
     // FFI wraps ets's badarg as a type_error.
     self should: [Erlang ets tab2list: table] raise: #type_error
+
+  // === restore:boundTo: (BT-4572) ===
+  testRestorePutsTheSameSessionBack =>
+    clock := FakeClock spawnWith: #{#time => 1000}
+    store := self storeWith: clock
+    store create: self.session boundTo: self.binding
+    taken := (store consume: self.session state boundTo: self.binding) unwrap
+    clock time: 1400
+    self assert: (store restore: taken boundTo: self.binding) isOk
+    self assert: store size equals: 1
+    // Still bound: another binding burns it.
+    self assert: (store consume: self.session state boundTo: Secrets generate) error code equals: "session_mismatch"
+
+  testRestoredSessionKeepsItsVerifierAndNonce =>
+    store := SessionStore spawn
+    store create: self.session boundTo: self.binding
+    taken := (store consume: self.session state boundTo: self.binding) unwrap
+    (store restore: taken boundTo: self.binding) unwrap
+    again := (store consume: self.session state boundTo: self.binding) unwrap
+    self assert: again codeVerifier equals: self.session codeVerifier
+    self assert: again nonce equals: self.session nonce
+    self assert: again createdAt equals: taken createdAt
+
+  testRestoreDoesNotExtendTheTtl =>
+    clock := FakeClock spawnWith: #{#time => 1000}
+    store := self storeWith: clock
+    store create: self.session boundTo: self.binding
+    taken := (store consume: self.session state boundTo: self.binding) unwrap
+    clock time: 1900
+    (store restore: taken boundTo: self.binding) unwrap
+    // Created at 1000 with a 1000 ms TTL: expired at 2000, restore or not.
+    clock time: 2000
+    self assert: (store consume: self.session state boundTo: self.binding) error code equals: "expired_session"
+
+  testRestoreWithSystemClockKeepsTheExpiry =>
+    store := SessionStore spawnWith: #{#ttl => 300}
+    store create: self.session boundTo: self.binding
+    taken := (store consume: self.session state boundTo: self.binding) unwrap
+    Timer sleep: 200
+    (store restore: taken boundTo: self.binding) unwrap
+    Timer sleep: 150
+    self assert: (store consume: self.session state boundTo: self.binding) error code equals: "expired_session"
+
+  testRestoreOfAnExpiredSessionStoresNothing =>
+    clock := FakeClock spawnWith: #{#time => 1000}
+    store := self storeWith: clock
+    store create: self.session boundTo: self.binding
+    taken := (store consume: self.session state boundTo: self.binding) unwrap
+    clock time: 2000
+    self assert: (store restore: taken boundTo: self.binding) error code equals: "expired_session"
+    self assert: store size equals: 0
+
+  testRestoreWithAFutureCreatedAtCountsAsNow =>
+    clock := FakeClock spawnWith: #{#time => 1000}
+    store := self storeWith: clock
+    (store restore: (self.session withCreatedAt: 999999) boundTo: self.binding) unwrap
+    clock time: 2000
+    self assert: (store consume: self.session state boundTo: self.binding) error code equals: "expired_session"
+
+  testRestoreIntoAFullStoreAnswersFull =>
+    clock := FakeClock spawnWith: #{#time => 1000}
+    store := self storeWith: clock options: #{#maxSessions => 1}
+    store create: self.session boundTo: self.binding
+    taken := (store consume: self.session state boundTo: self.binding) unwrap
+    store create: self otherSession boundTo: self.binding
+    self assert: (store restore: taken boundTo: self.binding) error code equals: "session_store_full"
+    self assert: store size equals: 1
+
+  testRestoreOfAStoredStateRaises =>
+    store := SessionStore spawn
+    stored := (store create: self.session boundTo: self.binding) unwrap
+    self should: [
+      store restore: stored boundTo: self.binding
+    ] raise: #user_error

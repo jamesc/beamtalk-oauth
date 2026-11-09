@@ -29,7 +29,9 @@
 ///   otherwise smuggle a second value past the state check.
 ///
 /// A rejected callback answers 404 and leaves the slot open for the real
-/// one.
+/// one. A recorded callback holds the slot until `rearm` clears it, which
+/// `OAuthFlows completeLoopbackLogin:...` does when the provider refuses
+/// its code (BT-4572).
 ///
 /// The gate also holds at most one waiter, a `{Pid, Reference}` pair
 /// registered by `awaitFrom:tag:`. When both the query and the waiter are
@@ -168,6 +170,22 @@ typed Server subclass: LoopbackGate
       ]
     self.stateDigest := Erlang crypto hash: #sha256 with: expected
     nil
+
+  /// Forget the recorded callback, so the next one that passes the checks
+  /// is recorded, and keep everything else: the listener and its port,
+  /// the expected state, the owner and the refused count. Answers `#ok`;
+  /// `#closed` when the gate has shut down; `#noState` when no state is
+  /// expected; `#busy` while a waiter is registered and has not yet
+  /// been sent a callback (there is nothing to re-arm).
+  ///
+  /// For `LoopbackReceiver rearm`, after the callback the receiver handed
+  /// out carried a code the provider refused.
+  rearm -> Symbol =>
+    self.closed ifTrue: [^#closed]
+    self.stateDigest isNil ifTrue: [^#noState]
+    self.waiter isNil ifFalse: [^#busy]
+    self.query := nil
+    #ok
 
   /// How many callbacks were refused for a missing, wrong or repeated
   /// parameter.

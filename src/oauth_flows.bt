@@ -46,7 +46,9 @@
 /// ## Native app flow
 ///
 /// The `LoopbackReceiver` only accepts a callback whose `state` it was told
-/// to expect, so call `expectState:` before opening the URL:
+/// to expect, so call `expectState:` before opening the URL. Then
+/// `completeLoopbackLogin:server:client:store:timeout:` waits for the
+/// callback, handles it and exchanges the code:
 ///
 /// ```beamtalk
 /// server := (OAuthServer fromPreset: ProviderPresets gitlab) unwrap
@@ -57,14 +59,24 @@
 /// (store create: sess boundTo: rx binding) unwrap
 /// rx expectState: sess state
 /// url := (OAuthFlows authorizeUrl: server client: reg scopes: #("openid", "read_user") session: sess) unwrap
-/// query := (rx awaitCallback: 300000) unwrap
-/// cb := (OAuthFlows handleCallback: query store: store boundTo: rx binding) unwrap
-/// toks := (OAuthFlows exchangeCode: server client: reg callback: cb store: store) unwrap
+/// toks := (OAuthFlows completeLoopbackLogin: rx server: server client: reg store: store timeout: 300000) unwrap
 /// toks subject                              // validated by oidcc
 /// toks := (OAuthFlows refresh: server client: reg tokenSet: toks) unwrap
 /// (OAuthFlows userInfo: server client: reg tokenSet: toks) unwrap
 /// (OAuthFlows revoke: server client: reg token: toks) unwrap
 /// ```
+///
+/// The helper is `rx awaitCallback:`, `handleCallback:store:boundTo:`
+/// and `exchangeCode:client:callback:store:` in a loop that survives a
+/// forged callback. `state` is visible to local processes (the browser's
+/// argv, its history), so one can send `/callback?code=junk&state=...`
+/// before the provider's redirect. The forged code is never accepted, but
+/// it takes the receiver's one-shot slot and burns the session. When the
+/// provider answers `invalid_grant`, the helper re-arms: it puts the same
+/// session back (`SessionStore restore:boundTo:`) and listens again on
+/// the same port for the same state (`LoopbackReceiver rearm`). See
+/// `completeLoopbackLogin:server:client:store:timeout:maxRearms:` for the
+/// limits.
 Object subclass: OAuthFlows
 
   /// Authorization parameters that the flow sets itself and that extra
@@ -190,8 +202,12 @@ Object subclass: OAuthFlows
   ///   (RFC 9207) must equal the session's issuer (`issuer_mismatch`).
   /// - A store already holding its cap of callback tickets answers
   ///   `session_store_full` (`SessionStore hasTicketRoom`) before the
-  ///   session is consumed, so the login can be retried; this is the one
-  ///   failure that does not burn the session.
+  ///   session is consumed, so the login can be retried; normally this is
+  ///   the one failure that does not burn the session. The room check and
+  ///   the ticket are separate store calls, though: when another callback
+  ///   takes the last ticket slot in between, `issueTicket:forState:`
+  ///   answers `session_store_full` after the session was consumed, and
+  ///   that session is burned (see `SessionStore hasTicketRoom`).
   ///
   /// Text taken from the callback (`iss`, `error_description`, an
   /// unregistered error code) is stripped of control characters and cut
@@ -370,6 +386,111 @@ Object subclass: OAuthFlows
     raw isEmpty ifTrue: [^#()]
     dissected := Erlang uri_string dissect_query: raw
     (dissected isKindOf: List) ifTrue: [dissected] ifFalse: [nil]
+
+  // ===== Native login =====
+
+  /// How many times `completeLoopbackLogin:...` re-arms after a refused
+  /// code, by default.
+  class defaultMaxRearms -> Integer => 3
+
+  /// As `completeLoopbackLogin:server:client:store:timeout:maxRearms:`
+  /// with `defaultMaxRearms` (3).
+  class completeLoopbackLogin: rx :: LoopbackReceiver server: server :: OAuthServer client: reg :: ClientRegistration store: store :: SessionStore timeout: timeoutMs :: Integer -> Result(TokenSet, OAuthError) =>
+    self
+      completeLoopbackLogin: rx
+      server: server
+      client: reg
+      store: store
+      timeout: timeoutMs
+      maxRearms: self defaultMaxRearms
+
+  /// Finish a native login: wait on `rx` for the callback, handle it with
+  /// `store` and `rx binding`, and exchange the code. Answers the
+  /// `TokenSet`, or the error that ended the login. `rx` is stopped
+  /// before this answers, either way.
+  ///
+  /// Call it after `rx expectState:` and after storing the session with
+  /// `rx binding`, as in the class comment. It blocks the calling process,
+  /// like `awaitCallback:`, for up to `timeoutMs` (`0..LoopbackReceiver
+  /// maxTimeout`) overall, however many times it re-arms.
+  ///
+  /// When the exchange answers the provider's `invalid_grant`, the code
+  /// was not one the provider issued for this flow, typically a forged
+  /// callback sent by a local process that read `state`. Then, while
+  /// fewer than `maxRearms` re-arms have been made and time is left, the
+  /// helper puts the session back in `store`, with the same PKCE verifier
+  /// and nonce, bound to `rx binding` and keeping its original expiry
+  /// (`SessionStore restore:boundTo:`), re-arms `rx` on the same port for
+  /// the same state (`LoopbackReceiver rearm`), and waits again for the
+  /// time left. Only `invalid_grant` re-arms. A provider `error=`
+  /// callback, any `handleCallback:store:boundTo:` failure, any other
+  /// exchange error, and a receiver timeout end the login at once with
+  /// their own error. When the cap or the overall timeout is reached
+  /// after an `invalid_grant`, that `invalid_grant` is answered; a wait
+  /// that runs out of time answers `callback_timeout`. A session that
+  /// cannot be put back (`expired_session`, `session_store_full`) or a
+  /// receiver that cannot be re-armed answers that error.
+  ///
+  /// The residual limit: a local process that reads `state` can still
+  /// delay the login until the cap or the timeout, or end it with a
+  /// forged `error=` callback, and a real redirect that lands before the
+  /// re-arm answers 404 and is lost. It cannot hijack the login: PKCE and
+  /// the session binding stop a forged code. `maxRearms` (`>= 0`; 0 never
+  /// re-arms) outside that range answers `config`.
+  class completeLoopbackLogin: rx :: LoopbackReceiver server: server :: OAuthServer client: reg :: ClientRegistration store: store :: SessionStore timeout: timeoutMs :: Integer maxRearms: maxRearms :: Integer -> Result(TokenSet, OAuthError) =>
+    [
+      self
+        loopbackLogin: rx
+        server: server
+        client: reg
+        store: store
+        timeout: timeoutMs
+        maxRearms: maxRearms
+    ] ensure: [rx stop]
+
+  /// The body of `completeLoopbackLogin:...`, which stops `rx` after it.
+  class loopbackLogin: rx :: LoopbackReceiver server: server :: OAuthServer client: reg :: ClientRegistration store: store :: SessionStore timeout: timeoutMs :: Integer maxRearms: maxRearms :: Integer -> Result(TokenSet, OAuthError) =>
+    ((timeoutMs isKindOf: Integer) and: [
+      timeoutMs >= 0 and: [timeoutMs <= LoopbackReceiver maxTimeout]
+    ])
+      ifFalse: [
+        ^Result error: (OAuthError config: "completeLoopbackLogin: timeout must be between 0 and {LoopbackReceiver maxTimeout} ms")
+      ]
+    ((maxRearms isKindOf: Integer) and: [maxRearms >= 0])
+      ifFalse: [
+        ^Result error: (OAuthError config: "completeLoopbackLogin: maxRearms must be an Integer >= 0")
+      ]
+    deadline := self monotonicMs + timeoutMs
+    rearms := 0
+    [true]
+      whileTrue: [
+        remaining := deadline - self monotonicMs
+        remaining < 0 ifTrue: [remaining := 0]
+        query := rx awaitCallback: remaining keepListening: true
+        query isError ifTrue: [^Result error: query error]
+        cb := self
+          handleCallback: query value
+          store: store
+          boundTo: rx binding
+        cb isError ifTrue: [^Result error: cb error]
+        toks := self
+          exchangeCode: server
+          client: reg
+          callback: cb value
+          store: store
+        (toks isOk or: [toks error code =/= "invalid_grant"]) ifTrue: [^toks]
+        (rearms < maxRearms and: [self monotonicMs < deadline]) ifFalse: [^toks]
+        restored := store restore: cb value session boundTo: rx binding
+        restored isError ifTrue: [^Result error: restored error]
+        rearmed := rx rearm
+        rearmed isError ifTrue: [^Result error: rearmed error]
+        rearms := rearms + 1
+      ]
+    // Not reached: every way out of the loop returns.
+    Result error: (OAuthError config: "completeLoopbackLogin: unreachable")
+
+  /// The monotonic clock, in ms, for the overall login deadline.
+  class monotonicMs -> Integer => Erlang erlang monotonic_time: #millisecond
 
   // ===== Code exchange =====
 

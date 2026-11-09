@@ -47,13 +47,14 @@
 /// `reused_state`, whether or not the session has been swept yet.
 ///
 /// There is no timer. Every `#sweepEvery`th store call (`create:boundTo:`,
-/// `consume:boundTo:`, `issueTicket:forState:`, `redeemTicket:forState:`)
-/// runs one `ets:select_delete/2` per table on the creation stamp, dropping
-/// the sessions and tickets past the grace, so abandoned attempts cannot
-/// accumulate. The sweep scans the table inside ETS without copying rows
-/// into the actor, and runs once per `#sweepEvery` calls, so a call costs
-/// amortised O(n / `#sweepEvery`) rather than O(n). A full store also
-/// sweeps before it refuses (see "Size cap").
+/// `restore:boundTo:`, `consume:boundTo:`, `issueTicket:forState:`,
+/// `redeemTicket:forState:`) runs one `ets:select_delete/2` per table on
+/// the creation stamp, dropping the sessions and tickets past the grace,
+/// so abandoned attempts cannot accumulate. The sweep scans the table
+/// inside ETS without copying rows into the actor, and runs once per
+/// `#sweepEvery` calls, so a call costs amortised O(n / `#sweepEvery`)
+/// rather than O(n). A full store also sweeps before it refuses (see
+/// "Size cap").
 ///
 /// ## Size cap
 ///
@@ -217,6 +218,48 @@ typed Actor subclass: SessionStore
     Erlang ets insert: self.table with: {key, stamp, stamped, digest}
     Result ok: stamped
 
+  /// Put back `sess`, a session this store answered from
+  /// `consume:boundTo:`, bound to `binding`, keeping its original
+  /// `createdAt`: a restored session expires when it would have had it
+  /// never been consumed, so restoring cannot extend its life. A
+  /// `createdAt` later than now counts as now.
+  ///
+  /// For `OAuthFlows completeLoopbackLogin:...`, which re-arms a native
+  /// login after a forged callback burned its session (BT-4572). Pass
+  /// the binding the session was created with: the store keeps only its
+  /// digest, so it cannot check that.
+  ///
+  /// Answers the session, or, storing nothing:
+  ///
+  /// - `expired_session` when it is past its TTL;
+  /// - `session_store_full` when `#maxSessions` sessions are held after a
+  ///   sweep (see "Size cap").
+  ///
+  /// Raises as `create:boundTo:` does: for a nil, empty or state-equal
+  /// binding, a session without state, or a state already stored.
+  restore: sess :: OAuthSession boundTo: binding :: String -> Result(OAuthSession, OAuthError) =>
+    digest := self digestOf: binding
+    sess state isEmpty ifTrue: [
+      self error: "SessionStore: the session has no state"
+    ]
+    binding =:= sess state ifTrue: [
+      self error: "SessionStore: the binding must not be the session's state"
+    ]
+    now := self clock
+    self tickAt: now
+    key := self keyOf: sess state
+    (Erlang ets member: self.table with: key) ifTrue: [
+      self error: "SessionStore: a session with this state is already stored"
+    ]
+    stamp := self stampFor: sess createdAt
+    stamp > now ifTrue: [stamp := now]
+    now >= (stamp + self.ttl) ifTrue: [^Result error: OAuthError expiredSession]
+    (self hasRoomIn: self.table at: now) ifFalse: [
+      ^Result error: OAuthError sessionStoreFull
+    ]
+    Erlang ets insert: self.table with: {key, stamp, sess, digest}
+    Result ok: sess
+
   /// Take the session stored under `state`, if `binding` matches the one
   /// it was created with.
   ///
@@ -329,6 +372,13 @@ typed Actor subclass: SessionStore
       Erlang erlang system_time: #millisecond
     ] ifFalse: [stamp]
 
+  /// The TTL-clock stamp for a session whose `createdAt` is `createdAt`:
+  /// the inverse of `createdAtFor:`.
+  internal stampFor: createdAt :: Integer -> Integer =>
+    self.now isNil ifTrue: [
+      createdAt - (Erlang erlang time_offset: #millisecond)
+    ] ifFalse: [createdAt]
+
   /// Count a store call made at `stamp`, sweeping on every
   /// `#sweepEvery`th.
   internal tickAt: stamp :: Integer -> Nil =>
@@ -361,8 +411,13 @@ typed Actor subclass: SessionStore
     next := stamp + ((self.ttl div: 10) max: 1)
     room
       ifFalse: [
-        stamps := Erlang ets select: table with: #({#'$1', #(), #({#element, 2, #'$1'})})
-        next := next max: (Erlang lists min: stamps) + self.ttl
+        // Each stamp wrapped in a 1-tuple: a bare list of stamps is a
+        // valid charlist whenever every stamp is a Unicode code point (an
+        // injected clock under 1114112), and would cross the FFI as a
+        // String.
+        stamps := Erlang ets select: table with: #({#'$1', #(), #({{{#element, 2, #'$1'}}})})
+        oldest := (Erlang lists min: stamps) at: 1
+        next := next max: oldest + self.ttl
       ]
     self.fullUntil := self.fullUntil at: table put: next
     room

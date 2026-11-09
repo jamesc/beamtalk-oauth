@@ -251,3 +251,161 @@ TestCase subclass: E2eNativeLoginTest
       callback: cb
       store: other
     self assert: elsewhere error code equals: "reused_state"
+
+  // ===== Re-arming after a forged callback (BT-4572) =====
+
+  // Registration, stored session and the authorize hop, without following
+  // the redirect: answers `{reg, sess, location}`, where `location` is the
+  // real callback URL the provider sent the browser to.
+  authorizeOnly: server :: OAuthServer -> Tuple =>
+    reg := (ClientRegistration forClient: FixtureProvider clientId redirect: self.rx redirectUri) unwrap
+    sess := OAuthSession newSessionFor: server client: reg
+    (self.store create: sess boundTo: self.rx binding) unwrap
+    self.rx expectState: sess state
+    url := (OAuthFlows
+      authorizeUrl: server
+      client: reg
+      scopes: #("openid", "profile")
+      session: sess) unwrap
+    authorize := (HTTPClient get: url) unwrap
+    self assert: authorize status equals: 302
+    {reg, sess, self header: "location" in: authorize}
+
+  // A forged callback for `sess`: a junk code with the real state.
+  junkFor: sess :: OAuthSession -> String =>
+    "{self.rx redirectUri}?code=junk&state={sess state urlEncoded}"
+
+  // GET `url` until the receiver records it (200), at most `tries` times,
+  // 20 ms apart: a stand-in for a callback that lands after a re-arm.
+  // Answers how many were recorded (0 or 1).
+  deliver: url :: String tries: tries :: Integer -> Integer =>
+    tries
+      timesRepeat: [
+        got := HTTPClient get: url
+        (got isOk and: [got value status =:= 200]) ifTrue: [^1]
+        Timer sleep: 20
+      ]
+    0
+
+  // The completion helper against `server`, default cap.
+  complete: server :: OAuthServer client: reg :: ClientRegistration timeout: ms :: Integer -> Result =>
+    OAuthFlows
+      completeLoopbackLogin: self.rx
+      server: server
+      client: reg
+      store: self.store
+      timeout: ms
+
+  testForgedCodeFirstStillLogsIn =>
+    server := self discovered
+    {reg, sess, location} := self authorizeOnly: server
+    junk := self junkFor: sess
+    // The local attacker's callback lands first; the real redirect is
+    // retried until the receiver has re-armed.
+    this := self
+    [
+      this deliver: junk tries: 1
+      this deliver: location tries: 200
+    ] fork
+    toks := (self
+      complete: server
+      client: reg
+      timeout: 10000) unwrap
+    self assert: toks subject equals: "user-1"
+    self assert: (self.provider hits: "/token") equals: 2
+    // The same session came back: same verifier, same nonce.
+    form := self.provider lastTokenRequest at: #form
+    self assert: (form at: "code") equals: "code-1"
+    self assert: (form at: "code_verifier") equals: sess codeVerifier
+    self assert: (toks idTokenClaims at: "nonce") equals: sess nonce
+    self assert: self.store size equals: 0
+    self deny: self.rx isListening
+
+  testRearmsAreCapped =>
+    server := self discovered
+    {reg, sess, _} := self authorizeOnly: server
+    junk := self junkFor: sess
+    this := self
+    // One forged callback, then one per re-arm, and one more that must
+    // never be recorded.
+    [5 timesRepeat: [this deliver: junk tries: 100]] fork
+    got := self
+      complete: server
+      client: reg
+      timeout: 10000
+    self assert: got error code equals: "invalid_grant"
+    self assert: (self.provider hits: "/token") equals: OAuthFlows defaultMaxRearms + 1
+    self deny: self.rx isListening
+
+  testZeroRearmsEndsOnTheFirstForgedCode =>
+    server := self discovered
+    {reg, sess, _} := self authorizeOnly: server
+    HTTPClient get: (self junkFor: sess)
+    got := OAuthFlows
+      completeLoopbackLogin: self.rx
+      server: server
+      client: reg
+      store: self.store
+      timeout: 5000
+      maxRearms: 0
+    self assert: got error code equals: "invalid_grant"
+    self assert: (self.provider hits: "/token") equals: 1
+    // The session was burned, not put back.
+    self assert: self.store size equals: 0
+    self deny: self.rx isListening
+
+  testProviderErrorCallbackIsNotRetried =>
+    server := self discovered
+    {reg, sess, _} := self authorizeOnly: server
+    HTTPClient get: "{self.rx redirectUri}?error=access_denied&state={sess state urlEncoded}"
+    got := self
+      complete: server
+      client: reg
+      timeout: 5000
+    self assert: got error code equals: "access_denied"
+    self assert: (self.provider hits: "/token") equals: 0
+    self assert: self.store size equals: 0
+    self deny: self.rx isListening
+
+  testOtherExchangeErrorsAreNotRetried =>
+    server := self discovered
+    {reg, _, location} := self authorizeOnly: server
+    self.provider
+      fail: "/token"
+      status: 400
+      body: #{"error" => "invalid_client"}
+    HTTPClient get: location
+    got := self
+      complete: server
+      client: reg
+      timeout: 5000
+    self assert: got error code equals: "invalid_client"
+    self assert: (self.provider hits: "/token") equals: 1
+    self deny: self.rx isListening
+
+  testTimeoutBoundsTheWholeLogin =>
+    server := self discovered
+    {reg, sess, _} := self authorizeOnly: server
+    // A forged callback re-arms, then nothing else comes.
+    HTTPClient get: (self junkFor: sess)
+    started := Erlang erlang monotonic_time: #millisecond
+    got := self
+      complete: server
+      client: reg
+      timeout: 500
+    elapsed := (Erlang erlang monotonic_time: #millisecond) - started
+    self assert: got error code equals: "callback_timeout"
+    self assert: (self.provider hits: "/token") equals: 1
+    self assert: elapsed < 2000
+    self deny: self.rx isListening
+
+  testBadArgumentsAnswerConfig =>
+    server := self discovered
+    {reg, _, _} := self authorizeOnly: server
+    self
+      assert: (self
+        complete: server
+        client: reg
+        timeout: -1) error code
+      equals: "config"
+    self deny: self.rx isListening

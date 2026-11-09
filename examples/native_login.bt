@@ -59,16 +59,14 @@ Object subclass: NativeLogin
       session: sess) unwrap
     Transcript showCr: "Open this URL in your browser and sign in:"
     Transcript showCr: url
-    query := (rx awaitCallback: 300000) unwrap
-    cb := (OAuthFlows
-      handleCallback: query
-      store: store
-      boundTo: rx binding) unwrap
+    // Waits for the redirect, handles it and exchanges the code; a
+    // forged callback with a junk code re-arms rather than ending it.
     toks := (OAuthFlows
-      exchangeCode: server
+      completeLoopbackLogin: rx
+      server: server
       client: reg
-      callback: cb
-      store: store) unwrap
+      store: store
+      timeout: 300000) unwrap
     // From here on the tokens are live: revoke them whatever happens.
     outcome := Result
       tryDo: [
