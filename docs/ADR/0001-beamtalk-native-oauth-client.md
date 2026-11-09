@@ -249,7 +249,7 @@ Object subclass: OAuthFlows
     // parses code/state/error/error_description/iss, rejects missing or
     // duplicate params, consumes the session with the user-agent binding
     // (see "Login CSRF" below)
-  class exchangeCode: server client: reg callback: cb -> Result(TokenSet, OAuthError) => ...
+  class exchangeCode: server client: reg callback: cb store: store -> Result(TokenSet, OAuthError) => ...
     // oidcc_token:retrieve; asserts the session's issuer and redirect URI
     // match server and reg; nonce and ID token checked by oidcc
   class refresh: server client: reg tokenSet: toks -> Result(TokenSet, OAuthError) => ...
@@ -464,14 +464,14 @@ url := (OAuthFlows authorizeUrl: server client: reg scopes: #("openid", "read_us
 Transcript showCr: url                    // or open the system browser
 query := (rx awaitCallback: 300000) unwrap
 cb := (OAuthFlows handleCallback: query store: store boundTo: rx binding) unwrap
-toks := (OAuthFlows exchangeCode: server client: reg callback: cb) unwrap
+toks := (OAuthFlows exchangeCode: server client: reg callback: cb store: store) unwrap
 toks subject                              // validated by oidcc
 ```
 
 ### Error example
 
 ```beamtalk
-result := OAuthFlows exchangeCode: server client: reg callback: usedCb
+result := OAuthFlows exchangeCode: server client: reg callback: usedCb store: store
 result isError            // => true
 (result error) code       // => "invalid_grant" (provider code, verbatim)
 ```

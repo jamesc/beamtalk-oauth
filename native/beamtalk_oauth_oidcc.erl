@@ -392,9 +392,19 @@ retrieve_token(_Provider, _Client, _Params) ->
 
 -doc """
 Refresh at `Provider`'s token endpoint with `oidcc_token:refresh/3`.
-`oidcc` requires the response's ID token and checks that its `sub` is
-`expected_subject` (`{error, sub_invalid}` otherwise, including when the
-response carries no ID token at all).
+
+The response may omit the ID token (OpenID Connect Core §12.2). When it
+has one, `oidcc` validates it (signature, `iss`, `aud`, expiry) and
+requires its `sub` to be `expected_subject` (`{error, sub_invalid}`
+otherwise). When it has none, `oidcc` still answers `sub_invalid`, so
+the shim reads the response body the adapter captured and answers its
+access token, refresh token, expiry and scope with `id_token => nil`;
+no identity is taken from it.
+
+`oidcc` also refuses to refresh unless the provider lists
+`refresh_token` in `grant_types_supported`, and RFC 8414's default for
+an absent member leaves it out. The shim adds it for this call: a
+provider that does not support the grant answers at its token endpoint.
 
 `Client` is as for `retrieve_token/3`; `Params` is
 `#{issuer, refresh_token, expected_subject}`, where `issuer` is the
@@ -402,7 +412,7 @@ issuer of the original ID token. Answers `{ok, token_to_map(Token)}`.
 """.
 -spec refresh_token(provider(), Client :: map(), Params :: map()) ->
     {ok, map()} | {error, term()}.
-refresh_token({beamtalk_oauth_provider, _} = Provider, Client, Params) when
+refresh_token({beamtalk_oauth_provider, _} = Provider0, Client, Params) when
     is_map(Client), is_map(Params)
 ->
     ensure_started(),
@@ -410,14 +420,107 @@ refresh_token({beamtalk_oauth_provider, _} = Provider, Client, Params) when
         {ok, [ClientId]} ?= required(Client, [client_id]),
         {ok, [Issuer, RefreshToken, Subject]} ?=
             required(Params, [issuer, refresh_token, expected_subject]),
-        ok ?= check_issuer(Provider, Issuer),
+        ok ?= check_issuer(Provider0, Issuer),
+        Provider = with_refresh_grant(Provider0),
         Context = client_context(Provider, ClientId, maps:get(client_secret, Client, nil)),
-        Opts = (call_opts(Provider))#{expected_subject => Subject},
-        {ok, Token} ?= guard(fun() -> oidcc_token:refresh(RefreshToken, Context, Opts) end),
-        {ok, token_to_map(Token)}
+        Opts = (capture(call_opts(Provider)))#{expected_subject => Subject},
+        _ = beamtalk_oauth_http_adapter:take_captured(),
+        try guard(fun() -> oidcc_token:refresh(RefreshToken, Context, Opts) end) of
+            {ok, Token} ->
+                {ok, token_to_map(Token)};
+            {error, sub_invalid} ->
+                without_id_token(beamtalk_oauth_http_adapter:take_captured());
+            {error, _} = Error ->
+                Error
+        after
+            beamtalk_oauth_http_adapter:take_captured()
+        end
     end;
 refresh_token(_Provider, _Client, _Params) ->
     {error, invalid_provider}.
+
+%% The provider with `refresh_token` among its grant types.
+with_refresh_grant({beamtalk_oauth_provider, #{config := Config} = Map}) ->
+    Grants =
+        case Config#oidcc_provider_configuration.grant_types_supported of
+            List when is_list(List) -> List;
+            _ -> []
+        end,
+    Config1 = Config#oidcc_provider_configuration{
+        grant_types_supported = lists:usort([<<"refresh_token">> | Grants])
+    },
+    {beamtalk_oauth_provider, Map#{config := Config1}}.
+
+%% `Opts` with the adapter told to capture POST response bodies.
+capture(#{request_opts := #{http_adapter := {Mod, Cfg}} = RequestOpts} = Opts) ->
+    Opts#{request_opts := RequestOpts#{http_adapter := {Mod, Cfg#{capture => true}}}}.
+
+%% A refresh response `oidcc` accepted but refused for having no ID token
+%% (`sub_invalid`): the token map without one. A response that does carry
+%% an ID token, or that cannot be read, stays `sub_invalid`.
+without_id_token(Body) when is_binary(Body) ->
+    try json:decode(Body) of
+        #{<<"access_token">> := Access} = Map when is_binary(Access) ->
+            case maps:get(<<"id_token">>, Map, null) of
+                null -> plain_token(Map);
+                _IdToken -> {error, sub_invalid}
+            end;
+        _ ->
+            {error, sub_invalid}
+    catch
+        _:_ -> {error, sub_invalid}
+    end;
+without_id_token(_None) ->
+    {error, sub_invalid}.
+
+plain_token(Map) ->
+    maybe
+        {ok, Type} ?= opt_text(Map, <<"token_type">>, <<"Bearer">>),
+        {ok, Refresh} ?= opt_text(Map, <<"refresh_token">>, nil),
+        {ok, Expires} ?= opt_expiry(maps:get(<<"expires_in">>, Map, null)),
+        {ok, Scope} ?= opt_scope(maps:get(<<"scope">>, Map, null)),
+        {ok, #{
+            access_token => str(maps:get(<<"access_token">>, Map)),
+            token_type => str(Type),
+            expires_in => Expires,
+            refresh_token => opt_tag(Refresh),
+            scope => Scope,
+            id_token => nil,
+            id_token_claims => nil
+        }}
+    end.
+
+opt_text(Map, Key, Default) ->
+    case maps:get(Key, Map, null) of
+        null -> {ok, Default};
+        Bin when is_binary(Bin) -> {ok, Bin};
+        _ -> {error, {invalid_property, binary_to_atom(Key)}}
+    end.
+
+opt_expiry(null) -> {ok, nil};
+opt_expiry(N) when is_integer(N) -> {ok, N};
+opt_expiry(Bin) when is_binary(Bin) ->
+    try
+        {ok, binary_to_integer(Bin)}
+    catch
+        error:badarg -> {error, {invalid_property, expires_in}}
+    end;
+opt_expiry(_) ->
+    {error, {invalid_property, expires_in}}.
+
+opt_scope(null) -> {ok, nil};
+opt_scope(<<>>) -> {ok, nil};
+opt_scope(Bin) when is_binary(Bin) -> {ok, str(Bin)};
+opt_scope(List) when is_list(List) ->
+    case lists:all(fun is_binary/1, List) of
+        true -> {ok, str(lists:join(<<" ">>, List))};
+        false -> {error, {invalid_property, scope}}
+    end;
+opt_scope(_) ->
+    {error, {invalid_property, scope}}.
+
+opt_tag(nil) -> nil;
+opt_tag(Bin) -> str(Bin).
 
 -doc """
 Userinfo from `Provider` with `oidcc_userinfo:retrieve/3`, the answer's

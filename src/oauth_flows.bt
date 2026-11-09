@@ -21,7 +21,12 @@
 /// add themselves:
 ///
 /// - `parse` — a callback with a missing, empty, non-text or duplicated
-///   parameter;
+///   parameter, or a malformed `error` code;
+/// - `provider_error` — the callback carried an `error` code that is not
+///   a registered authorization-error code (the provider's code is in
+///   `detail`), so it can never pose as one of this library's codes;
+/// - `reused_state` — also for a `Callback` that `handleCallback` did not
+///   make, or one already exchanged;
 /// - `session_mismatch` — the session belongs to another issuer or
 ///   redirect URI, or the server's own `oidcc` configuration names a
 ///   different issuer than `server issuer`; also from the store, for a
@@ -53,7 +58,7 @@
 /// url := (OAuthFlows authorizeUrl: server client: reg scopes: #("openid", "read_user") session: sess) unwrap
 /// query := (rx awaitCallback: 300000) unwrap
 /// cb := (OAuthFlows handleCallback: query store: store boundTo: rx binding) unwrap
-/// toks := (OAuthFlows exchangeCode: server client: reg callback: cb) unwrap
+/// toks := (OAuthFlows exchangeCode: server client: reg callback: cb store: store) unwrap
 /// toks subject                              // validated by oidcc
 /// toks := (OAuthFlows refresh: server client: reg tokenSet: toks) unwrap
 /// (OAuthFlows userInfo: server client: reg tokenSet: toks) unwrap
@@ -89,7 +94,8 @@ Object subclass: OAuthFlows
   /// (e.g. Google's `access_type=offline`) are added, then `extra`
   /// (String or Symbol keys, String values; `extra` wins on a clash). An
   /// extra naming a parameter the flow sets itself (`state`, `nonce`,
-  /// `code_challenge`, ...; see `reservedParams`) answers `config`.
+  /// `code_challenge`, ...; see `reservedParams`), in any letter case,
+  /// answers `config`.
   ///
   /// The session's issuer and redirect URI must match `server` and
   /// `reg` (`session_mismatch`), and the redirect URI must pass
@@ -139,7 +145,7 @@ Object subclass: OAuthFlows
             ]) ifTrue: [
               ^OAuthError config: "authorization parameters must be text: {k printString}"
             ]
-            (self reservedParams includes: name)
+            (self reservedParams includes: name lowercase)
               ifTrue: [
                 ^OAuthError config: "authorization parameter {name} is set by the flow and cannot be overridden"
               ]
@@ -162,40 +168,56 @@ Object subclass: OAuthFlows
   /// Dictionary, but its gate has already refused repeated parameters in
   /// the raw query.)
   ///
+  /// Every failure burns the session the callback names: any text `state`
+  /// value found in the query, even a malformed one, is consumed from
+  /// `store` with `binding` before the error is answered, so a probed or
+  /// broken callback cannot be retried.
+  ///
   /// - A missing or empty `code` or `state`, a parameter that is not text,
-  ///   or any parameter given twice (RFC 6749 §3.1) answers `parse`,
-  ///   without touching the store.
-  /// - A provider `error` answers an `OAuthError` with the provider's code
-  ///   verbatim (`access_denied`, ...) and its `error_description`; an
-  ///   empty code or one outside the RFC 6749 error charset answers
-  ///   `parse`. The code is whatever the redirect says, so an app should
-  ///   not trust it to tell provider and local failures apart. When
-  ///   the callback names a `state`, that session is consumed (burned)
-  ///   first, and a failed consume (wrong binding, unknown state) answers
-  ///   that error instead.
+  ///   or any parameter given twice (RFC 6749 §3.1) answers `parse`.
+  /// - A provider `error` answers an `OAuthError` with its
+  ///   `error_description`. A registered authorization-error code
+  ///   (`access_denied`, `login_required`, ...; see `providerErrorCodes`)
+  ///   is kept verbatim as the code; any other code answers
+  ///   `provider_error` with the provider's code as `detail`; an empty code
+  ///   or one outside the RFC 6749 error charset answers `parse`. A failed
+  ///   consume (wrong binding, unknown state) answers that error instead.
   /// - Otherwise the session is consumed from `store` with `binding`
   ///   (`SessionStore consume:boundTo:`: `session_mismatch`,
   ///   `reused_state`, `expired_session`), and an `iss` parameter
   ///   (RFC 9207) must equal the session's issuer (`issuer_mismatch`).
   ///
-  /// Answers a `Callback` for `exchangeCode:client:callback:`.
+  /// Text taken from the callback (`iss`, `error_description`, an
+  /// unregistered error code) is stripped of control characters and cut
+  /// to `maxEchoSize` characters before it goes into an error.
+  ///
+  /// Answers a `Callback` for `exchangeCode:client:callback:store:`, with a
+  /// single-use ticket recorded in `store`.
   class handleCallback: query :: Object store: store :: SessionStore boundTo: binding :: String -> Result(Callback, OAuthError) =>
     parsed := self parseQuery: query
-    (parsed isKindOf: OAuthError) ifTrue: [^Result error: parsed]
+    (parsed isKindOf: OAuthError)
+      ifTrue: [
+        self
+          burnStatesIn: query
+          store: store
+          boundTo: binding
+        ^Result error: parsed
+      ]
     state := parsed at: "state" ifAbsent: [""]
+    burned := state isEmpty ifTrue: [
+      nil
+    ] ifFalse: [store consume: state boundTo: binding]
     providerError := parsed at: "error" ifAbsent: [nil]
     providerError notNil
       ifTrue: [
         (providerError matchesRegex: self errorCodePattern) ifFalse: [
           ^Result error: (OAuthError parse: "callback error code is empty or malformed")
         ]
-        state isEmpty
-          ifFalse: [
-            burned := store consume: state boundTo: binding
-            burned isError ifTrue: [^Result error: burned error]
-          ]
+        (burned notNil and: [
+          burned isError
+        ]) ifTrue: [^Result error: burned error]
         ^Result
-          error: (OAuthError code: providerError description: (parsed at: "error_description" ifAbsent: [
+          error: (self providerError: providerError description: (parsed at: "error_description" ifAbsent: [
             ""
           ]))
       ]
@@ -203,22 +225,76 @@ Object subclass: OAuthFlows
     code isEmpty ifTrue: [
       ^Result error: (OAuthError parse: "callback has no code")
     ]
-    state isEmpty ifTrue: [
+    burned isNil ifTrue: [
       ^Result error: (OAuthError parse: "callback has no state")
     ]
-    consumed := store consume: state boundTo: binding
-    consumed isError ifTrue: [^Result error: consumed error]
-    sess := consumed value
+    burned isError ifTrue: [^Result error: burned error]
+    sess := burned value
     iss := parsed at: "iss" ifAbsent: [nil]
     (iss notNil and: [iss =/= sess issuer])
       ifTrue: [
-        ^Result error: (OAuthError code: "issuer_mismatch" description: "callback iss {iss} is not the session's issuer {sess issuer}")
+        ^Result error: (OAuthError code: "issuer_mismatch" description: "callback iss {self echo: iss} is not the session's issuer {sess issuer}")
       ]
+    ticket := Secrets generate
+    store issueTicket: ticket forState: sess state
     Result
       ok: (Callback
         code: code
         iss: iss
-        session: sess)
+        session: sess
+        ticket: ticket)
+
+  /// Consume, ignoring the outcome, every session named by a text `state`
+  /// value in `query`, however malformed the rest of it is.
+  class burnStatesIn: query :: Object store: store :: SessionStore boundTo: binding :: String -> Nil =>
+    pairs := self pairsOf: query
+    pairs isNil ifTrue: [^nil]
+    pairs
+      do: [:pair |
+        (((pair isKindOf: Tuple) or: [
+          pair isKindOf: List
+        ]) and: [pair size =:= 2])
+          ifTrue: [
+            name := self paramText: (pair at: 1)
+            value := (self paramText: (pair at: 2)) ifNil: [""]
+            ((name =:= "state") and: [
+              value isEmpty not
+            ]) ifTrue: [store consume: value boundTo: binding]
+          ]
+      ]
+    nil
+
+  /// The authorization-error codes kept verbatim from a callback: RFC 6749
+  /// §4.1.2.1 and OpenID Connect Core §3.1.2.6.
+  class providerErrorCodes -> List(String) =>
+    #("invalid_request", "unauthorized_client", "access_denied", "unsupported_response_type", "invalid_scope", "server_error", "temporarily_unavailable", "interaction_required", "login_required", "account_selection_required", "consent_required", "invalid_request_uri", "invalid_request_object", "request_not_supported", "request_uri_not_supported", "registration_not_supported")
+
+  /// The error for a callback `error` code: the code itself when it is a
+  /// registered one, `provider_error` with the code as `detail` otherwise.
+  class providerError: code :: String description: description :: String -> OAuthError =>
+    text := self echo: description
+    (self providerErrorCodes includes: code) ifTrue: [
+      ^OAuthError code: code description: text
+    ]
+    shown := self echo: code
+    suffix := text isEmpty ifTrue: [""] ifFalse: [": {text}"]
+    OAuthError
+      new: #{
+        #code => "provider_error",
+        #description => "provider error {shown}{suffix}",
+        #detail => shown
+      }
+
+  /// The most characters of callback text echoed into an error.
+  class maxEchoSize -> Integer => 200
+
+  /// `text` from a callback, safe to put in an error: control characters
+  /// removed and cut to `maxEchoSize` characters.
+  class echo: text :: String -> String =>
+    clean := text replaceAllRegex: "[[:cntrl:]]" with: ""
+    clean size > self maxEchoSize ifTrue: [
+      clean take: self maxEchoSize
+    ] ifFalse: [clean]
 
   /// RFC 6749 §4.1.2.1: an `error` value is one or more characters in
   /// %x20-21 / %x23-5B / %x5D-7E (printable ASCII but `"` and `\`).
@@ -285,7 +361,13 @@ Object subclass: OAuthFlows
 
   /// Exchange the callback's code for tokens.
   ///
-  /// Before any network call: the redirect URI must pass
+  /// First the callback's single-use ticket is redeemed from `store` (the
+  /// store `handleCallback` used): a `Callback` that `handleCallback` did
+  /// not make, or one already exchanged, answers `reused_state`; one whose
+  /// session was swapped answers `session_mismatch`. The ticket is spent
+  /// whatever happens next.
+  ///
+  /// Then, still before any network call: the redirect URI must pass
   /// `ClientRegistration checkRedirect:`; the session's issuer must equal
   /// `server issuer` and its redirect URI `reg redirectUri`
   /// (`session_mismatch`, the mix-up defence). The shim then checks,
@@ -297,13 +379,15 @@ Object subclass: OAuthFlows
   ///
   /// Then `oidcc_token:retrieve` sends the code with the PKCE verifier and
   /// client authentication, and validates the ID token, including the
-  /// session's nonce (`missing_claim` on a mismatch). Provider errors pass
-  /// through verbatim (`invalid_grant`, ...). A response without an ID
-  /// token answers `missing_id_token`. Answers a `TokenSet` with
-  /// the validated `idTokenClaims`, the raw `idToken`, and `obtainedAt`
-  /// stamped when the request was sent.
-  class exchangeCode: server :: OAuthServer client: reg :: ClientRegistration callback: cb :: Callback -> Result(TokenSet, OAuthError) =>
+  /// session's nonce (`missing_claim` on a mismatch) and audience. Provider
+  /// errors pass through verbatim (`invalid_grant`, ...). A response
+  /// without an ID token answers `missing_id_token`. Answers a `TokenSet`
+  /// with the validated `idTokenClaims`, the raw `idToken`, and
+  /// `obtainedAt` stamped when the request was sent.
+  class exchangeCode: server :: OAuthServer client: reg :: ClientRegistration callback: cb :: Callback store: store :: SessionStore -> Result(TokenSet, OAuthError) =>
     sess := cb session
+    redeemed := store redeemTicket: cb ticket forState: sess state
+    redeemed isError ifTrue: [^Result error: redeemed error]
     (self
       checkSession: sess
       server: server
@@ -333,13 +417,18 @@ Object subclass: OAuthFlows
   /// `iss` is `server issuer` and whose `aud` names `reg clientId`
   /// (`config` / `issuer_mismatch` / `session_mismatch`, before any
   /// network call): the refresh token is never sent to another provider
-  /// or under another client's credentials. `oidcc_token:refresh` requires
-  /// an ID token in the response and checks that its `sub` equals
-  /// `toks subject`; either failing answers `sub_invalid`.
+  /// or under another client's credentials.
+  ///
+  /// The response may omit the ID token (OpenID Connect Core §12.2). When
+  /// it has one, `oidcc` validates it (signature, `iss`, `aud`, expiry)
+  /// and requires its `sub` to equal `toks subject` (`sub_invalid`
+  /// otherwise). Refresh does not depend on the provider listing
+  /// `refresh_token` in `grant_types_supported`.
   ///
   /// Answers `toks mergedWith:` the response: new values win, and the old
-  /// refresh token, scope and ID token carry forward when the response
-  /// omits them. Store the answer; the old refresh token may be spent.
+  /// refresh token, scope and ID token (raw JWT and claims together) carry
+  /// forward when the response omits them. Store the answer; the old
+  /// refresh token may be spent.
   class refresh: server :: OAuthServer client: reg :: ClientRegistration tokenSet: toks :: TokenSet -> Result(TokenSet, OAuthError) =>
     refreshToken := toks refreshToken
     (refreshToken isNil or: [
@@ -371,8 +460,13 @@ Object subclass: OAuthFlows
 
   /// The userinfo claims for `toks`. As `userInfo:client:tokenSet:`, with
   /// the client id taken from the validated ID token (`azp`, else a
-  /// single `aud`), and no client secret. Pass the registration when the
-  /// provider signs userinfo with the client secret.
+  /// single `aud`), and no client secret.
+  ///
+  /// This variant has no client binding: the client id comes from the
+  /// tokens themselves, so it cannot tell that `toks` was issued to this
+  /// app. Prefer `userInfo:client:tokenSet:`, which also checks the ID
+  /// token's `aud` against the registration, and which a provider that
+  /// signs userinfo with the client secret needs.
   class userInfo: server :: OAuthServer tokenSet: toks :: TokenSet -> Result(Dictionary, OAuthError) =>
     claims := toks idTokenClaims
     claims isNil ifTrue: [
