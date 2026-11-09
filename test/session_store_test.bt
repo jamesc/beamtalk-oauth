@@ -16,6 +16,12 @@ TestCase subclass: SessionStoreTest
   storeWith: clock =>
     SessionStore spawnWith: #{#ttl => 1000, #now => [clock time]}
 
+  /// `storeWith:`, plus the spawn options in `options`.
+  storeWith: clock options: options =>
+    SessionStore spawnWith: ((options at: #ttl put: 1000) at: #now put: [
+      clock time
+    ])
+
   /// A fresh session from the same setUp recipe, with another state.
   otherSession =>
     server := OAuthServer new: #{#issuer => "https://gitlab.com"}
@@ -29,8 +35,15 @@ TestCase subclass: SessionStoreTest
   // === create:boundTo: ===
   testCreateStoresSession =>
     store := SessionStore spawn
-    self assert: (store create: self.session boundTo: self.binding) isNil
+    self assert: (store create: self.session boundTo: self.binding) isOk
     self assert: store size equals: 1
+
+  testCreateAnswersStampedSession =>
+    clock := FakeClock spawnWith: #{#time => 7000}
+    store := self storeWith: clock
+    stored := (store create: self.session boundTo: self.binding) unwrap
+    self assert: stored createdAt equals: 7000
+    self assert: stored state equals: self.session state
 
   testCreateStampsCreatedAt =>
     clock := FakeClock spawnWith: #{#time => 5000}
@@ -93,6 +106,31 @@ TestCase subclass: SessionStoreTest
     self should: [
       SessionStore spawnWith: #{#ttl => nil}
     ] raise: #instantiation_error
+
+  testSpawnRejectsBadMaxSessions =>
+    self should: [
+      SessionStore spawnWith: #{#maxSessions => 0}
+    ] raise: #instantiation_error
+    @expect type
+    self should: [
+      SessionStore spawnWith: #{#maxSessions => "many"}
+    ] raise: #instantiation_error
+
+  testSpawnRejectsBadSweepEvery =>
+    self should: [
+      SessionStore spawnWith: #{#sweepEvery => 0}
+    ] raise: #instantiation_error
+    @expect type
+    self should: [
+      SessionStore spawnWith: #{#sweepEvery => nil}
+    ] raise: #instantiation_error
+
+  testDefaultCapAndSweepInterval =>
+    self assert: SessionStore defaultMaxSessions equals: 10000
+    self assert: SessionStore defaultSweepEvery equals: 64
+    store := SessionStore spawn
+    self assert: (store fieldAt: #maxSessions) equals: 10000
+    self assert: (store fieldAt: #sweepEvery) equals: 64
 
   testSpawnRejectsBadClock =>
     @expect type
@@ -198,7 +236,7 @@ TestCase subclass: SessionStoreTest
   // === sweep ===
   testSweepDropsAbandonedSessions =>
     clock := FakeClock spawnWith: #{#time => 0}
-    store := self storeWith: clock
+    store := self storeWith: clock options: #{#sweepEvery => 1}
     store create: self.session boundTo: self.binding
     clock time: 900
     late := self otherSession
@@ -217,11 +255,124 @@ TestCase subclass: SessionStoreTest
 
   testSweepRunsOnConsume =>
     clock := FakeClock spawnWith: #{#time => 0}
-    store := self storeWith: clock
+    store := self storeWith: clock options: #{#sweepEvery => 1}
     store create: self.session boundTo: self.binding
     clock time: 5000
     store consume: Secrets generate boundTo: self.binding
     self assert: store size equals: 0
+
+  testSweepRunsEveryKCalls =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock options: #{#sweepEvery => 3}
+    store create: self.session boundTo: self.binding
+    clock time: 5000
+    store consume: Secrets generate boundTo: self.binding
+    // Two calls so far: no sweep yet.
+    self assert: store size equals: 1
+    store consume: Secrets generate boundTo: self.binding
+    self assert: store size equals: 0
+
+  testSweepCountsTicketCalls =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock options: #{#sweepEvery => 3}
+    store create: self.session boundTo: self.binding
+    store issueTicket: Secrets generate forState: self.session state
+    clock time: 5000
+    store redeemTicket: Secrets generate forState: self.session state
+    self assert: store size equals: 0
+    self assert: store ticketCount equals: 0
+
+  testStaleUnsweptSessionIsReused =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock
+    store create: self.session boundTo: self.binding
+    clock time: 2000
+    // Past the grace but not yet swept: the same answer as once swept.
+    self assert: store size equals: 1
+    out := store consume: self.session state boundTo: self.binding
+    self assert: out error code equals: "reused_state"
+    self assert: store size equals: 0
+
+  testStaleUnsweptTicketIsReused =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock
+    ticket := Secrets generate
+    store issueTicket: ticket forState: self.session state
+    clock time: 1500
+    out := store redeemTicket: ticket forState: self.session state
+    self assert: out error code equals: "expired_session"
+    other := Secrets generate
+    store issueTicket: other forState: self.session state
+    clock time: 3500
+    self assert: (store redeemTicket: other forState: self.session state) error code equals: "reused_state"
+
+  // === size cap ===
+  testCapRejects =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock options: #{#maxSessions => 2}
+    self assert: (store create: self.session boundTo: self.binding) isOk
+    self assert: (store create: self otherSession boundTo: self.binding) isOk
+    extra := self otherSession
+    out := store create: extra boundTo: self.binding
+    self assert: out isError
+    self assert: out error code equals: "session_store_full"
+    self assert: store size equals: 2
+    // Nothing was stored for the refused login.
+    self assert: (store consume: extra state boundTo: self.binding) error code equals: "reused_state"
+
+  testCapDoesNotEvictLiveSessions =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock options: #{#maxSessions => 1}
+    store create: self.session boundTo: self.binding
+    // Expired but within the grace: still held, so still counted.
+    clock time: 1500
+    self assert: (store create: self otherSession boundTo: self.binding) error code equals: "session_store_full"
+    self assert: (store consume: self.session state boundTo: self.binding) error code equals: "expired_session"
+
+  testSweepFreesRoomWhenFull =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock options: #{#maxSessions => 2}
+    store create: self.session boundTo: self.binding
+    store create: self otherSession boundTo: self.binding
+    clock time: 2000
+    // Full, but both sessions are past the grace: the full store sweeps
+    // before it refuses, though the call count is far from #sweepEvery.
+    fresh := self otherSession
+    self assert: (store create: fresh boundTo: self.binding) isOk
+    self assert: store size equals: 1
+    self assert: (store consume: fresh state boundTo: self.binding) isOk
+
+  testConsumeWorksWhenFull =>
+    store := SessionStore spawnWith: #{#maxSessions => 1}
+    store create: self.session boundTo: self.binding
+    late := self otherSession
+    self assert: (store create: late boundTo: self.binding) error code equals: "session_store_full"
+    got := store consume: self.session state boundTo: self.binding
+    self assert: got isOk
+    // The consume freed the slot.
+    self assert: (store create: late boundTo: self.binding) isOk
+
+  testTicketCapIsSeparate =>
+    store := SessionStore spawnWith: #{#maxSessions => 1}
+    store create: self.session boundTo: self.binding
+    // A full session table does not stop a ticket.
+    first := Secrets generate
+    self assert: (store issueTicket: first forState: self.session state) isOk
+    self assert: store ticketCount equals: 1
+    second := Secrets generate
+    out := store issueTicket: second forState: self.session state
+    self assert: out error code equals: "session_store_full"
+    self assert: store ticketCount equals: 1
+    self assert: (store redeemTicket: first forState: self.session state) isOk
+    self assert: (store issueTicket: second forState: self.session state) isOk
+
+  testTicketSweepFreesRoomWhenFull =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock options: #{#maxSessions => 1}
+    store issueTicket: Secrets generate forState: self.session state
+    clock time: 2000
+    self assert: (store issueTicket: Secrets generate forState: self.session state) isOk
+    self assert: store ticketCount equals: 1
 
   // === redaction ===
   testStatusRedactsSessionsAndBindings =>

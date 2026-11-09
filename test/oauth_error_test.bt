@@ -15,6 +15,7 @@ TestCase subclass: OAuthErrorTest
     self assert: OAuthError reusedState code equals: "reused_state"
     self assert: OAuthError sessionMismatch code equals: "session_mismatch"
     self assert: OAuthError callbackTimeout code equals: "callback_timeout"
+    self assert: OAuthError sessionStoreFull code equals: "session_store_full"
     self assert: (OAuthError callbackTimeoutRefusing: 0) description equals: OAuthError callbackTimeout description
     refused := OAuthError callbackTimeoutRefusing: 3
     self assert: refused code equals: "callback_timeout"

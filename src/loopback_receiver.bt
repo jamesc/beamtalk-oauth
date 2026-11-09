@@ -24,7 +24,7 @@
 ///
 /// ```beamtalk
 /// sess := OAuthSession newSessionFor: server client: reg
-/// store create: sess boundTo: rx binding
+/// (store create: sess boundTo: rx binding) unwrap
 /// rx expectState: sess state
 /// url := (OAuthFlows authorizeUrl: server client: reg scopes: scopes session: sess) unwrap
 /// query := (rx awaitCallback: 300000) unwrap

@@ -20,8 +20,11 @@
 /// URL carries `state` and so proves nothing about the user agent.
 ///
 /// The app spawns the store explicitly; there is no global store.
-/// `spawnWith:` takes `#ttl` (milliseconds, 10 minutes by default) and
-/// `#now` (a block answering the time in milliseconds, for tests). By
+/// `spawnWith:` takes `#ttl` (milliseconds, 10 minutes by default),
+/// `#maxSessions` (the most sessions held at once, 10,000 by default; see
+/// "Size cap"), `#sweepEvery` (store calls between sweeps, 64 by default;
+/// see "Expiry and the sweep") and `#now` (a block answering the time in
+/// milliseconds, for tests). By
 /// default TTLs run on the monotonic clock, so wall-clock steps neither
 /// extend nor cut short a session, and `createdAt` is stamped in Unix
 /// milliseconds; with `#now`, both use the injected clock.
@@ -37,18 +40,52 @@
 /// ## Expiry and the sweep
 ///
 /// A session is expired once `ttl` has passed since `create:boundTo:`.
-/// Every `create:boundTo:` and `consume:boundTo:` first sweeps the store
-/// (there is no timer), dropping sessions that expired more than one
-/// further `ttl` ago, so abandoned attempts cannot accumulate. Within that
-/// grace a late callback answers `expired_session`; after it the state is
-/// unknown and answers `reused_state`.
+/// Within one further `ttl` of grace a late callback answers
+/// `expired_session`; after it the state counts as unknown and answers
+/// `reused_state`, whether or not the session has been swept yet.
+///
+/// There is no timer. Every `#sweepEvery`th store call (`create:boundTo:`,
+/// `consume:boundTo:`, `issueTicket:forState:`, `redeemTicket:forState:`)
+/// runs one `ets:select_delete/2` per table on the creation stamp, dropping
+/// the sessions and tickets past the grace, so abandoned attempts cannot
+/// accumulate. The sweep runs inside ETS without copying rows into the
+/// actor, and only once per `#sweepEvery` calls, so the other calls cost
+/// O(1). A full store also sweeps before it refuses anything.
+///
+/// ## Size cap
+///
+/// `#maxSessions` bounds the sessions held, so a server-side web app that
+/// creates a session on an unauthenticated `GET /login` cannot be grown
+/// without bound. When the store is full, `create:boundTo:` sweeps; if it
+/// is still full it answers `session_store_full` and stores nothing.
+///
+/// The store rejects new logins rather than evicting old sessions.
+/// Evicting the oldest session would let a flood push out a user who is
+/// already mid-login, whose callback would then fail with `reused_state`.
+/// Rejecting means a flood can block new logins until its own sessions
+/// age out, but it cannot break a login already started, and the failure
+/// is visible: monitor `session_store_full` and `size`. `consume:boundTo:`
+/// is never refused, so logins in flight still complete when the store is
+/// full, and each one frees a slot. The cap is a backstop, not a rate
+/// limit: rate-limit login starts in the web layer.
+///
+/// Callback tickets have their own cap, also `#maxSessions`, counted
+/// apart from sessions (`ticketCount`). Each ticket stands for a session
+/// consumed with its binding, so tickets cannot be made faster than
+/// sessions, but each one frees a session slot as it is made, so without
+/// a cap a loop of login and callback could grow the ticket table without
+/// bound. Counting them apart keeps a full session table from failing the
+/// callback of a login already in flight. When the ticket table is full
+/// after a sweep, `issueTicket:forState:` answers `session_store_full`,
+/// and so does `OAuthFlows handleCallback:store:boundTo:`.
 ///
 /// ## Callback tickets
 ///
 /// `OAuthFlows handleCallback:store:boundTo:` records a single-use ticket
 /// here for the callback it accepted, and `exchangeCode:client:callback:store:`
 /// redeems it before any network call, so a `Callback` built by hand, or
-/// one exchanged twice, is refused. `size` counts sessions only.
+/// one exchanged twice, is refused. `size` counts sessions only;
+/// `ticketCount` counts tickets.
 ///
 /// ## Redaction
 ///
@@ -69,7 +106,7 @@
 /// ```beamtalk
 /// store := SessionStore spawn
 /// binding := Secrets generate
-/// store create: sess boundTo: binding
+/// (store create: sess boundTo: binding) unwrap
 /// (store consume: sess state boundTo: binding) unwrap   // => the session
 /// (store consume: sess state boundTo: binding) error code
 /// // => "reused_state"
@@ -85,18 +122,41 @@ typed Actor subclass: SessionStore
   /// The private ETS table of callback tickets: `{ticketDigest, stamp,
   /// stateDigest}` rows. See "Callback tickets".
   state: tickets :: Object = nil
+  /// The most sessions held at once, and separately the most callback
+  /// tickets. See "Size cap".
+  state: maxSessions :: Integer = 10000
+  /// Store calls between sweeps. See "Expiry and the sweep".
+  state: sweepEvery :: Integer = 64
+  /// Store calls since the last sweep.
+  state: calls :: Integer = 0
 
   /// The default session lifetime: 10 minutes, in milliseconds.
   class defaultTtl -> Integer => 600000
 
-  /// Check the configuration and create the private table. A `#ttl` that
-  /// is not a positive Integer, or a `#now` that is not a Block, fails the
-  /// spawn.
+  /// The default cap on sessions held at once (and on tickets).
+  class defaultMaxSessions -> Integer => 10000
+
+  /// The default number of store calls between sweeps.
+  class defaultSweepEvery -> Integer => 64
+
+  /// Check the configuration and create the private tables. A `#ttl`,
+  /// `#maxSessions` or `#sweepEvery` that is not a positive Integer, or a
+  /// `#now` that is not a Block, fails the spawn.
   initialize -> Nil =>
     ((self.ttl isKindOf: Integer) and: [
       self.ttl > 0
     ]) ifFalse: [
       self error: "SessionStore: #ttl must be a positive Integer of milliseconds"
+    ]
+    ((self.maxSessions isKindOf: Integer) and: [
+      self.maxSessions > 0
+    ]) ifFalse: [
+      self error: "SessionStore: #maxSessions must be a positive Integer"
+    ]
+    ((self.sweepEvery isKindOf: Integer) and: [
+      self.sweepEvery > 0
+    ]) ifFalse: [
+      self error: "SessionStore: #sweepEvery must be a positive Integer"
     ]
     (self.now isNil or: [
       self.now isKindOf: Block
@@ -110,10 +170,14 @@ typed Actor subclass: SessionStore
   /// Store `sess` under its `state`, bound to `binding`, and stamp its
   /// `createdAt` with the current time.
   ///
+  /// Answers the stored session, with `createdAt` stamped, or
+  /// `session_store_full` when `#maxSessions` sessions are still held
+  /// after a sweep; then nothing is stored (see "Size cap").
+  ///
   /// Raises when `binding` is nil, empty or equal to the session's state,
   /// when `sess` has no state, or when a session with the same state is
   /// already stored: each is a programming error.
-  create: sess :: OAuthSession boundTo: binding :: String -> Nil =>
+  create: sess :: OAuthSession boundTo: binding :: String -> Result(OAuthSession, OAuthError) =>
     digest := self digestOf: binding
     sess state isEmpty ifTrue: [
       self error: "SessionStore: the session has no state"
@@ -122,14 +186,17 @@ typed Actor subclass: SessionStore
       self error: "SessionStore: the binding must not be the session's state"
     ]
     stamp := self clock
-    self sweepAt: stamp
+    self tickAt: stamp
     key := self keyOf: sess state
     (Erlang ets member: self.table with: key) ifTrue: [
       self error: "SessionStore: a session with this state is already stored"
     ]
+    (self hasRoomIn: self.table at: stamp) ifFalse: [
+      ^Result error: OAuthError sessionStoreFull
+    ]
     stamped := sess withCreatedAt: (self createdAtFor: stamp)
     Erlang ets insert: self.table with: {key, stamp, stamped, digest}
-    nil
+    Result ok: stamped
 
   /// Take the session stored under `state`, if `binding` matches the one
   /// it was created with.
@@ -138,7 +205,8 @@ typed Actor subclass: SessionStore
   /// `OAuthError`:
   ///
   /// - `reused_state` when no session is stored under `state` (unknown,
-  ///   already consumed, or swept);
+  ///   already consumed, or past the grace of one further TTL, swept or
+  ///   not);
   /// - `session_mismatch` when `binding` differs, compared in constant
   ///   time (`crypto:hash_equals/2` over SHA-256 digests);
   /// - `expired_session` when the session is past its TTL.
@@ -149,10 +217,13 @@ typed Actor subclass: SessionStore
   consume: state :: String boundTo: binding :: String -> Result(OAuthSession, OAuthError) =>
     digest := self digestOf: binding
     stamp := self clock
-    self sweepAt: stamp
+    self tickAt: stamp
     rows := Erlang ets take: self.table with: (self keyOf: state)
     rows isEmpty ifTrue: [^Result error: OAuthError reusedState]
     {_, created, sess, stored} := rows first
+    (self isStale: created at: stamp) ifTrue: [
+      ^Result error: OAuthError reusedState
+    ]
     (Erlang crypto hash_equals: stored with: digest) ifFalse: [
       ^Result error: OAuthError sessionMismatch
     ]
@@ -165,39 +236,52 @@ typed Actor subclass: SessionStore
   /// For tests and monitoring.
   size -> Integer => Erlang ets info: self.table with: #size
 
+  /// The number of callback tickets held, including expired ones not yet
+  /// swept. For tests and monitoring.
+  ticketCount -> Integer => Erlang ets info: self.tickets with: #size
+
   /// Record `ticket`, a single-use proof that the session with `state`
   /// was consumed by `OAuthFlows handleCallback:store:boundTo:`. Kept as
   /// SHA-256 digests, like sessions, and expiring after the same TTL.
+  ///
+  /// Answers nil, or `session_store_full` when `#maxSessions` tickets are
+  /// still held after a sweep; then nothing is recorded (see "Size cap").
   /// Raises when `ticket` is nil, empty or already recorded.
-  issueTicket: ticket :: String forState: state :: String -> Nil =>
+  issueTicket: ticket :: String forState: state :: String -> Result(Nil, OAuthError) =>
     ((ticket isKindOf: String) and: [
       ticket isEmpty not
     ]) ifFalse: [
       self error: "SessionStore: a callback ticket must be a non-empty String"
     ]
     stamp := self clock
-    self sweepAt: stamp
+    self tickAt: stamp
     key := self keyOf: ticket
     (Erlang ets member: self.tickets with: key) ifTrue: [
       self error: "SessionStore: this callback ticket is already recorded"
     ]
+    (self hasRoomIn: self.tickets at: stamp) ifFalse: [
+      ^Result error: OAuthError sessionStoreFull
+    ]
     Erlang ets insert: self.tickets with: {key, stamp, self keyOf: state}
-    nil
+    Result ok: nil
 
   /// Take `ticket`, recorded by `issueTicket:forState:` for `state`.
   /// Single use: the ticket is removed whatever the outcome. Answers nil,
   /// or an `OAuthError`:
   ///
   /// - `reused_state` when no such ticket is held (never issued, already
-  ///   redeemed, or swept);
+  ///   redeemed, or past the grace of one further TTL, swept or not);
   /// - `session_mismatch` when it was issued for another state;
   /// - `expired_session` when it is past the TTL.
   redeemTicket: ticket :: String forState: state :: String -> Result(Nil, OAuthError) =>
     stamp := self clock
-    self sweepAt: stamp
+    self tickAt: stamp
     rows := Erlang ets take: self.tickets with: (self keyOf: ticket)
     rows isEmpty ifTrue: [^Result error: OAuthError reusedState]
     {_, created, stateKey} := rows first
+    (self isStale: created at: stamp) ifTrue: [
+      ^Result error: OAuthError reusedState
+    ]
     (Erlang crypto hash_equals: stateKey with: (self keyOf: state)) ifFalse: [
       ^Result error: OAuthError sessionMismatch
     ]
@@ -220,22 +304,33 @@ typed Actor subclass: SessionStore
       Erlang erlang system_time: #millisecond
     ] ifFalse: [stamp]
 
-  /// Drop the sessions that expired more than one further TTL before
-  /// `stamp`.
+  /// Count a store call made at `stamp`, sweeping on every
+  /// `#sweepEvery`th.
+  internal tickAt: stamp :: Integer -> Nil =>
+    self.calls := self.calls + 1
+    self.calls >= self.sweepEvery ifTrue: [self sweepAt: stamp]
+    nil
+
+  /// Whether a row stamped `created` is past its grace at `stamp`: expired
+  /// more than one further TTL ago, and so due for the sweep.
+  internal isStale: created :: Integer at: stamp :: Integer -> Boolean =>
+    created <= (stamp - (2 * self.ttl))
+
+  /// Whether `table` holds fewer than `#maxSessions` rows at `stamp`,
+  /// sweeping first when it is full.
+  internal hasRoomIn: table :: Object at: stamp :: Integer -> Boolean =>
+    (Erlang ets info: table with: #size) < self.maxSessions ifTrue: [^true]
+    self sweepAt: stamp
+    (Erlang ets info: table with: #size) < self.maxSessions
+
+  /// Drop the sessions and tickets that are stale at `stamp` (see
+  /// `isStale:at:`), with one `ets:select_delete/2` per table on the
+  /// creation stamp, and restart the call count.
   internal sweepAt: stamp :: Integer -> Nil =>
     cutoff := stamp - (2 * self.ttl)
-    (Erlang ets tab2list: self.tickets)
-      do: [:ticketRow :: Tuple |
-        {ticketKey, issued, _} := ticketRow
-        issued <= cutoff ifTrue: [
-          Erlang ets delete: self.tickets with: ticketKey
-        ]
-      ]
-    (Erlang ets tab2list: self.table)
-      do: [:row :: Tuple |
-        {key, created, _, _} := row
-        created <= cutoff ifTrue: [Erlang ets delete: self.table with: key]
-      ]
+    Erlang ets select_delete: self.table with: #({{#_, #'$1', #_, #_}, #({#'=<', #'$1', cutoff}), #(true)})
+    Erlang ets select_delete: self.tickets with: #({{#_, #'$1', #_}, #({#'=<', #'$1', cutoff}), #(true)})
+    self.calls := 0
     nil
 
   /// The table key for `state`: its SHA-256 digest, a raw binary (a

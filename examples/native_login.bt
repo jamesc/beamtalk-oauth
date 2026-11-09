@@ -49,7 +49,7 @@ Object subclass: NativeLogin
   class login: server :: OAuthServer client: clientId :: String receiver: rx :: LoopbackReceiver store: store :: SessionStore -> String =>
     reg := (ClientRegistration forClient: clientId redirect: rx redirectUri) unwrap
     sess := OAuthSession newSessionFor: server client: reg
-    store create: sess boundTo: rx binding
+    (store create: sess boundTo: rx binding) unwrap
     // Before the URL is opened: the receiver only records this state.
     rx expectState: sess state
     url := (OAuthFlows
