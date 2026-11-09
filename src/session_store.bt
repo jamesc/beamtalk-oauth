@@ -57,7 +57,10 @@
 /// `#maxSessions` bounds the sessions held, so a server-side web app that
 /// creates a session on an unauthenticated `GET /login` cannot be grown
 /// without bound. When the store is full, `create:boundTo:` sweeps; if it
-/// is still full it answers `session_store_full` and stores nothing.
+/// is still full it answers `session_store_full` and stores nothing. It
+/// then notes when its oldest session will go stale and refuses without
+/// sweeping until that time, so a flood against a full store costs O(1)
+/// per refused call rather than a sweep each.
 ///
 /// The store rejects new logins rather than evicting old sessions.
 /// Evicting the oldest session would let a flood push out a user who is
@@ -129,6 +132,9 @@ typed Actor subclass: SessionStore
   state: sweepEvery :: Integer = 64
   /// Store calls since the last sweep.
   state: calls :: Integer = 0
+  /// Per full table, the stamp before which no sweep can free a row: its
+  /// oldest row's stamp plus two TTLs. See "Size cap".
+  state: fullUntil :: Dictionary = #{}
 
   /// The default session lifetime: 10 minutes, in milliseconds.
   class defaultTtl -> Integer => 600000
@@ -318,18 +324,30 @@ typed Actor subclass: SessionStore
 
   /// Whether `table` holds fewer than `#maxSessions` rows at `stamp`,
   /// sweeping first when it is full.
+  ///
+  /// A sweep that frees nothing records when the oldest row will go stale,
+  /// and until then a full table refuses without sweeping again, so a
+  /// flood against a full store costs O(1) per refused call. Rows are
+  /// stamped in clock order, so no later row can go stale first.
   internal hasRoomIn: table :: Object at: stamp :: Integer -> Boolean =>
     (Erlang ets info: table with: #size) < self.maxSessions ifTrue: [^true]
+    until := self.fullUntil at: table ifAbsent: [nil]
+    (until notNil and: [stamp < until]) ifTrue: [^false]
     self sweepAt: stamp
-    (Erlang ets info: table with: #size) < self.maxSessions
+    (Erlang ets info: table with: #size) < self.maxSessions ifTrue: [^true]
+    stamps := Erlang ets select: table with: #({#'$1', #(), #({#element, 2, #'$1'})})
+    self.fullUntil := self.fullUntil at: table put: (Erlang lists min: stamps) + (2 * self.ttl)
+    false
 
   /// Drop the sessions and tickets that are stale at `stamp` (see
   /// `isStale:at:`), with one `ets:select_delete/2` per table on the
-  /// creation stamp, and restart the call count.
+  /// creation stamp (each row's second element), and restart the call
+  /// count.
   internal sweepAt: stamp :: Integer -> Nil =>
     cutoff := stamp - (2 * self.ttl)
-    Erlang ets select_delete: self.table with: #({{#_, #'$1', #_, #_}, #({#'=<', #'$1', cutoff}), #(true)})
-    Erlang ets select_delete: self.tickets with: #({{#_, #'$1', #_}, #({#'=<', #'$1', cutoff}), #(true)})
+    stale := #({#'$1', #({#'=<', {#element, 2, #'$1'}, cutoff}), #(true)})
+    Erlang ets select_delete: self.table with: stale
+    Erlang ets select_delete: self.tickets with: stale
     self.calls := 0
     nil
 

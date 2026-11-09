@@ -342,6 +342,26 @@ TestCase subclass: SessionStoreTest
     self assert: store size equals: 1
     self assert: (store consume: fresh state boundTo: self.binding) isOk
 
+  testFullStoreSkipsSweepUntilOldestGoesStale =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock options: #{#maxSessions => 2}
+    store create: self.session boundTo: self.binding
+    clock time: 500
+    second := self otherSession
+    store create: second boundTo: self.binding
+    clock time: 1000
+    self assert: (store create: self otherSession boundTo: self.binding) error code equals: "session_store_full"
+    // The oldest row goes stale at 0 + 2 * ttl: refused until then.
+    self assert: (store fieldAt: #fullUntil) values asList equals: #(2000)
+    clock time: 1999
+    self assert: (store create: self otherSession boundTo: self.binding) error code equals: "session_store_full"
+    clock time: 2000
+    third := self otherSession
+    self assert: (store create: third boundTo: self.binding) isOk
+    self assert: store size equals: 2
+    self assert: (store consume: second state boundTo: self.binding) error code equals: "expired_session"
+    self assert: (store consume: third state boundTo: self.binding) isOk
+
   testConsumeWorksWhenFull =>
     store := SessionStore spawnWith: #{#maxSessions => 1}
     store create: self.session boundTo: self.binding
