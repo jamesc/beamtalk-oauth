@@ -30,8 +30,8 @@
 ///
 /// Options, as for `OAuthServer fromDiscovery:preset:options:`
 /// (`#maxBodyBytes`, `#timeout`, test-only `#allowUnsafeHttp`), plus
-/// `#backoffMin` and `#backoffMax` (ms) and `#backoffType` (`#stop`,
-/// `#exponential`, `#random`, `#random_exponential`) for failed loads.
+/// `#backoffMin` and `#backoffMax` (ms) and `#backoffType`
+/// (`#exponential`, `#random`, `#random_exponential`) for failed loads.
 ///
 /// ## In a supervision tree
 /// `supervisionSpecFor:` takes the same Dictionary as `startWith:`
@@ -137,8 +137,10 @@ Actor subclass: ProviderWorker native: beamtalk_oauth_provider_worker
   /// names a non-HTTPS endpoint.
   server -> Result(OAuthServer, OAuthError) => self delegate
 
-  /// Reload the configuration and JWKS now, and wait for both. Normally
-  /// the worker reloads on its own when they expire.
+  /// Reload the configuration and JWKS now, waiting up to 4.5 s for both.
+  /// Normally the worker reloads on its own when they expire. A failed
+  /// reload is not reported here: the worker keeps its current
+  /// configuration and keys and retries with backoff.
   refresh -> Nil => self delegate
 
   /// The issuer the worker was started with.

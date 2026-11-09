@@ -27,7 +27,9 @@ TestCase subclass: NativeLayerTest
       preset: #{}
       options: #{#allowUnsafeHttp => true}) unwrap
 
-  adapterConfig -> Dictionary => #{#client => HTTPClient}
+  // The fixture is plain HTTP on loopback: the test-only opt-in.
+  adapterConfig -> Dictionary =>
+    #{#client => HTTPClient, #allow_unsafe_http => true}
 
   confidential -> Dictionary =>
     #{
@@ -66,6 +68,27 @@ TestCase subclass: NativeLayerTest
     ]
     self assert: (names includes: "content-type")
     self assert: (body asStringUnchecked includesSubstring: "token_endpoint")
+
+  adapterGet: url :: String config: cfg :: Dictionary -> Result =>
+    Erlang beamtalk_oauth_http_adapter
+      request: #get
+      with: {self bin: url, #()}
+      with: #()
+      with: #()
+      with: cfg
+
+  testAdapterRefusesPlainHttp =>
+    // oidcc accepts a plain-HTTP jwks_uri; the adapter does not. Refused
+    // before any request, and the reason carries no URL.
+    local := "{self.provider issuer}/jwks"
+    strict := self adapterGet: local config: #{#client => HTTPClient}
+    self assert: strict error reason equals: {#http_client, #insecure_url}
+    // The opt-in admits loopback hosts only.
+    remote := self adapterGet: "http://example.com/jwks" config: self adapterConfig
+    self assert: remote error reason equals: {#http_client, #insecure_url}
+    self assert: (self.provider hits: "/jwks") equals: 0
+    self assertOk: (self adapterGet: local config: self adapterConfig)
+    self assert: (self.provider hits: "/jwks") equals: 1
 
   testAdapterErrorCarriesNoRequest =>
     srv := HTTPServer start: 0 handler: [:req |

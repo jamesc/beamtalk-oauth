@@ -28,11 +28,17 @@ Config (the `spawnWith:` map, Symbol keys arriving as atoms):
 * `options` — `#{allowUnsafeHttp, maxBodyBytes, timeout}` as for
   `OAuthServer fromDiscovery:preset:options:`, plus `backoffMin`,
   `backoffMax` (ms) and `backoffType` for failed loads (default
-  `random_exponential`, 1 s to 30 s: the worker keeps retrying instead of
-  stopping).
+  `random_exponential`, 1 s to 30 s). oidcc's `stop` backoff is refused:
+  the worker keeps retrying instead of exiting.
 
 The state holds no secrets (no client credentials ever reach it), and
-`format_status/1` shows only the issuer and the `oidcc` worker's pid.
+`format_status/1` shows only the issuer and the `oidcc` worker's pid. The
+`oidcc` worker has no `format_status/1`: its status and crash reports show
+its load options (the adapter config and document overrides) and the
+public configuration and keys, none of them secret.
+
+Every request either process makes goes through the HTTP adapter, which
+refuses non-HTTPS URLs; `oidcc` alone would fetch a plain-HTTP `jwks_uri`.
 """.
 
 -behaviour(gen_server).
@@ -42,16 +48,18 @@ The state holds no secrets (no client credentials ever reach it), and
 -export([start_link/1, check/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, format_status/1]).
 
-%% Inner calls to the oidcc worker stay below the 5 s Beamtalk actor-call
-%% timeout, so a slow first load answers an error instead of the caller
-%% timing out.
+%% Every handle_call here finishes its calls to the oidcc worker within
+%% this budget, below the 5 s Beamtalk actor-call timeout, so a slow load
+%% answers an error instead of the caller timing out.
 -define(CALL_TIMEOUT, 4500).
 
 -define(KNOWN_OPTIONS, [
     allowUnsafeHttp, maxBodyBytes, timeout, backoffMin, backoffMax, backoffType
 ]).
 
--define(BACKOFF_TYPES, [stop, exponential, random, random_exponential]).
+%% No `stop`: the oidcc worker would exit on one failed refresh, and the
+%% link would take this process (and an unsupervised caller) with it.
+-define(BACKOFF_TYPES, [exponential, random, random_exponential]).
 
 -doc "Start the worker (the native-actor facade calls this with the `spawnWith:` map).".
 -spec start_link(map()) -> gen_server:start_ret().
@@ -130,19 +138,26 @@ handle_call({server, []}, _From, State) ->
         try
             {ok, server(State)}
         catch
-            Class:Reason:Stack -> {error, {Class, Reason, Stack}}
+            %% No stacktrace: its frames would carry the configuration.
+            Class:Reason -> {error, {Class, Reason}}
         end,
     {reply, Reply, State};
 handle_call({refresh, []}, _From, #{worker := Worker} = State) ->
-    Answer =
-        try
-            ok = oidcc_provider_configuration_worker:refresh_configuration(Worker),
-            ok = oidcc_provider_configuration_worker:refresh_jwks(Worker),
-            nil
-        catch
-            exit:{timeout, _} -> nil
-        end,
-    {reply, {ok, Answer}, State};
+    Deadline = deadline(),
+    %% A JWKS reload before any configuration has loaded crashes the oidcc
+    %% worker (it reads `jwks_uri` from the missing configuration), so only
+    %% the configuration is reloaded then; its first load chains the JWKS.
+    case fetch(Worker, get_provider_configuration, Deadline) of
+        {ok, _Config} ->
+            gen_server:cast(Worker, refresh_configuration),
+            gen_server:cast(Worker, refresh_jwks);
+        {error, _} ->
+            gen_server:cast(Worker, refresh_configuration)
+    end,
+    %% Answered after both reloads ran (the oidcc worker handles messages in
+    %% order); a failed reload stays in its backoff, as it would on expiry.
+    _ = fetch(Worker, get_jwks, Deadline),
+    {reply, {ok, nil}, State};
 handle_call({issuer, []}, _From, #{issuer := Issuer} = State) ->
     {reply, {ok, {beamtalk_string, Issuer}}, State};
 handle_call({oidccWorker, []}, _From, #{worker := Worker} = State) ->
@@ -196,15 +211,22 @@ send_class(ClassName, Selector, Args) ->
 %% reads them. Errors when the first load has not
 %% finished (or keeps failing) and when an endpoint is not HTTPS.
 server_info(#{worker := Worker, unsafe := Unsafe, request_opts := RequestOpts}) ->
+    Deadline = deadline(),
     maybe
-        {ok, Config} ?= fetch(Worker, get_provider_configuration),
-        {ok, Jwks} ?= fetch(Worker, get_jwks),
+        {ok, Config} ?= fetch(Worker, get_provider_configuration, Deadline),
         ok ?= beamtalk_oauth_oidcc:check_endpoints(Config, Unsafe),
+        {ok, Jwks} ?= fetch(Worker, get_jwks, Deadline),
         {ok, beamtalk_oauth_oidcc:provider_info(Config, Jwks, RequestOpts, Worker)}
     end.
 
-fetch(Worker, Call) ->
-    try gen_server:call(Worker, Call, ?CALL_TIMEOUT) of
+deadline() ->
+    erlang:monotonic_time(millisecond) + ?CALL_TIMEOUT.
+
+%% A call to the oidcc worker that finishes by `Deadline'. `undefined'
+%% (nothing loaded yet) and a timeout are `provider_unavailable'.
+fetch(Worker, Call, Deadline) ->
+    Timeout = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    try gen_server:call(Worker, Call, Timeout) of
         undefined -> {error, provider_unavailable};
         Value -> {ok, Value}
     catch

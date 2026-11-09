@@ -58,6 +58,10 @@ from the HTTPS-only check and `{http_client, Reason}` from the adapter.
 %% laptop clocks drift (ADR 0001, Open Question 8).
 -define(MAX_CLOCK_SKEW, 60).
 
+%% How long token validation waits for a `ProviderWorker`'s JWKS reload
+%% before loading the keys itself.
+-define(WORKER_JWKS_TIMEOUT, 3000).
+
 %% Endpoint fields of the provider configuration that must be HTTPS.
 -define(ENDPOINT_FIELDS, [
     issuer,
@@ -241,12 +245,16 @@ call_opts({beamtalk_oauth_provider, #{config := Config, request_opts := RequestO
 
 %% Ask the worker to reload its JWKS for `Kid' (it skips the reload when it
 %% already has that key) and answer its keys. A worker that has stopped,
-%% or has no keys, falls back to `Direct'.
+%% has no keys or does not answer within ?WORKER_JWKS_TIMEOUT falls back
+%% to `Direct'.
+%%
+%% The cast is what `oidcc_provider_configuration_worker:
+%% refresh_jwks_for_unknown_kid/2' sends; that function then waits with
+%% the default 5 s call timeout, too long inside a Beamtalk actor call.
+%% The worker handles the cast before the `get_jwks' call.
 worker_jwks(Worker, Kid, Direct) ->
-    try
-        ok = oidcc_provider_configuration_worker:refresh_jwks_for_unknown_kid(Worker, Kid),
-        oidcc_provider_configuration_worker:get_jwks(Worker)
-    of
+    gen_server:cast(Worker, {refresh_jwks_for_unknown_kid, Kid}),
+    try gen_server:call(Worker, get_jwks, ?WORKER_JWKS_TIMEOUT) of
         undefined -> Direct();
         Jwks -> {ok, Jwks}
     catch
@@ -259,12 +267,16 @@ map of URLs, as in `mtls_endpoint_aliases`) is HTTPS;
 `{error, {insecure_endpoint, Field, Url}}` for the first that is not.
 With `AllowUnsafe`, plain HTTP is also accepted on a loopback host
 (`127.0.0.1`, `::1`, `localhost`), never elsewhere. Absent fields
-(`undefined`, `null`, `nil`) are skipped.
+(`undefined`, `null`, `nil`) are skipped. The HTTP adapter checks each
+request URL as the field `request_url`.
 """.
 -spec check_https(Endpoints :: map(), AllowUnsafe :: boolean()) ->
     ok | {error, {insecure_endpoint, atom() | binary(), term()}}.
 check_https(Endpoints, AllowUnsafe) when is_map(Endpoints) ->
-    Fields = [F || F <- ?ENDPOINT_FIELDS ++ [mtls_endpoint_aliases], maps:is_key(F, Endpoints)],
+    Fields = [
+        F
+     || F <- ?ENDPOINT_FIELDS ++ [mtls_endpoint_aliases, request_url], maps:is_key(F, Endpoints)
+    ],
     check_fields(Fields, Endpoints, AllowUnsafe =:= true).
 
 check_fields([], _Endpoints, _Unsafe) ->
@@ -439,7 +451,10 @@ config_map(Config) ->
     ).
 
 request_opts(Opts) ->
-    AdapterCfg0 = #{client => maps:get(client, Opts)},
+    AdapterCfg0 = #{
+        client => maps:get(client, Opts),
+        allow_unsafe_http => maps:get(allow_unsafe_http, Opts, false) =:= true
+    },
     AdapterCfg =
         case maps:find(max_body_bytes, Opts) of
             {ok, Max} -> AdapterCfg0#{max_body_bytes => Max};

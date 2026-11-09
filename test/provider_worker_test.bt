@@ -144,12 +144,47 @@ TestCase subclass: ProviderWorkerTest
     self assert: (ProviderWorker preset: #{}) error code equals: "config"
 
   testUnreachableProviderIsUnavailable =>
+    self.worker := self unreachableWorker
+    self assert: self.worker server error code equals: "provider_unavailable"
+    self assert: self.worker isAlive
+
+  testRefreshBeforeFirstLoadKeepsRunning =>
+    // A JWKS reload with no configuration would crash the oidcc worker.
+    self.worker := self unreachableWorker
+    self assert: self.worker refresh equals: nil
+    self assert: self.worker isAlive
+    self assert: self.worker server error code equals: "provider_unavailable"
+
+  testStopBackoffIsRefused =>
+    err := (ProviderWorker
+      issuer: self.provider issuer
+      preset: #{}
+      options: #{#allowUnsafeHttp => true, #backoffType => #stop}) error
+    self assert: err code equals: "config"
+
+  testPlainHttpJwksIsNeverFetched =>
+    // oidcc accepts a plain-HTTP jwks_uri and its worker fetches it at
+    // once; the adapter refuses the request.
+    self.provider discoveryOverrides: #{"jwks_uri" => "http://example.com/jwks"}
+    self.worker := (ProviderWorker
+      issuer: self.provider issuer
+      preset: #{}
+      options: #{
+        #allowUnsafeHttp => true,
+        #backoffMin => 60000,
+        #backoffMax => 60000
+      }) unwrap
+    self assert: self.worker server error code equals: "insecure_endpoint"
+    self assert: self.worker isAlive
+
+  // A worker for a closed port, retrying only once a minute.
+  unreachableWorker -> ProviderWorker =>
     srv := HTTPServer start: 0 handler: [:req |
       HTTPResponse new: #{#status => 404}
     ]
     port := srv port
     srv stop
-    self.worker := (ProviderWorker
+    (ProviderWorker
       issuer: "http://127.0.0.1:{port}"
       preset: #{}
       options: #{
@@ -157,8 +192,6 @@ TestCase subclass: ProviderWorkerTest
         #backoffMin => 60000,
         #backoffMax => 60000
       }) unwrap
-    self assert: self.worker server error code equals: "provider_unavailable"
-    self assert: self.worker isAlive
 
   // ===== process =====
   testStatusShowsNoSecrets =>
