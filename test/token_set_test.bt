@@ -107,3 +107,34 @@ TestCase subclass: TokenSetTest
     json := (TokenSet new: #{#accessToken => "a"}) asJson
     self assert: (json at: "refreshToken") equals: nil
     self assert: (json at: "idToken") equals: nil
+
+  testShortLifetimeMarginIsHalved =>
+    t := TokenSet new: #{
+      #accessToken => "a",
+      #expiresIn => 30,
+      #obtainedAt => 1000
+    }
+    self deny: (t needsRefreshAt: 1000)
+    self deny: (t needsRefreshAt: 1014)
+    self assert: (t needsRefreshAt: 1015)
+
+  testZeroLifetimeIsExpiredImmediately =>
+    t := TokenSet new: #{
+      #accessToken => "a",
+      #expiresIn => 0,
+      #obtainedAt => 1000
+    }
+    self assert: (t isExpiredAt: 1000)
+    self assert: (t needsRefreshAt: 1000)
+
+  testMergeKeepsNewJwtWithoutClaims =>
+    response := TokenSet new: #{
+      #accessToken => "access-BBB333",
+      #idToken => "eyJ.new.jwt"
+    }
+    merged := self.tokens mergedWith: response
+    self assert: merged idToken equals: "eyJ.new.jwt"
+    self assert: merged idTokenClaims equals: nil
+
+  testDisplayStringRedactsTokens =>
+    self deny: (self.tokens displayString includesSubstring: "access-AAA111")

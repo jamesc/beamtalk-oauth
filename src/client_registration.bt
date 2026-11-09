@@ -35,20 +35,30 @@ typed Value subclass: ClientRegistration
       secret: nil
       redirect: uri
 
-  /// A registration with a secret (which may be nil), validated.
+  /// A registration with a secret, validated. A nil or empty secret
+  /// makes a public client.
+  ///
+  /// Only these constructors validate. `withRedirectUri:`, `new:` and the
+  /// keyword constructor do not, so flows re-check the redirect with
+  /// `checkRedirect:` before using it.
   class forClient: id :: String secret: secret :: String | Nil redirect: uri :: String -> Result(ClientRegistration, OAuthError) =>
     id isEmpty ifTrue: [
       ^Result error: (OAuthError config: "client id is empty")
     ]
     (self checkRedirect: uri) ifNotNil: [:err | ^Result error: err]
+    kept := (secret notNil and: [
+      secret isEmpty
+    ]) ifTrue: [nil] ifFalse: [secret]
     Result
       ok: (self
         clientId: id
-        clientSecret: secret
+        clientSecret: kept
         redirectUri: uri)
 
   /// nil when `uri` is an acceptable redirect URI, the `OAuthError`
-  /// otherwise.
+  /// otherwise: `insecure_endpoint` for a scheme or host other than https
+  /// or loopback-IP http (including `localhost` under any scheme), `config`
+  /// for a malformed URI, a missing host, userinfo or a fragment.
   class checkRedirect: uri :: String -> OAuthError | Nil =>
     parsed := Erlang uri_string parse: uri
     (parsed isKindOf: Dictionary) ifFalse: [
@@ -57,9 +67,16 @@ typed Value subclass: ClientRegistration
     (parsed includesKey: #fragment) ifTrue: [
       ^OAuthError config: "redirect URI must not contain a fragment: {uri}"
     ]
+    (parsed includesKey: #userinfo) ifTrue: [
+      ^OAuthError config: "redirect URI must not contain userinfo: {uri}"
+    ]
     scheme := (parsed at: #scheme ifAbsent: [""]) asStringUnchecked lowercase
     host := (parsed at: #host ifAbsent: [""]) asStringUnchecked lowercase
     host isEmpty ifTrue: [^OAuthError config: "redirect URI has no host: {uri}"]
+    (host =:= "localhost" or: [host endsWith: ".localhost"])
+      ifTrue: [
+        ^OAuthError insecureEndpoint: "redirect URI must use 127.0.0.1 or [::1], not localhost (RFC 8252 §8.3): {uri}"
+      ]
     scheme =:= "https" ifTrue: [^nil]
     (scheme =:= "http" and: [
       host =:= "127.0.0.1" or: [host =:= "::1"]

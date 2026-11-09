@@ -77,21 +77,26 @@ typed Value subclass: OAuthError
   ///   atom's name (`missing_claim`, `token_expired`, ...).
   /// - Anything else answers `transport`.
   ///
-  /// A wrapping `{error, Reason}` is unwrapped first. `detail` always holds
-  /// the redacted original term (see `redact:`).
+  /// Wrapping `{error, Reason}` tuples are unwrapped first, at any depth.
+  /// `undefined`, `true` and `false` are not reasons and answer `transport`.
+  /// `detail` always holds the redacted original term (see `redact:`).
   class fromOidcc: reason :: Object -> OAuthError =>
     term := reason
-    ((term isKindOf: Tuple) and: [
-      (term size =:= 2) and: [(term at: 1) =:= #error]
-    ]) ifTrue: [term := term at: 2]
+    [
+      (term isKindOf: Tuple) and: [
+        (term size =:= 2) and: [(term at: 1) =:= #error]
+      ]
+    ] whileTrue: [term := term at: 2]
     detail := self redact: term
-    (term isKindOf: Symbol) ifTrue: [
-      ^self new: #{#code => term asString, #detail => detail}
-    ]
-    ((term isKindOf: Tuple) and: [
-      (term size >= 1) and: [(term at: 1) isKindOf: Symbol]
-    ])
+    tag := (term isKindOf: Symbol)
+      ifTrue: [term]
       ifFalse: [
+        ((term isKindOf: Tuple) and: [
+          (term size >= 1) and: [(term at: 1) isKindOf: Symbol]
+        ]) ifTrue: [term at: 1] ifFalse: [nil]
+      ]
+    (tag isNil or: [#(#undefined, #true, #false) includes: tag])
+      ifTrue: [
         ^self
           new: #{
             #code => "transport",
@@ -99,10 +104,14 @@ typed Value subclass: OAuthError
             #detail => detail
           }
       ]
-    tag := term at: 1
-    ((tag =:= #http_error) and: [
-      (term size >= 2) and: [(term at: 2) isKindOf: Integer]
-    ]) ifTrue: [^self fromHttpError: term detail: detail]
+    // `term` is a Tuple here: only a tuple reason can carry this tag and a status.
+    @expect type
+    ((tag =:= #http_error)
+      and: [
+        (term isKindOf: Tuple) and: [
+          (term size >= 2) and: [(term at: 2) isKindOf: Integer]
+        ]
+      ]) ifTrue: [^self fromHttpError: term detail: detail]
     self new: #{#code => tag asString, #detail => detail}
 
   /// `{http_error, Status, Body}`: the provider's `error` member when the
@@ -155,32 +164,50 @@ typed Value subclass: OAuthError
   /// The marker that replaces redacted values.
   class redacted -> String => "[redacted]"
 
-  /// `term` with secrets removed, for `detail` and logs.
+  /// `term` with secrets removed, for `detail` and logs. Redaction errs
+  /// towards hiding: the marker `"[redacted]"` replaces
   ///
-  /// - a binary or String that looks like a JWT (`eyJ...` with dot-separated
-  ///   base64url segments) or an opaque token (20+ characters of token
-  ///   alphabet with both letters and digits), or that is not valid UTF-8,
-  ///   becomes `"[redacted]"`;
-  /// - a map with a `sub` or `iss` member (an ID-token claims map) becomes
-  ///   `"[redacted]"`;
-  /// - in any other map, the values of `access_token`, `refresh_token`,
-  ///   `id_token`, `code`, `code_verifier`, `client_secret`, `nonce` and
-  ///   `assertion` become `"[redacted]"`;
-  /// - tuples, lists and other map values are redacted recursively;
-  /// - everything else is kept.
+  /// - any binary or String that `looksSecret:`;
+  /// - `oidcc` token and client-context records and `jose` key records
+  ///   (tuples tagged `oidcc_token*`, `oidcc_client_context`, `jose_jw*`),
+  ///   whole;
+  /// - a claims map: any map with a `sub`, `iss`, `aud`, `exp` or `email`
+  ///   member;
+  /// - the value of a `secretKeys` member, in a map or as a `{Key, Value}`
+  ///   pair (keyword lists).
+  ///
+  /// Tuples, lists and other map values are redacted recursively; anything
+  /// else (atoms, numbers, pids) is kept.
   class redact: term :: Object -> Object =>
     (term isKindOf: Binary) ifTrue: [
       ^(self looksSecret: term) ifTrue: [self redacted] ifFalse: [term]
     ]
-    (term isKindOf: Tuple) ifTrue: [
-      ^Tuple withAll: ((1 to: term size) collect: [:i |
-        self redact: (term at: i)
-      ])
-    ]
+    (term isKindOf: Tuple) ifTrue: [^self redactTuple: term]
     @expect type
     (term isKindOf: List) ifTrue: [^term collect: [:each | self redact: each]]
     (term isKindOf: Dictionary) ifTrue: [^self redactMap: term]
     term
+
+  /// Secret-bearing records become the marker, a `{SecretKey, Value}` pair
+  /// keeps its key, and other tuples are redacted element by element.
+  class redactTuple: tuple :: Tuple -> Object =>
+    tuple size =:= 0 ifTrue: [^tuple]
+    tag := self textOf: (tuple at: 1)
+    tag notNil
+      ifTrue: [
+        ((tuple at: 1) isKindOf: Symbol)
+          ifTrue: [
+            (self secretRecordPrefixes anySatisfy: [:prefix |
+              tag startsWith: prefix
+            ]) ifTrue: [^self redacted]
+          ]
+        ((tuple size =:= 2) and: [
+          self secretKeys includes: tag
+        ]) ifTrue: [^{tuple at: 1, self redacted}]
+      ]
+    Tuple withAll: ((1 to: tuple size) collect: [:i |
+      self redact: (tuple at: i)
+    ])
 
   /// A claims map becomes the marker; any other map keeps its keys, with
   /// secret-named members replaced and the rest redacted recursively.
@@ -190,7 +217,7 @@ typed Value subclass: OAuthError
     map
       keysAndValuesDo: [:k :v |
         name := self textOf: k
-        (name =:= "sub" or: [name =:= "iss"]) ifTrue: [isClaims := true]
+        (self claimKeys includes: name) ifTrue: [isClaims := true]
       ]
     isClaims ifTrue: [^self redacted]
     out := #{}
@@ -207,21 +234,31 @@ typed Value subclass: OAuthError
 
   /// Member names whose values are always secret.
   class secretKeys -> List(String) =>
-    #("access_token", "refresh_token", "id_token", "code", "code_verifier", "client_secret", "nonce", "assertion")
+    #("access_token", "refresh_token", "id_token", "id_token_hint", "logout_token", "token", "code", "code_verifier", "client_secret", "client_assertion", "assertion", "device_code", "password", "nonce", "k", "d")
 
-  /// True when `bin` looks like a token, a JWT, or is not valid UTF-8.
+  /// Member names that mark a map as ID-token or userinfo claims.
+  class claimKeys -> List(String) => #("sub", "iss", "aud", "exp", "email")
+
+  /// Record tags (atom prefixes) whose tuples always hold secrets.
+  class secretRecordPrefixes -> List(String) =>
+    #("oidcc_token", "oidcc_client_context", "jose_jw")
+
+  /// True when `bin` should not appear in a detail: invalid UTF-8; anything
+  /// containing a JWT (`eyJ...` segment pair), an auth scheme (`Bearer `,
+  /// `Basic `) or a secret query parameter (`code=`, `token=`, `secret=`,
+  /// `password=`, `assertion=`); or 16+ characters without whitespace,
+  /// unless it is an http(s) URL with no query or fragment (an issuer or
+  /// endpoint).
   class looksSecret: bin :: Binary -> Boolean =>
     text := self textOf: bin
     text isNil ifTrue: [^true]
-    (text matchesRegex: "^eyJ[A-Za-z0-9_-]*([.][A-Za-z0-9_-]*)\{2,4}$") ifTrue: [
+    (text matchesRegex: "eyJ[A-Za-z0-9_-]+[.][A-Za-z0-9_-]+") ifTrue: [^true]
+    (text matchesRegex: "(?i)(bearer|basic|dpop) +[^ ]") ifTrue: [^true]
+    (text matchesRegex: "(?i)(code|token|secret|password|assertion|verifier)=") ifTrue: [
       ^true
     ]
-    (text size >= 20)
-      and: [
-        (text matchesRegex: "^[A-Za-z0-9._~+/=-]+$") and: [
-          (text matchesRegex: "[0-9]") and: [text matchesRegex: "[A-Za-z]"]
-        ]
-      ]
+    (text matchesRegex: "^(?i)https?://[^?#[:space:]]*$") ifTrue: [^false]
+    (text size >= 16) and: [(text matchesRegex: "[[:space:]]") not]
 
   /// `OAuthError(code, status: 400): description`. `detail` is not shown.
   printString -> String =>
@@ -232,3 +269,15 @@ typed Value subclass: OAuthError
       ""
     ] ifFalse: [": {self.description}"]
     "OAuthError({self.code}{statusPart}){descPart}"
+
+  /// The JSON shape. `detail` is an Erlang term, so it appears as the
+  /// printString of its redacted form.
+  asJson -> Dictionary =>
+    #{
+      "code" => self.code,
+      "description" => self.description,
+      "status" => self.status,
+      "detail" => self.detail isNil ifTrue: [
+        nil
+      ] ifFalse: [self.detail printString]
+    }

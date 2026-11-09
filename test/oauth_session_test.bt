@@ -41,3 +41,8 @@ TestCase subclass: OAuthSessionTest
     self deny: (out includesSubstring: s nonce)
     self deny: (out includesSubstring: s codeVerifier)
     self assert: (out includesSubstring: "https://gitlab.com")
+
+  testDisplayStringRedactsNonceAndVerifier =>
+    s := self.session
+    self deny: (s displayString includesSubstring: s nonce)
+    self deny: (s displayString includesSubstring: s codeVerifier)

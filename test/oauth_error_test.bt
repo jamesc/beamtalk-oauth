@@ -95,3 +95,45 @@ TestCase subclass: OAuthErrorTest
     e := OAuthError fromOidcc: {#token_invalid, jwt}
     self deny: (e printString includesSubstring: "eyJ")
     self assert: (e printString includesSubstring: "token_invalid")
+
+  testDetailRedactsNonAlphabetSecret =>
+    e := OAuthError fromOidcc: {#bad, self bin: "p@ss!w0rd#secret-value-xyz"}
+    self assert: (e detail at: 2) equals: "[redacted]"
+
+  testDetailRedactsBearerHeader =>
+    e := OAuthError fromOidcc: {#bad, self bin: "Bearer abc"}
+    self assert: (e detail at: 2) equals: "[redacted]"
+
+  testDetailRedactsEmbeddedJwt =>
+    e := OAuthError fromOidcc: {#bad, self bin: "token was eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiIxIn0 rejected"}
+    self assert: (e detail at: 2) equals: "[redacted]"
+
+  testDetailRedactsCallbackUrl =>
+    e := OAuthError fromOidcc: {#bad, self bin: "https://app/cb?code=abc&state=xyz"}
+    self assert: (e detail at: 2) equals: "[redacted]"
+
+  testDetailRedactsSecretRecords =>
+    e := OAuthError fromOidcc: {#bad, {#oidcc_token, 1, 2, 3}, {#oidcc_client_context, #x}, {#jose_jwk, #y}}
+    self assert: (e detail at: 2) equals: "[redacted]"
+    self assert: (e detail at: 3) equals: "[redacted]"
+    self assert: (e detail at: 4) equals: "[redacted]"
+
+  testDetailRedactsKeywordListPairs =>
+    e := OAuthError fromOidcc: {#bad, #({#client_secret, self bin: "s"}, {#scope, #openid})}
+    self assert: (e detail at: 2) equals: #({#client_secret, "[redacted]"}, {#scope, #openid})
+
+  testDetailRedactsClaimsWithoutSub =>
+    claims := #{} at: (self bin: "email") put: (self bin: "alice@example.com")
+    e := OAuthError fromOidcc: {#missing_claim, {self bin: "sub", #undefined}, claims}
+    self assert: (e detail at: 3) equals: "[redacted]"
+
+  testNestedErrorTuplesAreUnwrapped =>
+    self assert: (OAuthError fromOidcc: {#error, {#error, #sub_invalid}}) code equals: "sub_invalid"
+
+  testNonReasonAtomsAreTransport =>
+    self assert: (OAuthError fromOidcc: #undefined) code equals: "transport"
+    self assert: (OAuthError fromOidcc: false) code equals: "transport"
+
+  testJsonGenerateHidesDetailSecrets =>
+    e := OAuthError fromOidcc: {#bad, self bin: "glpat-abcdefghij1234567890"}
+    self deny: ((Json generate: e) includesSubstring: "glpat")

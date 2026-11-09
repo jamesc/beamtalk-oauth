@@ -73,3 +73,25 @@ TestCase subclass: ClientRegistrationTest
       secret: "s3cret-value"
       redirect: "https://app.example.com/cb") unwrap
     self deny: ((Json generate: reg) includesSubstring: "s3cret-value")
+
+  testHttpsLocalhostRejected =>
+    self assert: (self codeFor: "https://localhost/cb") equals: "insecure_endpoint"
+    self assert: (self codeFor: "http://app.localhost:8080/cb") equals: "insecure_endpoint"
+
+  testUserinfoRejected =>
+    self assert: (self codeFor: "http://x@127.0.0.1/cb") equals: "config"
+
+  testUppercaseLoopbackSchemeAccepted =>
+    self assert: (self codeFor: "HTTP://127.0.0.1:9000/cb") equals: "ok"
+
+  testEmptySecretMeansPublicClient =>
+    reg := (ClientRegistration
+      forClient: "app"
+      secret: ""
+      redirect: "https://app.example.com/cb") unwrap
+    self assert: reg clientSecret equals: nil
+
+  testCheckRedirectForUnvalidatedCopies =>
+    reg := (ClientRegistration forClient: "app" redirect: "https://app.example.com/cb") unwrap
+    tampered := reg withRedirectUri: "http://evil.example.com/cb"
+    self assert: (ClientRegistration checkRedirect: tampered redirectUri) code equals: "insecure_endpoint"

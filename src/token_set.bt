@@ -36,7 +36,7 @@ typed Value subclass: TokenSet
   /// The raw ID token (JWT), for `id_token_hint` only.
   field: idToken :: String | Nil = nil
 
-  /// Seconds before expiry at which `needsRefresh` turns true.
+  /// Seconds before expiry at which `needsRefresh` turns true, at most.
   class refreshMargin -> Integer => 60
 
   /// The current Unix time in seconds.
@@ -54,14 +54,16 @@ typed Value subclass: TokenSet
     deadline := self expiresAt
     deadline isNil ifTrue: [false] ifFalse: [now >= deadline]
 
-  /// True when the access token expires within `TokenSet refreshMargin`
-  /// seconds of `now` (Unix seconds), or already has. Always false when
-  /// the lifetime is unknown.
+  /// True when the access token expires within the refresh margin of
+  /// `now` (Unix seconds), or already has. The margin is
+  /// `TokenSet refreshMargin`, capped at half the lifetime so a short-lived
+  /// token is not due for refresh the moment it is issued. Always false
+  /// when the lifetime is unknown.
   needsRefreshAt: now :: Integer -> Boolean =>
     deadline := self expiresAt
-    deadline isNil ifTrue: [
-      false
-    ] ifFalse: [now >= (deadline - TokenSet refreshMargin)]
+    deadline isNil ifTrue: [^false]
+    margin := TokenSet refreshMargin min: ((deadline - self.obtainedAt) div: 2)
+    now >= (deadline - margin)
 
   /// `isExpiredAt:` against the system clock.
   isExpired -> Boolean => self isExpiredAt: TokenSet now
@@ -79,7 +81,9 @@ typed Value subclass: TokenSet
 
   /// The result of a refresh: `response`'s values win, and this set's
   /// refresh token, scope, and ID token (claims and raw JWT together)
-  /// carry forward when `response` omits them. Providers often answer a
+  /// carry forward when `response` omits them. The ID token carries
+  /// forward only when the response has neither claims nor a raw JWT, so
+  /// a new JWT is never paired with old claims. Providers often answer a
   /// refresh without a new refresh token (Google) or ID token, and an
   /// omitted scope means the scope is unchanged (RFC 6749 §5.1).
   mergedWith: response :: TokenSet -> TokenSet =>
@@ -88,7 +92,7 @@ typed Value subclass: TokenSet
       merged := merged withRefreshToken: self.refreshToken
     ]
     response scope isNil ifTrue: [merged := merged withScope: self.scope]
-    response idTokenClaims isNil
+    (response idTokenClaims isNil and: [response idToken isNil])
       ifTrue: [
         merged := (merged withIdTokenClaims: self.idTokenClaims) withIdToken: self.idToken
       ]
