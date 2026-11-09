@@ -1,4 +1,4 @@
-// Copyright 2026 oauth authors
+// Copyright 2026 James Casey
 // SPDX-License-Identifier: Apache-2.0
 
 // OAuthServer discovery against the local FixtureProvider. No test hits
