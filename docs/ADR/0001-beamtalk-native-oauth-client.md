@@ -361,6 +361,14 @@ Value subclass: LoopbackReceiver
   class start -> Result(LoopbackReceiver, OAuthError) => ...
   redirectUri -> String => ...      // "http://127.0.0.1:{port}/callback"
   binding -> String => ...
+  expectState: expected :: String -> LoopbackReceiver => ...
+    // the flow's state (sess state), set BEFORE the authorize URL is
+    // opened. Only a /callback whose state matches (constant time) is
+    // recorded; a missing, wrong or repeated state, or a repeated
+    // code/error/iss (RFC 6749 §3.1), answers 404 and leaves the slot
+    // open, so a junk request from a web page or a local port scan
+    // cannot use it up (BT-4569). A setter, not awaitCallback:state:,
+    // because the redirect can beat the await.
   awaitCallback: timeoutMs :: Integer -> Result(Dictionary, OAuthError) => ...
     // the raw query, for handleCallback:store:boundTo:. Waits in the
     // caller's process for a message from the handler, NOT a sync actor
@@ -447,6 +455,7 @@ reg := (ClientRegistration forClient: "APP_ID" redirect: rx redirectUri) unwrap
 store := SessionStore spawn
 sess := OAuthSession newSessionFor: server client: reg
 store create: sess boundTo: rx binding
+rx expectState: sess state                // before the URL is opened
 url := (OAuthFlows authorizeUrl: server client: reg scopes: #("openid", "read_user") session: sess) unwrap
 Transcript showCr: url                    // or open the system browser
 query := (rx awaitCallback: 300000) unwrap

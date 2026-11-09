@@ -5,11 +5,39 @@
 /// (RFC 8252 §7.3).
 ///
 /// `start` binds an `HTTPServer` to `127.0.0.1` on an OS-assigned port.
-/// The first `GET /callback` is recorded and answered with a static
-/// "you can close this tab" page that echoes no provider data; any other
-/// path or method, and any later callback, answers 404 without touching
-/// the recorded query. Browsers fetch `/favicon.ico` right after the
-/// redirect, so this matters.
+/// The first `GET /callback` carrying the flow's `state` is recorded and
+/// answered with a static "you can close this tab" page that echoes no
+/// provider data. Any other path or method, any callback with a missing,
+/// wrong or repeated `state` (or a repeated `code` or `error`), and any
+/// later callback answers 404 without touching the recorded query.
+/// Browsers fetch `/favicon.ico` right after the redirect, and any web
+/// page or local process can fire a junk `/callback` at the port, so a
+/// slot that took the first request would let either block the login.
+///
+/// ## The expected state
+///
+/// The receiver learns the flow's `state` from `expectState:`, which must
+/// be called before the authorize URL is opened: the redirect can arrive
+/// as soon as the browser has the URL, and a callback that arrives before
+/// the receiver knows the state is refused (404), not buffered. A native
+/// app creates the session, then hands its state over:
+///
+/// ```beamtalk
+/// sess := OAuthSession newSessionFor: server client: reg
+/// store create: sess boundTo: rx binding
+/// rx expectState: sess state
+/// url := (OAuthFlows authorizeUrl: server client: reg scopes: scopes session: sess) unwrap
+/// query := (rx awaitCallback: 300000) unwrap
+/// ```
+///
+/// It is a setter rather than `awaitCallback:state:` because the await
+/// usually starts after the URL is opened, too late to filter a callback
+/// that beats it. `awaitCallback:` without a prior `expectState:` answers
+/// a `config` error at once instead of waiting out its timeout.
+///
+/// This check only keeps junk from using up the one-shot slot.
+/// `OAuthFlows handleCallback:store:boundTo:` still checks the state
+/// against the `SessionStore`, and that is what stops a forged code.
 ///
 /// The receiver owns the per-flow `binding` (`Secrets generate`), so a
 /// native app passes `rx binding` to the session store and never makes
@@ -30,13 +58,15 @@
 /// rx := LoopbackReceiver start unwrap
 /// rx redirectUri                       // => "http://127.0.0.1:50278/callback"
 /// rx binding size                      // => 43
+/// rx expectState: sess state           // before opening the authorize URL
 /// query := (rx awaitCallback: 300000) unwrap
 /// query at: "code"                     // => "..."
 /// ```
 typed Value subclass: LoopbackReceiver
   /// The listening server.
   field: server :: HTTPServer | Nil = nil
-  /// The server's request handler, holding the one-shot callback state.
+  /// The actor behind the server's request handler, holding the one-shot
+  /// callback state.
   field: gate :: LoopbackGate | Nil = nil
   /// The OS-assigned port the server listens on.
   field: port :: Integer = 0
@@ -53,7 +83,7 @@ typed Value subclass: LoopbackReceiver
       tryDo: [
         srv := HTTPServer
           start: 0
-          handler: gate
+          handler: (self handlerFor: gate)
           options: #{#bind => "127.0.0.1"}
         rx := self new: #{
           #server => srv,
@@ -70,6 +100,17 @@ typed Value subclass: LoopbackReceiver
         (self new: #{#server => srv, #gate => gate}) stop
         Result error: (OAuthError transport: "loopback listener failed to start: {e messageText}")
       ]
+
+  /// The server's request handler: a block, so it runs in the connection
+  /// process, the only one that can read the raw query string (to spot a
+  /// repeated parameter, which `queryParams` hides). It forwards each
+  /// request to `gate`, which decides. A failed read raises, so the server
+  /// answers 500 and nothing is recorded: the check fails closed.
+  class handlerFor: gate :: LoopbackGate -> Block =>
+    [:req :: HTTPRequest |
+      raw := req exchange isNil ifTrue: [nil] ifFalse: [req exchange query]
+      gate handle: req rawQuery: raw
+    ]
 
   /// The largest `awaitCallback:` timeout, in ms: the BEAM's limit for a
   /// receive timeout (about 49 days).
@@ -91,6 +132,14 @@ typed Value subclass: LoopbackReceiver
   /// `http://127.0.0.1:{port}/callback`.
   redirectUri -> String => "http://127.0.0.1:{self.port}/callback"
 
+  /// Record only a callback whose `state` is `expected`, normally
+  /// `sess state`. Call it before opening the authorize URL: a callback
+  /// that arrives earlier answers 404 and is lost. Answers the receiver.
+  /// Raises when `expected` is nil or empty, or the receiver is stopped.
+  expectState: expected :: String -> LoopbackReceiver =>
+    self.gate expectState: expected
+    self
+
   /// Wait up to `timeoutMs` for the callback and answer its raw query
   /// (`code`, `state`, or `error` and `error_description`), for
   /// `OAuthFlows handleCallback:store:boundTo:`. A callback that arrived
@@ -102,9 +151,11 @@ typed Value subclass: LoopbackReceiver
   /// in. The listener is stopped before this answers. Errors:
   ///
   /// - `callback_timeout`: nothing arrived in time;
-  /// - `config`: a timeout outside `0..maxTimeout`; the receiver was
-  ///   stopped, before or during the wait; or another process is already
-  ///   waiting on it (that wait carries on, and the listener stays up).
+  /// - `config`: a timeout outside `0..maxTimeout`; `expectState:` was
+  ///   never called; the receiver was stopped, before or during the wait;
+  ///   or another process is already waiting on it. Only in the stopped
+  ///   case is the listener gone: otherwise it stays up, and any other
+  ///   wait carries on.
   awaitCallback: timeoutMs :: Integer -> Result(Dictionary, OAuthError) =>
     ((timeoutMs < 0) or: [timeoutMs > self class maxTimeout])
       ifTrue: [
@@ -117,8 +168,12 @@ typed Value subclass: LoopbackReceiver
         self stop
         ^Result error: (OAuthError config: "LoopbackReceiver is stopped")
       ]
-    registered value
-      ifFalse: [
+    registered value =:= #noState
+      ifTrue: [
+        ^Result error: (OAuthError config: "call expectState: on the LoopbackReceiver before opening the authorize URL")
+      ]
+    registered value =:= #busy
+      ifTrue: [
         ^Result error: (OAuthError config: "another process is already waiting on this LoopbackReceiver")
       ]
     gatePid := self.gate pid
