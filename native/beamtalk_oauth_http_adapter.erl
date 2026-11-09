@@ -30,7 +30,7 @@ response is also kept in the calling process's dictionary under
 this for refresh: `oidcc_token:refresh/3` discards a response that has
 no ID token, and the shim must still read it.
 
-A `GET` of a discovery document is handed to
+A `200` answer to a `GET` of a discovery document is handed to
 `beamtalk_oauth_oidcc:mark_discovery/3`, which marks a document that
 leaves out `revocation_endpoint_auth_methods_supported` (so the marker
 survives `oidcc` applying the RFC 8414 default).
@@ -138,7 +138,8 @@ capture(_Method, _Answer, _Config) ->
 %% A discovery document is passed through the shim, which records whether
 %% the provider named its revocation auth methods before `oidcc` fills in
 %% the RFC 8414 default (`beamtalk_oauth_oidcc:mark_discovery/3`).
-mark_discovery(Method, Url, {ok, {Status, Headers, Body}}) ->
+%% Only a 200 is a document: an error body at that URL is left as served.
+mark_discovery(Method, Url, {ok, {{_, 200, _} = Status, Headers, Body}}) ->
     {ok, {Status, Headers, beamtalk_oauth_oidcc:mark_discovery(Method, Url, Body)}};
 mark_discovery(_Method, _Url, Answer) ->
     Answer.

@@ -220,6 +220,75 @@ TestCase subclass: RevocationTest
     self assert: (self lastForm at: "client_id") equals: "client-1"
     self assert: (self lastForm at: "client_secret") equals: "secret-1"
 
+  testAbsentRevocationMethodsWithNoSecretTokenMethodIsConfigError =>
+    // Strict fallback: no Basic guess when the token endpoint names
+    // neither secret method.
+    self.provider discoveryOverrides: #{
+      "token_endpoint_auth_methods_supported" => #("private_key_jwt")
+    }
+    got := TokenRevocation
+      revoke: self server
+      client: self confidentialClient
+      token: self tokens
+    self assert: got error code equals: "config"
+    self assert: (self.provider lastRequestTo: "/revoke") equals: nil
+
+  testMarkDiscoveryOnlyMarksDiscoveryDocuments =>
+    shim := Erlang beamtalk_oauth_oidcc
+    url := self bin: "https://idp.test/tenant/.well-known/openid-configuration"
+    plain := self bin: "\{""a"":1}"
+    marked := (shim
+      mark_discovery: #get
+      with: url
+      with: plain) asStringUnchecked
+    self assert: (marked includesSubstring: "beamtalk_oauth_revocation_auth_methods_absent")
+    named := self bin: "\{""revocation_endpoint_auth_methods_supported"":[]}"
+    self
+      assert: (shim
+        mark_discovery: #get
+        with: url
+        with: named)
+      equals: named
+    self
+      assert: (shim
+        mark_discovery: #post
+        with: url
+        with: plain)
+      equals: plain
+    jwks := self bin: "https://idp.test/jwks"
+    self
+      assert: (shim
+        mark_discovery: #get
+        with: jwks
+        with: plain)
+      equals: plain
+    #("[1]", "null", "not json")
+      do: [:text |
+        body := self bin: text
+        self
+          assert: (shim
+            mark_discovery: #get
+            with: url
+            with: body)
+          equals: body
+      ]
+
+  testDiscoveryErrorBodyIsNotMarked =>
+    self.provider
+      fail: "/.well-known/openid-configuration"
+      status: 500
+      body: #{"error" => "server_error"}
+    got := OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: #{}
+      options: #{#allowUnsafeHttp => true}
+    self assert: got isError
+    self deny: (got error printString includesSubstring: "beamtalk_oauth")
+    self deny: (got error asJson printString includesSubstring: "beamtalk_oauth")
+
+  // A raw Erlang binary, as the adapter passes (distinct from a String).
+  bin: text :: String -> Binary => Binary fromIolist: #(text)
+
   testAdvertisedRevocationMethodsWinOverTokenMethods =>
     self.provider
       discoveryOverrides: #{

@@ -218,7 +218,8 @@ field with RFC 8414's default (`client_secret_basic`), after which the
 two cases look the same. A provider that omits the field may still
 accept only `client_secret_post`, so `TokenRevocation` treats an absent
 field as unadvertised and uses the token endpoint's methods instead (the
-strict fallback, BT-4590).
+strict fallback, BT-4590). This departs from RFC 8414 §2 on purpose:
+do not change it back to the default.
 
 An absent field adds a marker member to the document (kept by `oidcc`
 in `extra_fields`); a marker the provider sent itself is dropped. Any
