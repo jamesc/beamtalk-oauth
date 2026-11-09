@@ -50,6 +50,11 @@ typed Actor subclass: LoopbackGate
   /// SHA-256 digest of the flow's expected `state`; nil until
   /// `expectState:`, and nothing is recorded before then.
   state: stateDigest :: Binary | Nil = nil
+  /// How many `GET /callback` requests for this listener were refused for
+  /// a missing, wrong or repeated parameter: reported on a timeout, so a
+  /// flow armed with the wrong state can be told from a user who never
+  /// signed in.
+  state: refused :: Integer = 0
 
   /// The callback parameters that must appear at most once (RFC 6749
   /// §3.1, RFC 9207 for `iss`).
@@ -77,36 +82,53 @@ typed Actor subclass: LoopbackGate
   /// Record the first `GET /callback` that passes the host, state and
   /// duplicate-parameter checks, and answer the static close-this-tab
   /// page; answer 404 to anything else, including a second callback.
-  /// `raw` is the request's undecoded query string (nil when it has none),
-  /// which `queryParams` no longer shows duplicates in.
+  ///
+  /// `raw` is the request's undecoded query string (nil when it has
+  /// none). The recorded query is parsed from `raw` here, with
+  /// `QueryParser`, not taken from `req queryParams`: that keeps only the
+  /// last of a repeated parameter, and one source for both the duplicate
+  /// check and the recorded query means they cannot disagree.
   handle: req :: HTTPRequest rawQuery: raw :: String | Nil -> HTTPResponse =>
     isCallback := (req method =:= "GET") and: [req path =:= "/callback"]
     (isCallback and: [
       self.query isNil and: [self acceptsHostOf: req]
     ]) ifFalse: [^self class notFound]
-    params := req queryParams
-    ((self matchesState: (params at: "state" ifAbsent: [
-      nil
-    ])) and: [
-      (self hasDuplicateParams: raw) not
-    ]) ifFalse: [^self class notFound]
+    params := QueryParser parse: raw
+    ok := params notNil
+      and: [
+        (self hasDuplicateParams: raw) not and: [
+          self matchesState: (params at: "state" ifAbsent: [nil])
+        ]
+      ]
+    ok
+      ifFalse: [
+        self.refused := self.refused + 1
+        ^self class notFound
+      ]
     self.query := params
     self notifyWaiter
     self class closeTabPage
 
   /// Accept only callbacks whose `state` is `expected`. Raises, and
-  /// changes nothing, when `expected` is nil, empty or not a String.
+  /// changes nothing, when `expected` is nil, empty or not a String, or a
+  /// state is already expected: one receiver serves one flow, and
+  /// re-arming it would silently drop the first flow's redirect.
   expectState: expected :: String -> Nil =>
     ((expected isKindOf: String) and: [
       expected isEmpty not
     ]) ifFalse: [
       self error: "LoopbackGate: the expected state must be a non-empty String"
     ]
+    self.stateDigest isNil
+      ifFalse: [
+        self error: "LoopbackGate: a state is already expected; start a new LoopbackReceiver for another flow"
+      ]
     self.stateDigest := Erlang crypto hash: #sha256 with: expected
     nil
 
-  /// Whether `expectState:` has been called.
-  expectsState -> Boolean => self.stateDigest notNil
+  /// How many callbacks were refused for a missing, wrong or repeated
+  /// parameter.
+  refusedCount -> Integer => self.refused
 
   /// Whether `candidate` is the expected state, in constant time. False
   /// when no state is expected yet or `candidate` is not a String.
@@ -116,9 +138,8 @@ typed Actor subclass: LoopbackGate
     Erlang crypto hash_equals: self.stateDigest with: (Erlang crypto hash: #sha256 with: candidate)
 
   /// Whether one of `singleParams` appears more than once in the raw
-  /// query `raw`. Names are decoded first, so `st%61te` counts as
-  /// `state`; a name that does not decode counts as nothing (the server
-  /// has already answered 400 to such a query).
+  /// query `raw`. Names are split and decoded exactly as `QueryParser`
+  /// does, so `st%61te` counts as `state`.
   internal hasDuplicateParams: raw :: String | Nil -> Boolean =>
     raw isNil ifTrue: [^false]
     names := ((raw split: "&") reject: [:part | part isEmpty])

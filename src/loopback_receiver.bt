@@ -35,9 +35,23 @@
 /// that beats it. `awaitCallback:` without a prior `expectState:` answers
 /// a `config` error at once instead of waiting out its timeout.
 ///
+/// One receiver serves one flow: `expectState:` raises when a state is
+/// already expected. A timeout reports how many callbacks were refused,
+/// so a receiver armed with the wrong state (the binding, or another
+/// session's state) shows up as such rather than as a user who never
+/// signed in.
+///
 /// This check only keeps junk from using up the one-shot slot.
 /// `OAuthFlows handleCallback:store:boundTo:` still checks the state
 /// against the `SessionStore`, and that is what stops a forged code.
+///
+/// Known limit: `state` is not a secret from the local machine. The
+/// authorize URL carrying it can show up in the argv of the process that
+/// opens the browser and in browser history, so a local process that
+/// reads it can still send a matching junk callback first and use up the
+/// slot. It cannot get a forged code accepted (PKCE and the session store
+/// stop that), but the login fails and must be retried with a new
+/// receiver. Web pages and blind port scans no longer can.
 ///
 /// The receiver owns the per-flow `binding` (`Secrets generate`), so a
 /// native app passes `rx binding` to the session store and never makes
@@ -135,7 +149,9 @@ typed Value subclass: LoopbackReceiver
   /// Record only a callback whose `state` is `expected`, normally
   /// `sess state`. Call it before opening the authorize URL: a callback
   /// that arrives earlier answers 404 and is lost. Answers the receiver.
-  /// Raises when `expected` is nil or empty, or the receiver is stopped.
+  /// Raises when `expected` is nil or empty, when a state is already
+  /// expected (start a new receiver for another flow), or when the
+  /// receiver is stopped.
   expectState: expected :: String -> LoopbackReceiver =>
     self.gate expectState: expected
     self
@@ -150,7 +166,9 @@ typed Value subclass: LoopbackReceiver
   /// actor stops answering (and its callers time out) while the user signs
   /// in. The listener is stopped before this answers. Errors:
   ///
-  /// - `callback_timeout`: nothing arrived in time;
+  /// - `callback_timeout`: nothing arrived in time; its `detail` is the
+  ///   number of callbacks refused for a missing, wrong or repeated
+  ///   parameter, also given in the description when it is not 0;
   /// - `config`: a timeout outside `0..maxTimeout`; `expectState:` was
   ///   never called; the receiver was stopped, before or during the wait;
   ///   or another process is already waiting on it. Only in the stopped
@@ -181,6 +199,10 @@ typed Value subclass: LoopbackReceiver
       await: tag
       from: gatePid
       timeout: timeoutMs
+    refused := 0
+    (outcome isError and: [
+      outcome error =:= #timeout
+    ]) ifTrue: [refused := [self.gate refusedCount] on: Error do: [:e | 0]]
     self stop
     // A callback that raced the timeout may already be in the mailbox:
     // take it, which also leaves no stray message behind.
@@ -198,7 +220,7 @@ typed Value subclass: LoopbackReceiver
           ifTrue: [
             Result error: (OAuthError config: "LoopbackReceiver was stopped while waiting")
           ]
-          ifFalse: [Result error: OAuthError callbackTimeout]
+          ifFalse: [Result error: (OAuthError callbackTimeoutRefusing: refused)]
       ]
 
   /// Stop the listener, then its handler. Idempotent: answers `#ok` every

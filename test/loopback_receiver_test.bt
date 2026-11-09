@@ -277,7 +277,7 @@ TestCase subclass: LoopbackReceiverTest
 
   testDuplicateParametersAreRefusedAndKeepTheSlot =>
     st := self expected
-    dupes := #("/callback?state=wrong&state={st}&code=a", "/callback?state={st}&state={st}&code=b", "/callback?code=c1&code=c2&state={st}", "/callback?error=e1&error=e2&state={st}", "/callback?code=d&error=access_denied&error=x&state={st}", "/callback?code=e&iss=a&iss=b&state={st}", "/callback?code=f&st%61te=wrong&state={st}")
+    dupes := #("/callback?state=wrong&state={st}&code=a", "/callback?state={st}&state={st}&code=b", "/callback?code=c1&code=c2&state={st}", "/callback?error=e1&error=e2&state={st}", "/callback?code=d&error=access_denied&error=x&state={st}", "/callback?code=e&iss=a&iss=b&state={st}", "/callback?code=f&st%61te=wrong&state={st}", "/callback?code=g&%73tate={st}&state={st}", "/callback?error=e&error_description=a&error_description=b&state={st}", "/callback?error=e&error_uri=a&error_uri=b&state={st}", "/callback?error=e&iss=a&iss=b&state={st}")
     dupes do: [:path |
       self assert: (self browse: path) unwrap status equals: 404
     ]
@@ -315,3 +315,62 @@ TestCase subclass: LoopbackReceiverTest
     // The earlier expected state still holds.
     self callback: "code=still"
     self assert: ((self.rx awaitCallback: 5000) unwrap at: "code") equals: "still"
+
+  testExpectStateTwiceRaisesAndKeepsTheFirst =>
+    self should: [self.rx expectState: "another-flow"] raise: #user_error
+    self should: [self.rx expectState: self expected] raise: #user_error
+    resp := (self browse: "/callback?code=x&state=another-flow") unwrap
+    self assert: resp status equals: 404
+    self callback: "code=first-flow"
+    self assert: ((self.rx awaitCallback: 5000) unwrap at: "code") equals: "first-flow"
+
+  testExpectStateOnAStoppedReceiverRaises =>
+    other := LoopbackReceiver start unwrap
+    other stop
+    self should: [other expectState: "s"] raise: #actor_dead
+
+  testPercentEncodedStateMatches =>
+    other := LoopbackReceiver start unwrap
+    other expectState: "a+b/c d"
+    resp := (HTTPClient get: other redirectUri ++ "?code=enc&state=a%2Bb%2Fc+d") unwrap
+    self assert: resp status equals: 200
+    self assert: ((other awaitCallback: 5000) unwrap at: "state") equals: "a+b/c d"
+
+  testMalformedQueryAnswers400AndKeepsTheSlot =>
+    resp := (self browse: "/callback?code=a&junk=%ZZ&state={self expected}") unwrap
+    self assert: resp status equals: 400
+    self callback: "code=real"
+    self assert: ((self.rx awaitCallback: 5000) unwrap at: "code") equals: "real"
+
+  testGateParsesTheRawQueryNotQueryParams =>
+    // A request without a raw query is refused even when its decoded
+    // queryParams carry the right state: the raw query is the only source.
+    gate := LoopbackGate spawn
+    gate expectHost: "127.0.0.1:4000"
+    gate expectState: "s1"
+    req := HTTPRequest
+      new: #{
+        #method => "GET",
+        #path => "/callback",
+        #headers => #(#("host", "127.0.0.1:4000")),
+        #queryParams => #{"code" => "smuggled", "state" => "s1"}
+      }
+    self assert: (gate handle: req rawQuery: nil) status equals: 404
+    self assert: (gate handle: req rawQuery: "code=a&state=s1&state=s1") status equals: 404
+    self assert: gate refusedCount equals: 2
+    self assert: (gate handle: req rawQuery: "code=real&state=s1") status equals: 200
+    gate stop
+
+  testTimeoutReportsRefusedCallbacks =>
+    self browse: "/callback?code=a&state=wrong"
+    self browse: "/callback?code=b"
+    self browse: "/favicon.ico"
+    outcome := self.rx awaitCallback: 50
+    self assert: outcome error code equals: "callback_timeout"
+    self assert: outcome error detail equals: 2
+    self assert: (outcome error description includesSubstring: "2 callback")
+
+  testTimeoutWithNothingRefusedReportsZero =>
+    outcome := self.rx awaitCallback: 20
+    self assert: outcome error code equals: "callback_timeout"
+    self assert: outcome error detail equals: 0

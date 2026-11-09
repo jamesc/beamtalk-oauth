@@ -68,6 +68,13 @@ typed Value subclass: OAuthError
   class callbackTimeout -> OAuthError =>
     self code: "callback_timeout" description: "no callback before the timeout"
 
+  /// No callback was accepted before the deadline, after `refused`
+  /// callbacks were refused for a missing, wrong or repeated parameter
+  /// (see `LoopbackReceiver`). `detail` holds the count.
+  class callbackTimeoutRefusing: refused :: Integer -> OAuthError =>
+    refused =:= 0 ifTrue: [^self callbackTimeout withDetail: 0]
+    (self code: "callback_timeout" description: "no matching callback before the timeout; {refused} callback(s) with a missing, wrong or repeated state, code or error were refused") withDetail: refused
+
   /// Map an `oidcc` error reason to an `OAuthError`.
   ///
   /// - `{http_error, Status, #{<<"error">> := Code}}` answers the provider

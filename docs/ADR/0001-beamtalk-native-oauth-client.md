@@ -355,8 +355,8 @@ protocol if a multi-node web deployment needs it.
 // It owns the per-flow binding, so native apps never see one.
 // A Value handle, not an Actor: an actor's methods run in the actor, so
 // awaitCallback: could only wait inside a 5s sync call. The one-shot
-// state lives in an internal LoopbackGate actor, the server's
-// HTTPHandler (BT-4560).
+// state lives in an internal LoopbackGate actor (BT-4560), which the
+// server's block handler forwards each request to with its raw query.
 Value subclass: LoopbackReceiver
   class start -> Result(LoopbackReceiver, OAuthError) => ...
   redirectUri -> String => ...      // "http://127.0.0.1:{port}/callback"
@@ -368,7 +368,11 @@ Value subclass: LoopbackReceiver
     // code/error/iss (RFC 6749 §3.1), answers 404 and leaves the slot
     // open, so a junk request from a web page or a local port scan
     // cannot use it up (BT-4569). A setter, not awaitCallback:state:,
-    // because the redirect can beat the await.
+    // because the redirect can beat the await. One flow per receiver:
+    // a second expectState: raises. A timeout reports how many
+    // callbacks were refused. Known limit: state is visible to local
+    // processes (browser argv, history), so one that reads it can still
+    // use up the slot; it cannot get a forged code accepted.
   awaitCallback: timeoutMs :: Integer -> Result(Dictionary, OAuthError) => ...
     // the raw query, for handleCallback:store:boundTo:. Waits in the
     // caller's process for a message from the handler, NOT a sync actor
