@@ -29,6 +29,10 @@
 /// - `issuer_mismatch` — a callback `iss` (RFC 9207) or a token set's
 ///   issuer differs from the expected one, or the provider advertises
 ///   `iss` and the callback lacks it;
+/// - `missing_id_token` — the token response carried no ID token;
+/// - `no_userinfo_endpoint` — the provider names no userinfo endpoint;
+/// - `oidcc_crash` — `oidcc` raised on a malformed provider answer (the
+///   exception is dropped: its stacktrace could hold secrets);
 /// - `config` — the registration's redirect URI is not acceptable (see
 ///   `ClientRegistration checkRedirect:`), a reserved authorization
 ///   parameter was overridden, or a token set lacks what the call needs.
@@ -57,9 +61,11 @@
 Object subclass: OAuthFlows
 
   /// Authorization parameters that the flow sets itself and that extra
-  /// parameters (from the preset or the caller) may not override.
+  /// parameters (from the preset or the caller) may not override. The JWT
+  /// claim names are included because `oidcc` merges extras over the
+  /// claims of a signed request object.
   class reservedParams -> List(String) =>
-    #("response_type", "client_id", "redirect_uri", "state", "nonce", "scope", "code_challenge", "code_challenge_method", "request", "request_uri", "response_mode", "dpop_jkt", "purpose")
+    #("response_type", "client_id", "redirect_uri", "state", "nonce", "scope", "code_challenge", "code_challenge_method", "request", "request_uri", "response_mode", "dpop_jkt", "purpose", "iss", "aud", "exp", "nbf", "iat", "jti")
 
   // ===== Authorization URL =====
 
@@ -152,13 +158,18 @@ Object subclass: OAuthFlows
   /// or a whole callback URL is fine), a List of `{name, value}` pairs, or
   /// a Dictionary. Only the first two can show a duplicated parameter; a
   /// Dictionary has already collapsed duplicates, so prefer the raw query
-  /// where the web framework offers it.
+  /// where the web framework offers it. (`LoopbackReceiver` answers a
+  /// Dictionary, but its gate has already refused repeated parameters in
+  /// the raw query.)
   ///
   /// - A missing or empty `code` or `state`, a parameter that is not text,
   ///   or any parameter given twice (RFC 6749 §3.1) answers `parse`,
   ///   without touching the store.
   /// - A provider `error` answers an `OAuthError` with the provider's code
-  ///   verbatim (`access_denied`, ...) and its `error_description`. When
+  ///   verbatim (`access_denied`, ...) and its `error_description`; an
+  ///   empty code or one outside the RFC 6749 error charset answers
+  ///   `parse`. The code is whatever the redirect says, so an app should
+  ///   not trust it to tell provider and local failures apart. When
   ///   the callback names a `state`, that session is consumed (burned)
   ///   first, and a failed consume (wrong binding, unknown state) answers
   ///   that error instead.
@@ -175,6 +186,9 @@ Object subclass: OAuthFlows
     providerError := parsed at: "error" ifAbsent: [nil]
     providerError notNil
       ifTrue: [
+        (providerError matchesRegex: self errorCodePattern) ifFalse: [
+          ^Result error: (OAuthError parse: "callback error code is empty or malformed")
+        ]
         state isEmpty
           ifFalse: [
             burned := store consume: state boundTo: binding
@@ -206,6 +220,10 @@ Object subclass: OAuthFlows
         iss: iss
         session: sess)
 
+  /// RFC 6749 §4.1.2.1: an `error` value is one or more characters in
+  /// %x20-21 / %x23-5B / %x5D-7E (printable ASCII but `"` and `\`).
+  class errorCodePattern -> String => "^[ !#-\\[\\]-~]+$"
+
   /// The callback parameters as a Dictionary of String to String, or the
   /// `parse` error for a malformed, non-text or duplicated parameter.
   class parseQuery: query :: Object -> Dictionary | OAuthError =>
@@ -223,8 +241,8 @@ Object subclass: OAuthFlows
         ok ifFalse: [
           ^OAuthError parse: "callback parameter is not a name/value pair"
         ]
-        name := OAuthError textOf: (pair at: 1)
-        value := OAuthError textOf: (pair at: 2)
+        name := self paramText: (pair at: 1)
+        value := self paramText: (pair at: 2)
         (name isNil or: [
           value isNil
         ]) ifTrue: [^OAuthError parse: "callback parameter is not text"]
@@ -234,6 +252,13 @@ Object subclass: OAuthFlows
         out := out at: name put: value
       ]
     out
+
+  /// `value` as a String when it is a String or a valid UTF-8 Binary; nil
+  /// otherwise. Symbols are refused: `uri_string:dissect_query` answers
+  /// `true` for a parameter with no `=`, which must not read as "true".
+  class paramText: value :: Object -> String | Nil =>
+    ((value isKindOf: String) or: [value isKindOf: Binary]) ifFalse: [^nil]
+    OAuthError textOf: value
 
   /// `query` as a list of pairs, or nil when it is none of the accepted
   /// shapes.
@@ -263,16 +288,18 @@ Object subclass: OAuthFlows
   /// Before any network call: the redirect URI must pass
   /// `ClientRegistration checkRedirect:`; the session's issuer must equal
   /// `server issuer` and its redirect URI `reg redirectUri`
-  /// (`session_mismatch`, the mix-up defence); a callback `iss` must equal
-  /// the issuer, and must be present when the provider advertises
-  /// `authorization_response_iss_parameter_supported` (`issuer_mismatch`).
-  /// The shim also checks the issuer against the server's own `oidcc`
-  /// configuration.
+  /// (`session_mismatch`, the mix-up defence). The shim then checks,
+  /// against the server's own `oidcc` configuration rather than the
+  /// Beamtalk-side copy, that the issuer matches (`session_mismatch`) and
+  /// that a callback `iss` equals it and is present when the provider
+  /// advertises `authorization_response_iss_parameter_supported`
+  /// (`issuer_mismatch`).
   ///
   /// Then `oidcc_token:retrieve` sends the code with the PKCE verifier and
   /// client authentication, and validates the ID token, including the
   /// session's nonce (`missing_claim` on a mismatch). Provider errors pass
-  /// through verbatim (`invalid_grant`, ...). Answers a `TokenSet` with
+  /// through verbatim (`invalid_grant`, ...). A response without an ID
+  /// token answers `missing_id_token`. Answers a `TokenSet` with
   /// the validated `idTokenClaims`, the raw `idToken`, and `obtainedAt`
   /// stamped when the request was sent.
   class exchangeCode: server :: OAuthServer client: reg :: ClientRegistration callback: cb :: Callback -> Result(TokenSet, OAuthError) =>
@@ -281,9 +308,9 @@ Object subclass: OAuthFlows
       checkSession: sess
       server: server
       client: reg) ifNotNil: [:err | ^Result error: err]
-    (self checkIss: cb iss server: server) ifNotNil: [:err | ^Result error: err]
     params := #{
       #issuer => sess issuer,
+      #iss => cb iss,
       #code => cb code,
       #redirect_uri => sess redirectUri,
       #nonce => sess nonce,
@@ -298,31 +325,17 @@ Object subclass: OAuthFlows
       Result ok: (self tokenSetFrom: toks obtainedAt: sentAt)
     ] ifError: [:reason | Result error: (OAuthError fromOidcc: reason)]
 
-  /// nil when the callback's `iss` is acceptable for `server`.
-  class checkIss: iss :: String | Nil server: server :: OAuthServer -> OAuthError | Nil =>
-    iss isNil
-      ifTrue: [
-        advertised := server metadata at: #authorization_response_iss_parameter_supported ifAbsent: [
-          false
-        ]
-        ^advertised =:= true
-          ifTrue: [
-            OAuthError code: "issuer_mismatch" description: "the provider sends iss (RFC 9207) but the callback had none"
-          ]
-          ifFalse: [nil]
-      ]
-    iss =:= server issuer ifTrue: [^nil]
-    OAuthError code: "issuer_mismatch" description: "callback iss {iss} is not the server's issuer {server issuer}"
-
   // ===== Refresh =====
 
   /// Refresh `toks` with its refresh token.
   ///
   /// `toks` must carry a refresh token and validated ID-token claims whose
-  /// `iss` is `server issuer` (`config` / `issuer_mismatch`, before any
-  /// network call): the refresh token is never sent to another provider.
-  /// `oidcc_token:refresh` checks that the new ID token's `sub` equals
-  /// `toks subject` (`sub_invalid` otherwise).
+  /// `iss` is `server issuer` and whose `aud` names `reg clientId`
+  /// (`config` / `issuer_mismatch` / `session_mismatch`, before any
+  /// network call): the refresh token is never sent to another provider
+  /// or under another client's credentials. `oidcc_token:refresh` requires
+  /// an ID token in the response and checks that its `sub` equals
+  /// `toks subject`; either failing answers `sub_invalid`.
   ///
   /// Answers `toks mergedWith:` the response: new values win, and the old
   /// refresh token, scope and ID token carry forward when the response
@@ -334,9 +347,10 @@ Object subclass: OAuthFlows
     ]) ifTrue: [
       ^Result error: (OAuthError config: "the token set has no refresh token")
     ]
-    (self checkTokens: toks server: server) ifNotNil: [:err |
-      ^Result error: err
-    ]
+    (self
+      checkTokens: toks
+      server: server
+      client: reg) ifNotNil: [:err | ^Result error: err]
     params := #{
       #issuer => server issuer,
       #refresh_token => refreshToken,
@@ -387,16 +401,19 @@ Object subclass: OAuthFlows
   /// The userinfo claims for `toks`, from `oidcc_userinfo:retrieve`.
   ///
   /// `toks` must carry an access token and validated ID-token claims whose
-  /// `iss` is `server issuer` (`config` / `issuer_mismatch`, before any
-  /// network call). The answer's `sub` must equal `toks subject`
+  /// `iss` is `server issuer` and whose `aud` names `reg clientId`
+  /// (`config` / `issuer_mismatch` / `session_mismatch`, before any
+  /// network call). A provider without a userinfo endpoint answers
+  /// `no_userinfo_endpoint`. The answer's `sub` must equal `toks subject`
   /// (`bad_subject` otherwise). Answers the claims with String keys.
   class userInfo: server :: OAuthServer client: reg :: ClientRegistration tokenSet: toks :: TokenSet -> Result(Dictionary, OAuthError) =>
     toks accessToken isEmpty ifTrue: [
       ^Result error: (OAuthError config: "the token set has no access token")
     ]
-    (self checkTokens: toks server: server) ifNotNil: [:err |
-      ^Result error: err
-    ]
+    (self
+      checkTokens: toks
+      server: server
+      client: reg) ifNotNil: [:err | ^Result error: err]
     params := #{
       #issuer => server issuer,
       #access_token => toks accessToken,
@@ -428,9 +445,10 @@ Object subclass: OAuthFlows
       ]
     nil
 
-  /// nil when `toks` has a validated subject issued by `server`; the
+  /// nil when `toks` has a validated subject issued by `server` to `reg`
+  /// (its client id is the ID token's `aud` or one of them); the
   /// `OAuthError` otherwise.
-  class checkTokens: toks :: TokenSet server: server :: OAuthServer -> OAuthError | Nil =>
+  class checkTokens: toks :: TokenSet server: server :: OAuthServer client: reg :: ClientRegistration -> OAuthError | Nil =>
     claims := toks idTokenClaims
     claims isNil ifTrue: [
       ^OAuthError config: "the token set has no ID-token claims"
@@ -442,6 +460,14 @@ Object subclass: OAuthFlows
     issuer =:= server issuer
       ifFalse: [
         ^OAuthError code: "issuer_mismatch" description: "the tokens were issued by {issuer}, not {server issuer}"
+      ]
+    aud := claims at: "aud" ifAbsent: [nil]
+    audiences := (aud isKindOf: List) ifTrue: [
+      aud collect: [:a | OAuthError textOf: a]
+    ] ifFalse: [#(OAuthError textOf: aud)]
+    (audiences includes: reg clientId)
+      ifFalse: [
+        ^OAuthError code: "session_mismatch" description: "the tokens were not issued to client {reg clientId}"
       ]
     nil
 

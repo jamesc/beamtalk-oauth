@@ -109,7 +109,7 @@ TestCase subclass: OAuthFlowsTest
 
   testAuthorizeUrlRefusesReservedExtras =>
     sess := self newSession
-    #("state", "code_challenge_method", "nonce", "redirect_uri")
+    #("state", "code_challenge_method", "nonce", "redirect_uri", "iss", "jti")
       do: [:name |
         got := OAuthFlows
           authorizeUrl: self.server
@@ -542,3 +542,109 @@ TestCase subclass: OAuthFlowsTest
     claims := toks idTokenClaims at: "iss" put: "https://other.test"
     got := OAuthFlows userInfo: self.server tokenSet: (toks withIdTokenClaims: claims)
     self assert: (self codeOf: got) equals: "issuer_mismatch"
+
+  // ===== Hardening =====
+  testValuelessAndMalformedErrorAreParseErrors =>
+    sess := self newSession
+    empty := OAuthFlows
+      handleCallback: "error=&state={sess state}"
+      store: self.store
+      boundTo: self.binding
+    self assert: (self codeOf: empty) equals: "parse"
+    quoted := OAuthFlows
+      handleCallback: #(#("error", "bad""code"), #("state", sess state))
+      store: self.store
+      boundTo: self.binding
+    self assert: (self codeOf: quoted) equals: "parse"
+    symbol := OAuthFlows
+      handleCallback: #(#("code", #true), #("state", sess state))
+      store: self.store
+      boundTo: self.binding
+    self assert: (self codeOf: symbol) equals: "parse"
+    self assert: self.store size equals: 1
+
+  testIssRequirementComesFromContextNotMetadata =>
+    self.provider discoveryOverrides: #{
+      "authorization_response_iss_parameter_supported" => true
+    }
+    self.server := (self discover: #{}) withMetadata: #{}
+    sess := self newSession
+    got := OAuthFlows
+      exchangeCode: self.server
+      client: self.reg
+      callback: (self callbackFor: sess)
+    self assert: (self codeOf: got) equals: "issuer_mismatch"
+    self assert: self.provider lastTokenRequest equals: nil
+
+  testMissingIdTokenIsRejected =>
+    sess := self newSession
+    self.provider tokenFields: #{"id_token" => nil}
+    got := OAuthFlows
+      exchangeCode: self.server
+      client: self.reg
+      callback: (self callbackFor: sess)
+    self assert: (self codeOf: got) equals: "missing_id_token"
+
+  testOidccCrashBecomesErrorWithoutSecrets =>
+    // Empty algorithm lists make oidcc raise badarg with the ID token,
+    // client context and options as the call's arguments.
+    self.provider
+      discoveryOverrides: #{
+        "id_token_signing_alg_values_supported" => #(),
+        "id_token_encryption_alg_values_supported" => #()
+      }
+    self.server := self discover: #{}
+    sess := self newSession
+    got := OAuthFlows
+      exchangeCode: self.server
+      client: self.reg
+      callback: (self callbackFor: sess)
+    err := got error
+    self assert: err code equals: "oidcc_crash"
+    text := err printString ++ err detail printString
+    self deny: (text includesSubstring: FixtureProvider clientSecret)
+    self deny: (text includesSubstring: sess codeVerifier)
+
+  testUserInfoWithoutEndpoint =>
+    self.provider discoveryOverrides: #{"userinfo_endpoint" => nil}
+    self.server := self discover: #{}
+    toks := self exchange
+    got := OAuthFlows
+      userInfo: self.server
+      client: self.reg
+      tokenSet: toks
+    self assert: (self codeOf: got) equals: "no_userinfo_endpoint"
+
+  testForgedServerIsRefusedForRefreshAndUserInfo =>
+    toks := self exchange
+    self.provider reset
+    self.provider
+      fail: "/userinfo"
+      status: 500
+      body: #{"error" => "server_error"}
+    forged := self.server withIssuer: "https://forged.test"
+    claims := toks idTokenClaims at: "iss" put: "https://forged.test"
+    forgedToks := toks withIdTokenClaims: claims
+    refreshed := OAuthFlows
+      refresh: forged
+      client: self.reg
+      tokenSet: forgedToks
+    self assert: (self codeOf: refreshed) equals: "session_mismatch"
+    self assert: self.provider lastTokenRequest equals: nil
+    // A request would have answered the configured 500.
+    info := OAuthFlows
+      userInfo: forged
+      client: self.reg
+      tokenSet: forgedToks
+    self assert: (self codeOf: info) equals: "session_mismatch"
+
+  testTokensForAnotherClientAreRefused =>
+    toks := self exchange
+    self.provider reset
+    other := self.reg withClientId: "client-2"
+    got := OAuthFlows
+      refresh: self.server
+      client: other
+      tokenSet: toks
+    self assert: (self codeOf: got) equals: "session_mismatch"
+    self assert: self.provider lastTokenRequest equals: nil

@@ -31,7 +31,10 @@ issuer with another provider's context is refused before any request
 
 Errors are `oidcc`'s own reasons, plus `{insecure_endpoint, Field, Url}`
 from the HTTPS-only check, `{http_client, Reason}` from the adapter,
-`{missing_param, Key}` and `{session_mismatch, issuer}` from this shim.
+and, from this shim, `{missing_param, Key}`, `{session_mismatch, issuer}`,
+`{issuer_mismatch, iss | missing_iss}`, `missing_id_token`,
+`no_userinfo_endpoint` and `{oidcc_crash, Class}` (an exception inside
+`oidcc`, caught so its stacktrace cannot carry secrets).
 `OAuthError fromOidcc:` maps all of them.
 """.
 
@@ -289,7 +292,7 @@ authorize_url({beamtalk_oauth_provider, #{config := Config}} = Provider, Client,
             scopes => [untag(S) || S <- maps:get(scopes, Params, [])],
             url_extension => [{untag(K), untag(V)} || {K, V} <- maps:get(extra, Params, [])]
         },
-        {ok, Url} ?= oidcc_authorization:create_redirect_url(Context, Opts),
+        {ok, Url} ?= guard(fun() -> oidcc_authorization:create_redirect_url(Context, Opts) end),
         {ok, str(Url)}
     end;
 authorize_url(_Provider, _Client, _Params) ->
@@ -299,6 +302,38 @@ check_s256(#oidcc_provider_configuration{code_challenge_methods_supported = Meth
     case is_list(Methods) andalso lists:member(<<"S256">>, Methods) of
         true -> ok;
         false -> {error, no_supported_code_challenge}
+    end.
+
+%% Run an `oidcc` call. A crash inside `oidcc` (a malformed provider
+%% answer, an empty algorithm list) must not escape: its stacktrace can
+%% hold the ID token, the client context (secret) and the options
+%% (verifier, nonce). It becomes a fixed reason, like the adapter's.
+guard(Fun) ->
+    try
+        Fun()
+    catch
+        Class:_Reason -> {error, {oidcc_crash, Class}}
+    end.
+
+%% `ok` when the RFC 9207 callback `iss` agrees with the configuration.
+check_callback_iss({beamtalk_oauth_provider, #{config := Config}}, Iss0) ->
+    #oidcc_provider_configuration{
+        issuer = Issuer, authorization_response_iss_parameter_supported = Advertised
+    } = Config,
+    case text(Iss0) of
+        {ok, Issuer} -> ok;
+        {ok, _Other} -> {error, {issuer_mismatch, iss}};
+        error when Advertised =:= true -> {error, {issuer_mismatch, missing_iss}};
+        error -> ok
+    end.
+
+check_id_token(#oidcc_token{id = #oidcc_token_id{}}) -> ok;
+check_id_token(_Token) -> {error, missing_id_token}.
+
+check_userinfo_endpoint({beamtalk_oauth_provider, #{config := Config}}) ->
+    case Config#oidcc_provider_configuration.userinfo_endpoint of
+        undefined -> {error, no_userinfo_endpoint};
+        _ -> ok
     end.
 
 %% `ok` when `Expected` is the issuer of `Provider`'s own configuration.
@@ -314,8 +349,18 @@ ID token validated by `oidcc` and PKCE always required.
 
 `Client` is `#{client_id, client_secret}` (secret `nil` for a public
 client); `Params` is `#{issuer, code, redirect_uri, nonce,
-pkce_verifier}`, where `issuer` is the issuer the flow was started for
-(checked against the provider configuration before any request).
+pkce_verifier}` plus an optional `iss`, where `issuer` is the issuer the
+flow was started for. Before any request, `issuer` is checked against
+the provider configuration, and so is the callback's RFC 9207 `iss`:
+it must equal the configuration's issuer when present, and must be
+present when the configuration sets
+`authorization_response_iss_parameter_supported`
+(`{error, {issuer_mismatch, iss}}` / `{issuer_mismatch, missing_iss}`).
+
+A token response without an ID token answers
+`{error, missing_id_token}`: `oidcc` accepts one, but then checks no
+nonce and validates no subject.
+
 Answers `{ok, token_to_map(Token)}` or `{error, Reason}`.
 """.
 -spec retrieve_token(provider(), Client :: map(), Params :: map()) ->
@@ -329,6 +374,7 @@ retrieve_token({beamtalk_oauth_provider, _} = Provider, Client, Params) when
         {ok, [Issuer, Code, Redirect, Nonce, Verifier]} ?=
             required(Params, [issuer, code, redirect_uri, nonce, pkce_verifier]),
         ok ?= check_issuer(Provider, Issuer),
+        ok ?= check_callback_iss(Provider, maps:get(iss, Params, nil)),
         Context = client_context(Provider, ClientId, maps:get(client_secret, Client, nil)),
         Opts = (call_opts(Provider))#{
             redirect_uri => Redirect,
@@ -336,7 +382,8 @@ retrieve_token({beamtalk_oauth_provider, _} = Provider, Client, Params) when
             pkce_verifier => Verifier,
             require_pkce => true
         },
-        {ok, Token} ?= oidcc_token:retrieve(Code, Context, Opts),
+        {ok, Token} ?= guard(fun() -> oidcc_token:retrieve(Code, Context, Opts) end),
+        ok ?= check_id_token(Token),
         {ok, token_to_map(Token)}
     end;
 retrieve_token(_Provider, _Client, _Params) ->
@@ -346,7 +393,8 @@ retrieve_token(_Provider, _Client, _Params) ->
 -doc """
 Refresh at `Provider`'s token endpoint with `oidcc_token:refresh/3`.
 `oidcc` requires the response's ID token and checks that its `sub` is
-`expected_subject` (`{error, sub_invalid}` otherwise).
+`expected_subject` (`{error, sub_invalid}` otherwise, including when the
+response carries no ID token at all).
 
 `Client` is as for `retrieve_token/3`; `Params` is
 `#{issuer, refresh_token, expected_subject}`, where `issuer` is the
@@ -365,7 +413,7 @@ refresh_token({beamtalk_oauth_provider, _} = Provider, Client, Params) when
         ok ?= check_issuer(Provider, Issuer),
         Context = client_context(Provider, ClientId, maps:get(client_secret, Client, nil)),
         Opts = (call_opts(Provider))#{expected_subject => Subject},
-        {ok, Token} ?= oidcc_token:refresh(RefreshToken, Context, Opts),
+        {ok, Token} ?= guard(fun() -> oidcc_token:refresh(RefreshToken, Context, Opts) end),
         {ok, token_to_map(Token)}
     end;
 refresh_token(_Provider, _Client, _Params) ->
@@ -395,7 +443,8 @@ userinfo({beamtalk_oauth_provider, _} = Provider, Client, Params) when
         Context = client_context(Provider, ClientId, maps:get(client_secret, Client, nil)),
         Access = #oidcc_token_access{token = AccessToken, type = Type},
         Opts = (call_opts(Provider))#{expected_subject => Subject},
-        {ok, Claims} ?= oidcc_userinfo:retrieve(Access, Context, Opts),
+        ok ?= check_userinfo_endpoint(Provider),
+        {ok, Claims} ?= guard(fun() -> oidcc_userinfo:retrieve(Access, Context, Opts) end),
         {ok, to_beamtalk(Claims)}
     end;
 userinfo(_Provider, _Client, _Params) ->
