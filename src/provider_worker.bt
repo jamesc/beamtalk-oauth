@@ -1,0 +1,148 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+/// ProviderWorker — a supervised provider configuration and JWKS that
+/// stay fresh.
+///
+/// `OAuthServer fromDiscovery:` loads discovery and the JWKS once, which
+/// suits scripts, CLIs and the REPL. A long-running service can run a
+/// `ProviderWorker` instead: it wraps `oidcc`'s
+/// `oidcc_provider_configuration_worker`, which reloads the configuration
+/// and JWKS when they expire (from the responses' cache headers), so
+/// logins skip discovery. `server` answers an `OAuthServer` built from the
+/// worker's current configuration and keys; use it wherever a
+/// `fromDiscovery:` server goes.
+///
+/// When a token names a key the server does not have, validation asks the
+/// worker to reload its JWKS, so the new key is kept for every later
+/// login (a `fromDiscovery:` server reloads for that one call only).
+///
+/// The worker is an optimization, not a requirement: `fromDiscovery:`
+/// works everywhere (ADR 0001, Open Question 9). `oidcc` starts no
+/// processes of its own; the app owns this one.
+///
+/// Every load goes through the `http` package's `HTTPClient`, never
+/// `httpc`. The issuer and every endpoint must be HTTPS. A failed load is
+/// retried with backoff (1 s to 30 s by default), and `server` answers
+/// `provider_unavailable` until a load succeeds. The worker holds no
+/// secrets; `sys:get_status` shows only its issuer and the `oidcc`
+/// worker's pid.
+///
+/// Options, as for `OAuthServer fromDiscovery:preset:options:`
+/// (`#maxBodyBytes`, `#timeout`, test-only `#allowUnsafeHttp`), plus
+/// `#backoffMin` and `#backoffMax` (ms) and `#backoffType` (`#stop`,
+/// `#exponential`, `#random`, `#random_exponential`) for failed loads.
+///
+/// ## In a supervision tree
+/// `supervisionSpecFor:` takes the same Dictionary as `startWith:`
+/// (`#issuer`, `#preset`, `#options`). The supervisor restarts the worker
+/// if it, or the `oidcc` worker it runs, crashes.
+/// ```beamtalk
+/// Supervisor subclass: AppSup
+///   childSpecs => #(
+///     ((ProviderWorker supervisionSpecFor: #{#preset => ProviderPresets gitlab})
+///       withId: #gitlab
+///       withRestart: #permanent),
+///     WebServer)
+///
+/// // later, in a request handler:
+/// worker := (AppSup current childWithId: #gitlab) unwrap
+/// server := worker server unwrap
+/// ```
+///
+/// (A plain `ProviderWorker supervisionSpec withArgs:` does not work: a
+/// supervisor starts a `native:` actor's facade module instead of its
+/// backing module. `supervisionSpecFor:` starts it through `start:`.)
+///
+/// ## Examples
+/// ```beamtalk
+/// worker := (ProviderWorker preset: ProviderPresets gitlab) unwrap
+/// server := worker server unwrap
+/// server issuer                 // => "https://gitlab.com"
+/// worker stop
+/// ```
+Actor subclass: ProviderWorker native: beamtalk_oauth_provider_worker
+
+  /// Start a worker for `issuer`, with no preset.
+  class issuer: issuer :: String -> Result(ProviderWorker, OAuthError) =>
+    self
+      issuer: issuer
+      preset: #{}
+      options: #{}
+
+  /// Start a worker for the provider a preset names (`#issuer`), with its
+  /// quirks.
+  class preset: preset :: Dictionary -> Result(ProviderWorker, OAuthError) =>
+    self preset: preset options: #{}
+
+  /// As `preset:`, with options.
+  class preset: preset :: Dictionary options: opts :: Dictionary -> Result(ProviderWorker, OAuthError) =>
+    self startWith: #{#preset => preset, #options => opts}
+
+  /// Start a worker for `issuer`, applying the preset's
+  /// `#documentOverrides` and endpoints, with options (see the class
+  /// comment).
+  class issuer: issuer :: String preset: preset :: Dictionary options: opts :: Dictionary -> Result(ProviderWorker, OAuthError) =>
+    self startWith: #{#issuer => issuer, #preset => preset, #options => opts}
+
+  /// Start a worker from a Dictionary: `#issuer` (or the preset's),
+  /// `#preset` (default `#{}`) and `#options` (default `#{}`). A bad
+  /// issuer or option answers `Result error:` and starts nothing.
+  ///
+  /// The worker is linked to the caller, as any `spawnWith:` is; in a
+  /// service, start it under a supervisor with `supervisionSpecFor:`.
+  class startWith: config :: Dictionary -> Result(ProviderWorker, OAuthError) =>
+    preset := config at: #preset ifAbsent: [#{}]
+    (preset isKindOf: Dictionary) ifFalse: [
+      ^Result error: (OAuthError config: "#preset must be a Dictionary")
+    ]
+    issuer := config at: #issuer ifAbsent: [preset at: #issuer ifAbsent: [nil]]
+    (issuer isKindOf: String) ifFalse: [
+      ^Result error: (OAuthError config: "no #issuer, and the preset names none")
+    ]
+    full := #{
+      #issuer => issuer,
+      #client => HTTPClient,
+      #preset => preset,
+      #options => (config at: #options ifAbsent: [#{}])
+    }
+    problem := Erlang beamtalk_oauth_provider_worker check: full
+    problem isNil ifFalse: [^Result error: (self errorFor: problem)]
+    Result ok: (self spawnWith: full)
+
+  /// As `startWith:`, raising on a bad config. A supervisor starts (and
+  /// restarts) the worker through this; see `supervisionSpecFor:`.
+  class start: config :: Dictionary -> ProviderWorker =>
+    (self startWith: config) ifOk: [:worker |
+      worker
+    ] ifError: [:err |
+      Error signal: "ProviderWorker: {err code}: {err description}"
+    ]
+
+  /// A `SupervisionSpec` that starts a worker from `config` (as
+  /// `startWith:` takes it). Refine it with `withId:`, `withRestart:`, ...
+  class supervisionSpecFor: config :: Dictionary -> SupervisionSpec =>
+    (self supervisionSpec withClassMethod: #start:) withArgs: #(config)
+
+  /// The `OAuthError` for a config problem from the backing module's
+  /// `check/1`.
+  class errorFor: problem :: Tuple -> OAuthError =>
+    (problem at: 1) =:= #config ifTrue: [
+      OAuthError config: (problem at: 2)
+    ] ifFalse: [OAuthError fromOidcc: problem]
+
+  /// An `OAuthServer` from the worker's current configuration and JWKS.
+  /// Waits for the first load; answers `provider_unavailable` while no
+  /// load has succeeded, and `insecure_endpoint` if the configuration
+  /// names a non-HTTPS endpoint.
+  server -> Result(OAuthServer, OAuthError) => self delegate
+
+  /// Reload the configuration and JWKS now, and wait for both. Normally
+  /// the worker reloads on its own when they expire.
+  refresh -> Nil => self delegate
+
+  /// The issuer the worker was started with.
+  issuer -> String => self delegate
+
+  /// The pid of the `oidcc_provider_configuration_worker` it runs.
+  oidccWorker -> Pid => self delegate

@@ -1,0 +1,207 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+// ProviderWorker against the local FixtureProvider: the server it builds,
+// key rotation, refresh, supervision and status redaction. No test hits
+// the network, and none may reach httpc (HttpcGuard), including the
+// oidcc worker's own loads.
+//
+// The exchange goes through the shim's retrieve_token/3; OAuthFlows
+// (BT-4562) runs the full flow through a worker in BT-4565's end-to-end
+// test.
+
+TestCase subclass: ProviderWorkerTest
+  field: provider = nil
+  field: worker = nil
+
+  setUp =>
+    HttpcGuard install
+    self.provider := FixtureProvider start
+    self
+
+  tearDown =>
+    (self.worker notNil and: [self.worker isAlive]) ifTrue: [self.worker stop]
+    self.provider stop
+    self assert: HttpcGuard calls equals: 0
+    nil
+
+  unsafe -> Dictionary => #{#allowUnsafeHttp => true}
+
+  start: preset :: Dictionary -> ProviderWorker =>
+    self.worker := (ProviderWorker
+      issuer: self.provider issuer
+      preset: preset
+      options: self unsafe) unwrap
+    self.worker
+
+  confidential -> Dictionary =>
+    #{
+      #client_id => FixtureProvider clientId,
+      #client_secret => FixtureProvider clientSecret
+    }
+
+  codeParams -> Dictionary =>
+    #{
+      #code => "code-1",
+      #redirect_uri => "http://127.0.0.1:50278/callback",
+      #nonce => FixtureProvider nonce,
+      #pkce_verifier => Secrets generate
+    }
+
+  retrieve: server :: OAuthServer client: client :: Dictionary -> Result =>
+    Erlang beamtalk_oauth_oidcc
+      retrieve_token: server context
+      with: client
+      with: self codeParams
+
+  exchange: server :: OAuthServer -> Dictionary =>
+    self assertOk: (self retrieve: server client: self confidential)
+
+  render: term =>
+    Erlang unicode characters_to_binary: (Erlang io_lib format: "~p" with: #(term))
+
+  // ===== server =====
+  testServerFromWorker =>
+    worker := self start: #{}
+    server := self assertOk: worker server
+    issuer := self.provider issuer
+    self assert: worker issuer equals: issuer
+    self assert: server issuer equals: issuer
+    self assert: server tokenEndpoint equals: "{issuer}/token"
+    self assert: server revocationEndpoint equals: "{issuer}/revoke"
+    self deny: server context isNil
+
+  testExchangeThroughWorkerServer =>
+    server := self assertOk: (self start: #{}) server
+    toks := self exchange: server
+    self assert: (toks at: #access_token) equals: "at-1"
+    self assert: ((toks at: #id_token_claims) at: "sub") equals: "user-1"
+
+  testServerDoesNotRediscover =>
+    worker := self start: #{}
+    self assertOk: worker server
+    self assertOk: worker server
+    self assert: (self.provider hits: "/.well-known/openid-configuration") equals: 1
+    self assert: (self.provider hits: "/jwks") equals: 1
+
+  testPresetQuirksApply =>
+    preset := ProviderPresets gitlab
+    server := self assertOk: (self start: preset) server
+    self assert: server preset equals: preset
+    self assert: server tokenInfoEndpoint equals: (preset at: #tokenInfoEndpoint)
+    // The gitlab preset adds "none", so a public client can exchange.
+    public := #{#client_id => FixtureProvider clientId, #client_secret => nil}
+    self assertOk: (self retrieve: server client: public)
+
+  // ===== key rotation =====
+  testRotatedKeyValidatesAndIsKept =>
+    self.provider keyId: "key-1"
+    worker := self start: #{}
+    server := self assertOk: worker server
+    self exchange: server
+    self.provider rotateKeyTo: "key-2"
+    // The server's keys predate the rotation; the unknown kid makes the
+    // worker reload its JWKS.
+    self exchange: server
+    self assert: (self.provider hits: "/jwks") equals: 2
+    // The worker kept the new key: a fresh server validates without
+    // another JWKS load.
+    self exchange: (self assertOk: worker server)
+    self assert: (self.provider hits: "/jwks") equals: 2
+
+  testRotationAfterWorkerStopsStillValidates =>
+    self.provider keyId: "key-1"
+    worker := self start: #{}
+    server := self assertOk: worker server
+    worker stop
+    self.provider rotateKeyTo: "key-2"
+    self exchange: server
+
+  testRefreshReloads =>
+    worker := self start: #{}
+    self assertOk: worker server
+    self assert: worker refresh equals: nil
+    self assert: (self.provider hits: "/.well-known/openid-configuration") equals: 2
+    self assert: (self.provider hits: "/jwks") equals: 2
+
+  // ===== configuration errors =====
+  testInsecureIssuerIsRefused =>
+    err := (ProviderWorker issuer: "http://example.com") error
+    self assert: err code equals: "insecure_endpoint"
+    // The fixture is plain HTTP: refused without the test-only opt-in.
+    local := (ProviderWorker issuer: self.provider issuer) error
+    self assert: local code equals: "insecure_endpoint"
+
+  testUnknownOptionIsRefused =>
+    err := (ProviderWorker
+      issuer: self.provider issuer
+      preset: #{}
+      options: #{#allowUnsafeHttp => true, #bogus => 1}) error
+    self assert: err code equals: "config"
+    self assert: (err description includesSubstring: "bogus")
+
+  testPresetWithoutIssuerIsRefused =>
+    self assert: (ProviderWorker preset: #{}) error code equals: "config"
+
+  testUnreachableProviderIsUnavailable =>
+    srv := HTTPServer start: 0 handler: [:req |
+      HTTPResponse new: #{#status => 404}
+    ]
+    port := srv port
+    srv stop
+    self.worker := (ProviderWorker
+      issuer: "http://127.0.0.1:{port}"
+      preset: #{}
+      options: #{
+        #allowUnsafeHttp => true,
+        #backoffMin => 60000,
+        #backoffMax => 60000
+      }) unwrap
+    self assert: self.worker server error code equals: "provider_unavailable"
+    self assert: self.worker isAlive
+
+  // ===== process =====
+  testStatusShowsNoSecrets =>
+    worker := self start: ProviderPresets gitlab
+    self exchange: (self assertOk: worker server)
+    text := self render: (Erlang sys get_status: worker pid)
+    self assert: (text includesSubstring: "127.0.0.1")
+    self deny: (text includesSubstring: FixtureProvider clientSecret)
+    self deny: (text includesSubstring: "request_opts")
+    self deny: (text includesSubstring: "document_overrides")
+
+  testStopStopsOidccWorker =>
+    worker := self start: #{}
+    inner := worker oidccWorker
+    self assert: (Erlang erlang is_process_alive: inner)
+    worker stop
+    self deny: (Erlang erlang is_process_alive: inner)
+
+  testSupervisedChild =>
+    sup := ProviderWorkerSup spawnWith: #{
+      #issuer => self.provider issuer,
+      #options => self unsafe
+    }
+    child := (sup childWithId: #provider) unwrap
+    self exchange: (self assertOk: child server)
+    // The oidcc worker crashing takes the ProviderWorker with it, and the
+    // supervisor restarts both.
+    Erlang erlang exit: child oidccWorker with: #kill
+    restarted := self waitForRestartOf: child in: sup
+    self exchange: (self assertOk: restarted server)
+    sup stop
+
+  // The running #provider child once it is no longer `old`.
+  waitForRestartOf: old in: sup :: ProviderWorkerSup =>
+    current := nil
+    tries := 0
+    [current isNil and: [tries < 100]]
+      whileTrue: [
+        tries := tries + 1
+        found := [(sup childWithId: #provider) unwrap] on: Error do: [:e | nil]
+        (found notNil and: [
+          (found pid =:= old pid) not
+        ]) ifTrue: [current := found] ifFalse: [Erlang timer sleep: 20]
+      ]
+    self deny: current isNil
+    current

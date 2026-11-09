@@ -33,9 +33,12 @@ from the HTTPS-only check and `{http_client, Reason}` from the adapter.
 -export([
     ensure_started/0,
     discover/2,
+    load_opts/1,
+    provider_info/4,
     client_context/3,
     call_opts/1,
     check_https/2,
+    check_endpoints/2,
     retrieve_token/3,
     token_to_map/1,
     to_beamtalk/1
@@ -47,7 +50,8 @@ from the HTTPS-only check and `{http_client, Reason}` from the adapter.
 -opaque provider() :: {beamtalk_oauth_provider, #{
     config := oidcc_provider_configuration:t(),
     jwks := jose_jwk:key(),
-    request_opts := oidcc_http_util:request_opts()
+    request_opts := oidcc_http_util:request_opts(),
+    worker => pid()
 }}.
 
 %% `oidcc` checks ID-token `iat`/`exp`/`nbf` with no tolerance by default;
@@ -112,32 +116,81 @@ discover(Issuer0, Opts) when is_map(Opts) ->
     ensure_started(),
     Issuer = bin(Issuer0),
     Unsafe = maps:get(allow_unsafe_http, Opts, false) =:= true,
-    RequestOpts = request_opts(Opts),
-    Overrides = untag(maps:get(document_overrides, Opts, #{})),
-    Quirks = #{document_overrides => Overrides, allow_unsafe_http => Unsafe},
-    LoadOpts = #{request_opts => RequestOpts, quirks => Quirks},
+    LoadOpts = #{request_opts := RequestOpts} = load_opts(Opts),
     maybe
         ok ?= check_url(issuer, Issuer, Unsafe),
         {ok, {Config, _ConfigExpiry}} ?=
             oidcc_provider_configuration:load_configuration(Issuer, LoadOpts),
-        Endpoints = config_map(Config),
-        ok ?= check_complete(Endpoints),
-        ok ?= check_https(Endpoints, Unsafe),
+        ok ?= check_endpoints(Config, Unsafe),
         {ok, {Jwks, _JwksExpiry}} ?=
             oidcc_provider_configuration:load_jwks(
                 Config#oidcc_provider_configuration.jwks_uri, LoadOpts
             ),
-        Provider =
-            {beamtalk_oauth_provider, #{
-                config => Config, jwks => Jwks, request_opts => RequestOpts
-            }},
-        {ok, #{
-            issuer => str(Config#oidcc_provider_configuration.issuer),
-            context => Provider,
-            revocation_endpoint => opt_str(Config#oidcc_provider_configuration.revocation_endpoint),
-            metadata => to_beamtalk(config_map(Config))
-        }}
+        {ok, provider_info(Config, Jwks, RequestOpts, undefined)}
     end.
+
+-doc """
+The options `oidcc` loads a provider configuration and JWKS with:
+`#{request_opts, quirks}`, built from the same `Opts` as `discover/2`
+(`client`, `document_overrides`, `allow_unsafe_http`, `max_body_bytes`,
+`timeout`). `request_opts` carries the adapter, so a load made with these
+options never reaches `httpc`. `ProviderWorker` hands them to
+`oidcc_provider_configuration_worker` as its
+`provider_configuration_opts`.
+""".
+-spec load_opts(Opts :: map()) -> #{request_opts := map(), quirks := map()}.
+load_opts(Opts) when is_map(Opts) ->
+    Unsafe = maps:get(allow_unsafe_http, Opts, false) =:= true,
+    Overrides = untag(maps:get(document_overrides, Opts, #{})),
+    #{
+        request_opts => request_opts(Opts),
+        quirks => #{document_overrides => Overrides, allow_unsafe_http => Unsafe}
+    }.
+
+-doc """
+`ok` when the configuration names every endpoint field the HTTPS check
+knows and each is HTTPS (or, with `AllowUnsafe`, plain HTTP on a loopback
+host); `{error, Reason}` otherwise.
+""".
+-spec check_endpoints(oidcc_provider_configuration:t(), AllowUnsafe :: boolean()) ->
+    ok | {error, term()}.
+check_endpoints(Config, Unsafe) ->
+    Endpoints = config_map(Config),
+    maybe
+        ok ?= check_complete(Endpoints),
+        check_https(Endpoints, Unsafe)
+    end.
+
+-doc """
+What Beamtalk's `OAuthServer fromShim:preset:` reads, for a loaded
+configuration and JWKS: `#{issuer, context, revocation_endpoint,
+metadata}`. `context` is the opaque provider; `metadata` the
+configuration record as a map.
+
+`Worker` is the `oidcc_provider_configuration_worker` the configuration
+came from, or `undefined`. With a worker, the context's `refresh_jwks`
+callback asks the worker to reload, so the new keys are kept for every
+later caller (see `call_opts/1`).
+""".
+-spec provider_info(
+    oidcc_provider_configuration:t(),
+    jose_jwk:key(),
+    RequestOpts :: map(),
+    Worker :: pid() | undefined
+) -> map().
+provider_info(Config, Jwks, RequestOpts, Worker) ->
+    Context0 = #{config => Config, jwks => Jwks, request_opts => RequestOpts},
+    Context =
+        case is_pid(Worker) of
+            true -> Context0#{worker => Worker};
+            false -> Context0
+        end,
+    #{
+        issuer => str(Config#oidcc_provider_configuration.issuer),
+        context => {beamtalk_oauth_provider, Context},
+        revocation_endpoint => opt_str(Config#oidcc_provider_configuration.revocation_endpoint),
+        metadata => to_beamtalk(config_map(Config))
+    }.
 
 -doc """
 An `oidcc` client context for `Provider` and a client id. `Secret` is the
@@ -159,13 +212,19 @@ client_context(_NotAProvider, _ClientId, _Secret) ->
 
 -doc """
 The options every `oidcc` call for `Provider` starts from: the adapter in
-`request_opts`, and a `refresh_jwks` callback that reloads the JWKS
-through the same adapter when a token names an unknown `kid`.
+`request_opts`, and a `refresh_jwks` callback for a token that names an
+unknown `kid`.
+
+A provider from `discover/2` reloads the JWKS through the adapter itself;
+the new keys last for that one call. A provider from a `ProviderWorker`
+asks the worker to reload instead, so the worker keeps the new keys for
+every later caller; if the worker has gone, it falls back to reloading
+directly.
 """.
 -spec call_opts(provider()) -> map().
-call_opts({beamtalk_oauth_provider, #{config := Config, request_opts := RequestOpts}}) ->
+call_opts({beamtalk_oauth_provider, #{config := Config, request_opts := RequestOpts} = Ctx}) ->
     JwksUri = Config#oidcc_provider_configuration.jwks_uri,
-    Refresh = fun(_Jwks, _Kid) ->
+    Direct = fun() ->
         case
             oidcc_provider_configuration:load_jwks(JwksUri, #{request_opts => RequestOpts})
         of
@@ -173,7 +232,26 @@ call_opts({beamtalk_oauth_provider, #{config := Config, request_opts := RequestO
             {error, Reason} -> {error, Reason}
         end
     end,
+    Refresh =
+        case Ctx of
+            #{worker := Worker} -> fun(_Jwks, Kid) -> worker_jwks(Worker, Kid, Direct) end;
+            _ -> fun(_Jwks, _Kid) -> Direct() end
+        end,
     #{request_opts => RequestOpts, refresh_jwks => Refresh}.
+
+%% Ask the worker to reload its JWKS for `Kid' (it skips the reload when it
+%% already has that key) and answer its keys. A worker that has stopped,
+%% or has no keys, falls back to `Direct'.
+worker_jwks(Worker, Kid, Direct) ->
+    try
+        ok = oidcc_provider_configuration_worker:refresh_jwks_for_unknown_kid(Worker, Kid),
+        oidcc_provider_configuration_worker:get_jwks(Worker)
+    of
+        undefined -> Direct();
+        Jwks -> {ok, Jwks}
+    catch
+        exit:_ -> Direct()
+    end.
 
 -doc """
 `ok` when every URL in `Endpoints` (a map of field name to URL, or to a
