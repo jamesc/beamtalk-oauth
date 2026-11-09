@@ -1,0 +1,13 @@
+# Build outputs
+/_build/
+*.beam
+*.core
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local agent settings
+.claude/settings.local.json

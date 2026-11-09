@@ -1,0 +1,12 @@
+# Copyright 2026 oauth authors
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "oauth"
+version = "0.1.0"
+
+[dependencies]
+http = "0.3.2"
+
+[native.dependencies]
+oidcc = "3.9.2"

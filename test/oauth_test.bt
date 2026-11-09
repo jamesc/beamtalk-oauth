@@ -1,0 +1,6 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+TestCase subclass: OauthTest
+
+  testBasic => self assert: (Oauth greet) equals: "Hello from oauth!"
