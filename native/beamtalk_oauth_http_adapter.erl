@@ -30,6 +30,11 @@ response is also kept in the calling process's dictionary under
 this for refresh: `oidcc_token:refresh/3` discards a response that has
 no ID token, and the shim must still read it.
 
+A `200` answer to a `GET` of a discovery document is handed to
+`beamtalk_oauth_oidcc:mark_discovery/3`, which marks a document that
+leaves out `revocation_endpoint_auth_methods_supported` (so the marker
+survives `oidcc` applying the RFC 8414 default).
+
 Every URL must be HTTPS (`{error, {http_client, insecure_url}}`
 otherwise), whatever `oidcc` accepted: `oidcc` itself takes a plain-HTTP
 `jwks_uri`, and an `oidcc_provider_configuration_worker` fetches it
@@ -119,7 +124,7 @@ do_request(Method, Request, HttpOptions, Client, Config) ->
             beamtalk_message_dispatch:send(Client, 'request:url:options:', [Method, str(Url), Opts])
         ),
         capture(Method, Answer, Config),
-        Answer
+        mark_discovery(Method, Url, Answer)
     else
         {error, Reason} -> {error, {http_client, Reason}}
     end.
@@ -129,6 +134,15 @@ capture(post, {ok, {_Status, _Headers, Body}}, #{capture := true}) ->
     ok;
 capture(_Method, _Answer, _Config) ->
     ok.
+
+%% A discovery document is passed through the shim, which records whether
+%% the provider named its revocation auth methods before `oidcc` fills in
+%% the RFC 8414 default (`beamtalk_oauth_oidcc:mark_discovery/3`).
+%% Only a 200 is a document: an error body at that URL is left as served.
+mark_discovery(Method, Url, {ok, {{_, 200, _} = Status, Headers, Body}}) ->
+    {ok, {Status, Headers, beamtalk_oauth_oidcc:mark_discovery(Method, Url, Body)}};
+mark_discovery(_Method, _Url, Answer) ->
+    Answer.
 
 %% The opt-in counts only while the test-only application flag is set.
 unsafe(Config) ->

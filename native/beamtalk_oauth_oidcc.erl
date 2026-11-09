@@ -46,6 +46,7 @@ and, from this shim, `{missing_param, Key}`, `{session_mismatch, issuer}`,
     unsafe_http_enabled/0,
     discover/2,
     load_opts/1,
+    mark_discovery/3,
     provider_info/4,
     client_context/3,
     call_opts/1,
@@ -76,6 +77,15 @@ and, from this shim, `{missing_param, Key}`, `{session_mismatch, issuer}`,
 %% How long token validation waits for a `ProviderWorker`'s JWKS reload
 %% before going on with the keys it has.
 -define(WORKER_JWKS_TIMEOUT, 3000).
+
+%% The member `mark_discovery/3` adds to a discovery document that does
+%% not name `revocation_endpoint_auth_methods_supported`, before `oidcc`
+%% fills that field with RFC 8414's default. `oidcc` keeps it in
+%% `extra_fields`; `provider_info/4` turns it into the metadata flag
+%% `revocation_endpoint_auth_methods_advertised`.
+-define(REVOCATION_AUTH_ABSENT, <<"beamtalk_oauth_revocation_auth_methods_absent">>).
+-define(REVOCATION_AUTH_FIELD, <<"revocation_endpoint_auth_methods_supported">>).
+-define(DISCOVERY_SUFFIX, <<"/.well-known/openid-configuration">>).
 
 %% Endpoint fields of the provider configuration that must be HTTPS.
 -define(ENDPOINT_FIELDS, [
@@ -180,11 +190,73 @@ options never reaches `httpc`. `ProviderWorker` hands them to
 -spec load_opts(Opts :: map()) -> #{request_opts := map(), quirks := map()}.
 load_opts(Opts) when is_map(Opts) ->
     Unsafe = maps:get(allow_unsafe_http, Opts, false) =:= true andalso unsafe_http_enabled(),
-    Overrides = untag(maps:get(document_overrides, Opts, #{})),
+    Overrides = overrides(untag(maps:get(document_overrides, Opts, #{}))),
     #{
         request_opts => request_opts(Opts),
         quirks => #{document_overrides => Overrides, allow_unsafe_http => Unsafe}
     }.
+
+%% The document overrides, as `oidcc` merges them over the discovery
+%% document. A caller cannot set the absent-marker itself; overrides that
+%% name the revocation auth methods clear it, since they are then
+%% advertised (by the preset) whatever the provider served.
+overrides(Overrides0) when is_map(Overrides0) ->
+    Overrides = maps:remove(?REVOCATION_AUTH_ABSENT, Overrides0),
+    case maps:is_key(?REVOCATION_AUTH_FIELD, Overrides) of
+        true -> Overrides#{?REVOCATION_AUTH_ABSENT => false};
+        false -> Overrides
+    end;
+overrides(Other) ->
+    Other.
+
+-doc """
+The HTTP adapter's hook for every response: for a `GET` of a discovery
+document (`.../.well-known/openid-configuration`) whose body is a JSON
+object, record whether the provider itself named
+`revocation_endpoint_auth_methods_supported`. `oidcc` fills an absent
+field with RFC 8414's default (`client_secret_basic`), after which the
+two cases look the same. A provider that omits the field may still
+accept only `client_secret_post`, so `TokenRevocation` treats an absent
+field as unadvertised and uses the token endpoint's methods instead (the
+strict fallback, BT-4590). This departs from RFC 8414 §2 on purpose:
+do not change it back to the default.
+
+An absent field adds a marker member to the document (kept by `oidcc`
+in `extra_fields`); a marker the provider sent itself is dropped. Any
+other response, or a body that is not a JSON object, is answered
+unchanged, as is a document that names the field and has no marker.
+""".
+-spec mark_discovery(Method :: atom(), Url :: iodata(), Body :: binary()) -> binary().
+mark_discovery(get, Url, Body) when is_binary(Body) ->
+    try is_discovery_url(Url) andalso json:decode(Body) of
+        Doc when is_map(Doc) ->
+            Clean = maps:remove(?REVOCATION_AUTH_ABSENT, Doc),
+            Marked =
+                case maps:is_key(?REVOCATION_AUTH_FIELD, Clean) of
+                    true -> Clean;
+                    false -> Clean#{?REVOCATION_AUTH_ABSENT => true}
+                end,
+            case Marked =:= Doc of
+                true -> Body;
+                false -> iolist_to_binary(json:encode(Marked))
+            end;
+        _ ->
+            Body
+    catch
+        _:_ -> Body
+    end;
+mark_discovery(_Method, _Url, Body) ->
+    Body.
+
+is_discovery_url(Url) ->
+    case uri_string:parse(iolist_to_binary(Url)) of
+        #{path := Path} when is_binary(Path) ->
+            Size = byte_size(?DISCOVERY_SUFFIX),
+            byte_size(Path) >= Size andalso
+                binary:part(Path, byte_size(Path) - Size, Size) =:= ?DISCOVERY_SUFFIX;
+        _ ->
+            false
+    end.
 
 -doc """
 `ok` when the configuration names every endpoint field the HTTPS check
@@ -228,7 +300,19 @@ provider_info(Config, Jwks, RequestOpts, Worker) ->
         issuer => str(Config#oidcc_provider_configuration.issuer),
         context => {beamtalk_oauth_provider, Context},
         revocation_endpoint => opt_str(Config#oidcc_provider_configuration.revocation_endpoint),
-        metadata => to_beamtalk(config_map(Config))
+        metadata => to_beamtalk(metadata(Config))
+    }.
+
+%% The configuration record as a map, with the absent-marker taken out of
+%% `extra_fields` and stated as `revocation_endpoint_auth_methods_advertised`:
+%% false only when the discovery document left the field out (and no
+%% override named it), so `revocation_endpoint_auth_methods_supported`
+%% holds `oidcc`'s default rather than anything the provider said.
+metadata(#oidcc_provider_configuration{extra_fields = Extra} = Config) ->
+    Absent = maps:get(?REVOCATION_AUTH_ABSENT, Extra, false) =:= true,
+    (config_map(Config))#{
+        extra_fields => maps:remove(?REVOCATION_AUTH_ABSENT, Extra),
+        revocation_endpoint_auth_methods_advertised => not Absent
     }.
 
 -doc """
