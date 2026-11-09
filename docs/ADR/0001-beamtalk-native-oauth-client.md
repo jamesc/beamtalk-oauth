@@ -236,7 +236,8 @@ typed Value subclass: TokenSet
 
 ```beamtalk
 // Grant operations. OIDC paths delegate to oidcc through the shim;
-// revoke and tokenInfo are Beamtalk-owned on HTTPClient.
+// revoke and tokenInfo are Beamtalk-owned on HTTPClient: they delegate
+// to TokenRevocation (BT-4563).
 Object subclass: OAuthFlows
   class authorizeUrl: server client: reg scopes: scopes session: sess -> Result(String, OAuthError) => ...
     // oidcc_authorization:create_redirect_url with state, nonce,
@@ -257,6 +258,7 @@ Object subclass: OAuthFlows
     // merged TokenSet: response values win, and the old refreshToken
     // carries forward when the response omits one (Google usually does).
   class clientCredentials: server client: reg scopes: scopes -> Result(TokenSet, OAuthError) => ...
+    // 0.2
   class userInfo: server tokenSet: toks -> Result(Dictionary, OAuthError) => ...
   class revoke: server client: reg token: tok -> Result(Nil, OAuthError) => ...
     // RFC 7009 on HTTPClient (oidcc has none yet); sends
@@ -453,7 +455,7 @@ typed Value subclass: OAuthError
 Native app (the primary case):
 
 ```beamtalk
-server := (OAuthServer fromDiscovery: "https://gitlab.com") unwrap
+server := (OAuthServer fromPreset: ProviderPresets gitlab) unwrap
 rx := LoopbackReceiver start unwrap
 reg := (ClientRegistration forClient: "APP_ID" redirect: rx redirectUri) unwrap
 store := SessionStore spawn
@@ -466,7 +468,16 @@ query := (rx awaitCallback: 300000) unwrap
 cb := (OAuthFlows handleCallback: query store: store boundTo: rx binding) unwrap
 toks := (OAuthFlows exchangeCode: server client: reg callback: cb store: store) unwrap
 toks subject                              // validated by oidcc
+(OAuthFlows userInfo: server client: reg tokenSet: toks) unwrap
+toks := (OAuthFlows refresh: server client: reg tokenSet: toks) unwrap
+(OAuthFlows revoke: server client: reg token: toks) unwrap
 ```
+
+`fromPreset:` rather than a bare `fromDiscovery:`: the GitLab preset adds
+the `none` client auth method that a public native client needs. The
+runnable form is `examples/native_login.bt`, and
+`test/e2e_native_login_test.bt` runs the same sequence against the
+fixture provider (BT-4565).
 
 ### Error example
 

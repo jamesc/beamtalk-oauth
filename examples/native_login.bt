@@ -1,0 +1,84 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+/// NativeLogin — sign in to gitlab.com from a native app (RFC 8252): a
+/// loopback redirect, PKCE, a validated ID token, then userinfo.
+///
+/// Register a GitLab application (User settings > Applications) that is
+/// not confidential, with the `openid` scope (add `read_user` for more
+/// profile claims) and the redirect URI `http://127.0.0.1:8765/callback`.
+/// GitLab accepts a loopback redirect on any port for it, so the
+/// receiver's OS-assigned port works. Then, from a REPL in this package:
+///
+/// ```beamtalk
+/// // OAUTH_GITLAB_CLIENT_ID=<application id> beamtalk repl
+/// Workspace load: "examples/native_login.bt"
+/// NativeLogin run
+/// ```
+///
+/// `run` prints the authorize URL and waits up to five minutes for the
+/// browser to come back. It prints who signed in, never a token, and
+/// revokes the tokens at the end.
+Object subclass: NativeLogin
+
+  /// The environment variable holding the GitLab application id.
+  class clientIdVariable -> String => "OAUTH_GITLAB_CLIENT_ID"
+
+  /// Sign in, print the user, revoke. Answers the user's subject.
+  class run -> String =>
+    clientId := System getEnv: self clientIdVariable default: ""
+    clientId isEmpty ifTrue: [
+      ^self error: "set {self clientIdVariable} to your GitLab application id"
+    ]
+    server := (OAuthServer fromPreset: ProviderPresets gitlab) unwrap
+    rx := LoopbackReceiver start unwrap
+    store := SessionStore spawn
+    [
+      self
+        login: server
+        client: clientId
+        receiver: rx
+        store: store
+    ]
+      ensure: [
+        rx stop
+        store stop
+      ]
+
+  /// The login itself, with the receiver and store `run` cleans up.
+  class login: server :: OAuthServer client: clientId :: String receiver: rx :: LoopbackReceiver store: store :: SessionStore -> String =>
+    reg := (ClientRegistration forClient: clientId redirect: rx redirectUri) unwrap
+    sess := OAuthSession newSessionFor: server client: reg
+    store create: sess boundTo: rx binding
+    // Before the URL is opened: the receiver only records this state.
+    rx expectState: sess state
+    url := (OAuthFlows
+      authorizeUrl: server
+      client: reg
+      scopes: #("openid", "read_user")
+      session: sess) unwrap
+    Transcript showCr: "Open this URL in your browser and sign in:"
+    Transcript showCr: url
+    query := (rx awaitCallback: 300000) unwrap
+    cb := (OAuthFlows
+      handleCallback: query
+      store: store
+      boundTo: rx binding) unwrap
+    toks := (OAuthFlows
+      exchangeCode: server
+      client: reg
+      callback: cb
+      store: store) unwrap
+    // `toks subject` comes from an ID token oidcc has validated.
+    info := (OAuthFlows
+      userInfo: server
+      client: reg
+      tokenSet: toks) unwrap
+    name := info at: "nickname" ifAbsent: [info at: "name" ifAbsent: ["?"]]
+    Transcript showCr: "Signed in as {name} (GitLab user {toks subject})"
+    (OAuthFlows
+      revoke: server
+      client: reg
+      token: toks) unwrap
+    Transcript showCr: "Tokens revoked."
+    toks subject

@@ -1,0 +1,234 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+// End-to-end native login against the FixtureProvider, composed the way a
+// native app composes it: a real LoopbackReceiver receives a real
+// redirect (the fixture's /authorize answers a 302, followed with
+// HTTPClient as a browser would, then a stray /favicon.ico), the code
+// exchange goes through oidcc and the HTTP adapter, and the same objects
+// then call userinfo, token info, refresh and revoke. Run once with a
+// fromDiscovery: server and once with a ProviderWorker server. No test
+// hits the network, and none may reach httpc (HttpcGuard).
+
+TestCase subclass: E2eNativeLoginTest
+  field: provider = nil
+  field: rx = nil
+  field: store = nil
+
+  setUp =>
+    HttpcGuard install
+    self.provider := FixtureProvider start
+    // A public native client, as on GitLab: the provider must accept
+    // `none` at the token endpoint (the gitlab preset's override).
+    self.provider
+      discoveryOverrides: #{
+        "token_endpoint_auth_methods_supported" => #("none", "client_secret_basic", "client_secret_post")
+      }
+    // Steps 2 and 4: the loopback receiver and the session store.
+    self.rx := LoopbackReceiver start unwrap
+    self.store := SessionStore spawn
+    self
+
+  tearDown =>
+    self.rx stop
+    self.store stop
+    self.provider stop
+    self assert: HttpcGuard calls equals: 0
+    nil
+
+  unsafe -> Dictionary => #{#allowUnsafeHttp => true}
+
+  // Step 1, one-shot: discover the provider.
+  discovered -> OAuthServer =>
+    (OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: #{}
+      options: self unsafe) unwrap
+
+  // Step 1, long-running: a ProviderWorker (the caller stops it).
+  startWorker -> ProviderWorker =>
+    (ProviderWorker
+      issuer: self.provider issuer
+      preset: #{}
+      options: self unsafe) unwrap
+
+  // The value of header `name` in `resp`, or "" when it has none.
+  header: name :: String in: resp :: HTTPResponse -> String =>
+    resp headers
+      do: [:pair |
+        (pair at: 1) asStringUnchecked lowercase =:= name ifTrue: [
+          ^(pair at: 2) asStringUnchecked
+        ]
+      ]
+    ""
+
+  // Step 6, the browser hop: GET the authorize URL, follow its 302 to the
+  // loopback receiver, then fetch /favicon.ico as browsers do. Answers the
+  // receiver's status for the callback.
+  browse: url :: String -> Integer =>
+    authorize := (HTTPClient get: url) unwrap
+    self assert: authorize status equals: 302
+    location := self header: "location" in: authorize
+    self assert: (location startsWith: "{self.rx redirectUri}?")
+    landed := (HTTPClient get: location) unwrap
+    favicon := (HTTPClient get: "http://127.0.0.1:{self.rx port}/favicon.ico") unwrap
+    self assert: favicon status equals: 404
+    landed status
+
+  // Steps 3-7 up to the raw callback query: registration, session,
+  // authorize URL, browser hop, await. Answers `{reg, sess, query}`.
+  signIn: server :: OAuthServer -> Tuple =>
+    reg := (ClientRegistration forClient: FixtureProvider clientId redirect: self.rx redirectUri) unwrap
+    sess := OAuthSession newSessionFor: server client: reg
+    self.store create: sess boundTo: self.rx binding
+    self.rx expectState: sess state
+    url := (OAuthFlows
+      authorizeUrl: server
+      client: reg
+      scopes: #("openid", "profile")
+      session: sess) unwrap
+    self assert: (self browse: url) equals: 200
+    query := (self.rx awaitCallback: 5000) unwrap
+    {reg, sess, query}
+
+  // The whole login and the calls after it, against `server`.
+  runLogin: server :: OAuthServer =>
+    {reg, sess, query} := self signIn: server
+    self assert: (query at: "code") equals: "code-1"
+    self assert: (query at: "state") equals: sess state
+    self assert: (query at: "iss") equals: server issuer
+    // Step 7: the callback, then the code exchange.
+    cb := (OAuthFlows
+      handleCallback: query
+      store: self.store
+      boundTo: self.rx binding) unwrap
+    self assert: cb session state equals: sess state
+    toks := (OAuthFlows
+      exchangeCode: server
+      client: reg
+      callback: cb
+      store: self.store) unwrap
+    // The ID token carried the session's nonce (the fixture echoed it from
+    // the authorize request) and oidcc validated it.
+    self assert: toks subject equals: "user-1"
+    self assert: (toks idTokenClaims at: "nonce") equals: sess nonce
+    self assert: toks accessToken equals: "at-1"
+    // PKCE: the verifier sent to /token hashes to the challenge the
+    // browser carried to /authorize; a public client sends no secret.
+    form := self.provider lastTokenRequest at: #form
+    challenge := ((self.provider lastRequestTo: "/authorize") at: #query) at: "code_challenge"
+    verifier := form at: "code_verifier"
+    self assert: verifier equals: sess codeVerifier
+    self assert: ((Erlang crypto hash: #sha256 with: verifier) asBase64Url replaceAll: "=" with: "") equals: challenge
+    self assert: (form at: "client_id") equals: FixtureProvider clientId
+    self deny: (form includesKey: "client_secret")
+    self deny: ((self.provider lastTokenRequest at: #headers) includesKey: "authorization")
+    // Step 8: userinfo, token info, refresh (merged), revoke.
+    info := (OAuthFlows
+      userInfo: server
+      client: reg
+      tokenSet: toks) unwrap
+    self assert: (info at: "sub") equals: toks subject
+    infoServer := server withTokenInfoEndpoint: "{server issuer}/tokeninfo"
+    self.provider
+      tokenInfo: #{
+        "sub" => "user-1",
+        "aud" => FixtureProvider clientId,
+        "scope" => "openid profile",
+        "expires_in" => 3000
+      }
+    tokenInfo := (OAuthFlows
+      tokenInfo: infoServer
+      client: reg
+      token: toks) unwrap
+    self assert: (tokenInfo at: #active)
+    self assert: (tokenInfo at: #subject) equals: toks subject
+    self.provider tokenFields: #{
+      "access_token" => "at-2",
+      "refresh_token" => nil
+    }
+    fresh := (OAuthFlows
+      refresh: server
+      client: reg
+      tokenSet: toks) unwrap
+    self assert: fresh accessToken equals: "at-2"
+    self assert: fresh refreshToken equals: "rt-1"
+    self assert: fresh subject equals: toks subject
+    self assert: ((self.provider lastTokenRequest at: #form) at: "grant_type") equals: "refresh_token"
+    self
+      assert: (OAuthFlows
+        revoke: server
+        client: reg
+        token: fresh) isOk
+    revoked := (self.provider lastRequestTo: "/revoke") at: #form
+    self assert: (revoked at: "token") equals: "rt-1"
+    self assert: (revoked at: "token_type_hint") equals: "refresh_token"
+    self assert: (revoked at: "client_id") equals: FixtureProvider clientId
+    // The callback is spent: neither it nor its query can be used again.
+    again := OAuthFlows
+      exchangeCode: server
+      client: reg
+      callback: cb
+      store: self.store
+    self assert: again error code equals: "reused_state"
+    replay := OAuthFlows
+      handleCallback: query
+      store: self.store
+      boundTo: self.rx binding
+    self assert: replay error code equals: "reused_state"
+    self deny: self.rx isListening
+
+  // ===== The happy path, both ways to get a server =====
+  testNativeLoginWithDiscovery => self runLogin: self discovered
+
+  testNativeLoginWithProviderWorker =>
+    worker := self startWorker
+    [self runLogin: worker server unwrap] ensure: [worker stop]
+    // The worker discovered once; the login did not rediscover.
+    self assert: (self.provider hits: "/.well-known/openid-configuration") equals: 1
+
+  // ===== Replays (login CSRF) =====
+  testCallbackWithOtherBindingFails =>
+    {_, _, query} := self signIn: self discovered
+    got := OAuthFlows
+      handleCallback: query
+      store: self.store
+      boundTo: Secrets generate
+    self assert: got error code equals: "session_mismatch"
+    // The probe burned the session: the right binding cannot use it now.
+    retry := OAuthFlows
+      handleCallback: query
+      store: self.store
+      boundTo: self.rx binding
+    self assert: retry error code equals: "reused_state"
+
+  testCallbackInOtherStoreFails =>
+    {reg, _, query} := self signIn: self discovered
+    other := SessionStore spawn
+    [
+      self
+        replay: query
+        into: other
+        client: reg
+    ] ensure: [other stop]
+
+  // `query` replayed into `other`, a second store, then the real login
+  // carried on with the ticket redeemed against `other`.
+  replay: query :: Dictionary into: other :: SessionStore client: reg :: ClientRegistration =>
+    got := OAuthFlows
+      handleCallback: query
+      store: other
+      boundTo: self.rx binding
+    self assert: got error code equals: "reused_state"
+    // The real store still holds the session, so the real login goes on.
+    cb := (OAuthFlows
+      handleCallback: query
+      store: self.store
+      boundTo: self.rx binding) unwrap
+    // A ticket redeemed against another store fails too.
+    elsewhere := OAuthFlows
+      exchangeCode: self discovered
+      client: reg
+      callback: cb
+      store: other
+    self assert: elsewhere error code equals: "reused_state"

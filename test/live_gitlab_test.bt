@@ -1,0 +1,99 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+// Opt-in live login against gitlab.com. Skipped unless
+// OAUTH_LIVE_GITLAB_CLIENT_ID is set, so the suite never hits the network
+// by default.
+//
+// It needs a person at a browser on this machine. The test opens the
+// authorize URL with `open` (macOS) or `xdg-open` (elsewhere), or with the
+// command named in OAUTH_LIVE_BROWSER, and also writes it to
+// _build/live_gitlab_authorize_url.txt (`beamtalk test` does not show test
+// output). Sign in within 5 minutes (or OAUTH_LIVE_TIMEOUT_MS). The login
+// is then exchanged, userinfo fetched, the tokens refreshed and revoked.
+//
+// Register a GitLab application (User settings > Applications) that is
+// not confidential, with the `openid` scope and the redirect URI
+// `http://127.0.0.1:8765/callback` (GitLab accepts a loopback redirect on
+// any port for it), then:
+//
+//   OAUTH_LIVE_GITLAB_CLIENT_ID=<application id> beamtalk test test/live_gitlab_test.bt
+//
+// No token is printed or written.
+
+TestCase subclass: LiveGitlabTest
+
+  testLiveGitlabLogin =>
+    clientId := System getEnv: "OAUTH_LIVE_GITLAB_CLIENT_ID" default: ""
+    clientId isEmpty ifTrue: [
+      ^self skip: "set OAUTH_LIVE_GITLAB_CLIENT_ID to run the live GitLab login"
+    ]
+    timeout := (System getEnv: "OAUTH_LIVE_TIMEOUT_MS" default: "300000") asInteger
+    server := (OAuthServer fromPreset: ProviderPresets gitlab) unwrap
+    rx := LoopbackReceiver start unwrap
+    store := SessionStore spawn
+    [
+      self
+        login: server
+        client: clientId
+        receiver: rx
+        store: store
+        timeout: timeout
+    ]
+      ensure: [
+        rx stop
+        store stop
+      ]
+
+  login: server :: OAuthServer client: clientId :: String receiver: rx :: LoopbackReceiver store: store :: SessionStore timeout: timeout :: Integer =>
+    reg := (ClientRegistration forClient: clientId redirect: rx redirectUri) unwrap
+    sess := OAuthSession newSessionFor: server client: reg
+    store create: sess boundTo: rx binding
+    rx expectState: sess state
+    url := (OAuthFlows
+      authorizeUrl: server
+      client: reg
+      scopes: #("openid")
+      session: sess) unwrap
+    self show: url
+    query := (rx awaitCallback: timeout) unwrap
+    cb := (OAuthFlows
+      handleCallback: query
+      store: store
+      boundTo: rx binding) unwrap
+    toks := (OAuthFlows
+      exchangeCode: server
+      client: reg
+      callback: cb
+      store: store) unwrap
+    self deny: toks subject isNil
+    self assert: (toks idTokenClaims at: "iss") equals: "https://gitlab.com"
+    info := (OAuthFlows
+      userInfo: server
+      client: reg
+      tokenSet: toks) unwrap
+    self assert: (info at: "sub") equals: toks subject
+    fresh := (OAuthFlows
+      refresh: server
+      client: reg
+      tokenSet: toks) unwrap
+    self assert: fresh subject equals: toks subject
+    self
+      assert: (OAuthFlows
+        revoke: server
+        client: reg
+        token: fresh) isOk
+
+  // Hand `url` to the person: write it to a file and open the browser.
+  show: url :: String -> Nil =>
+    (File mkdirAll: "_build") unwrap
+    (File writeAll: "_build/live_gitlab_authorize_url.txt" contents: url) unwrap
+    fallback := System osPlatform =:= "darwin" ifTrue: [
+      "open"
+    ] ifFalse: ["xdg-open"]
+    browser := System getEnv: "OAUTH_LIVE_BROWSER" default: fallback
+    // The URL is an argument, never shell text.
+    (Subprocess open: browser args: #(url)) ifOk: [:proc |
+      proc close
+    ] ifError: [:e | nil]
+    nil
