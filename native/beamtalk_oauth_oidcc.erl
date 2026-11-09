@@ -650,11 +650,14 @@ otherwise).
 
 A userinfo response may name distributed claims (OpenID Connect Core
 §5.6.2), which `oidcc` fetches from each `_claim_sources[].endpoint`.
-The adapter hands the userinfo response to `check_claim_sources/2`
-before `oidcc` sees it, so a source endpoint that is not HTTPS fails the
-call with `{insecure_endpoint, claim_source, Url}` before any of them is
-fetched. (An encrypted userinfo JWT cannot be read there; its sources are
-still refused one by one by the adapter's own request-URL check.)
+The adapter hands a JSON or signed-JWT userinfo response to
+`check_claim_sources/2` before `oidcc` sees it, so a source endpoint that
+is not HTTPS fails the call with `{insecure_endpoint, claim_source, Url}`
+before any source is fetched, and before `oidcc` checks the response's
+signature and subject. An encrypted userinfo JWT cannot be read there:
+its plain-HTTP sources are refused one by one by the adapter's own
+request-URL check (`{http_client, insecure_url}`), after any HTTPS
+source listed before them has been fetched.
 
 `Client` is as for `retrieve_token/3` (the id is the expected audience
 of a signed userinfo response); `Params` is
@@ -695,16 +698,16 @@ claim_source_check(
         userinfo_endpoint = Endpoint, mtls_endpoint_aliases = Aliases
     } = Config,
     Urls = [
-        U
+        iolist_to_binary(U)
      || U <- [Endpoint, maps:get(<<"userinfo_endpoint">>, aliases(Aliases), undefined)],
-        is_binary(U)
+        is_binary(U) orelse is_list(U)
     ],
     Check = fun
-        (get, Url, {ok, {{_, Status, _}, Headers, Body}}, Unsafe) when
+        (get, Url, {ok, {{_, Status, _}, _Headers, Body}}, Unsafe) when
             Status =:= 200; Status =:= 201
         ->
             case lists:member(iolist_to_binary(Url), Urls) of
-                true -> check_claim_sources(userinfo_claims(Headers, Body), Unsafe);
+                true -> check_claim_sources(userinfo_claims(Body), Unsafe);
                 false -> ok
             end;
         (_Method, _Url, _Answer, _Unsafe) ->
@@ -716,50 +719,72 @@ aliases(Map) when is_map(Map) -> Map;
 aliases(_) -> #{}.
 
 -doc """
-`ok` when every `_claim_sources[].endpoint` in a userinfo claims map is
-HTTPS (or, with `AllowUnsafe`, plain HTTP on a loopback host), as
+`ok` when every distributed-claim source endpoint in a userinfo claims
+map is HTTPS (or, with `AllowUnsafe`, plain HTTP on a loopback host), as
 `check_https/2` decides; `{error, {insecure_endpoint, claim_source, Url}}`
-for the first that is not. Claims without `_claim_sources`, and sources
-that carry an aggregated `JWT` instead of an endpoint, are `ok`.
+for the first that is not.
+
+The sources checked are the ones `oidcc` would fetch: claims with both
+`_claim_names` and `_claim_sources`, and in `_claim_sources` each source
+with an `endpoint` and no aggregated `JWT`. A source with an endpoint
+that is not text fails. `Url` in the error is the endpoint without its
+user info, query or fragment, which can carry credentials.
 """.
 -spec check_claim_sources(Claims :: term(), AllowUnsafe :: boolean()) ->
-    ok | {error, {insecure_endpoint, claim_source, term()}}.
-check_claim_sources(#{<<"_claim_sources">> := Sources}, Unsafe) when is_map(Sources) ->
+    ok | {error, {insecure_endpoint, claim_source, binary()}}.
+check_claim_sources(#{<<"_claim_names">> := _, <<"_claim_sources">> := Sources}, Unsafe) when
+    is_map(Sources)
+->
     check_sources(maps:values(Sources), Unsafe);
 check_claim_sources(_Claims, _Unsafe) ->
     ok.
 
 check_sources([], _Unsafe) ->
     ok;
+check_sources([#{<<"JWT">> := _Aggregated} | Rest], Unsafe) ->
+    check_sources(Rest, Unsafe);
 check_sources([#{<<"endpoint">> := Endpoint} | Rest], Unsafe) ->
     case check_https(#{claim_source => Endpoint}, Unsafe) of
         ok -> check_sources(Rest, Unsafe);
-        Error -> Error
+        {error, _} -> {error, {insecure_endpoint, claim_source, display_url(Endpoint)}}
     end;
-check_sources([_Aggregated | Rest], Unsafe) ->
+check_sources([_Other | Rest], Unsafe) ->
     check_sources(Rest, Unsafe).
 
+%% `Url` as `scheme://host[:port]/path`, for an error: the user info,
+%% query and fragment of a provider-supplied URL can carry credentials.
+display_url(Url) when is_binary(Url) ->
+    case uri_string:parse(Url) of
+        #{} = Parts ->
+            Kept = maps:with([scheme, host, port, path], Parts),
+            case uri_string:recompose(Kept) of
+                Bin when is_binary(Bin) -> Bin;
+                _ -> <<"[invalid URL]">>
+            end;
+        _ ->
+            <<"[invalid URL]">>
+    end;
+display_url(_NotText) ->
+    <<"[invalid URL]">>.
+
 %% The claims of a userinfo response body, read without validation (only
-%% to find `_claim_sources`): a JSON object, or the payload of a signed
-%% JWT. Anything else (an encrypted JWT, a malformed body) is `#{}`;
-%% `oidcc` judges the body itself.
-userinfo_claims(Headers, Body) ->
+%% to find `_claim_sources`): a JSON object, else the payload of a signed
+%% compact JWT. The content type is not consulted, so no type `oidcc`
+%% reads differently can hide the sources. Anything else (an encrypted
+%% JWT, a malformed body) is `#{}`; `oidcc` judges the body itself.
+userinfo_claims(Body) ->
     try
-        case is_jwt(Headers) of
-            true ->
-                [_Header, Payload, _Signature] = binary:split(Body, <<".">>, [global]),
-                json:decode(base64:decode(Payload, #{mode => urlsafe, padding => false}));
-            false ->
-                json:decode(Body)
-        end
+        json:decode(Body)
     catch
-        _:_ -> #{}
+        _:_ -> jws_payload(Body)
     end.
 
-is_jwt(Headers) ->
-    case proplists:get_value("content-type", Headers) of
-        Type when is_list(Type) -> lists:prefix("application/jwt", string:lowercase(Type));
-        _ -> false
+jws_payload(Body) ->
+    try
+        [_Header, Payload, _Signature] = binary:split(Body, <<".">>, [global]),
+        json:decode(base64:decode(Payload, #{mode => urlsafe, padding => false}))
+    catch
+        _:_ -> #{}
     end.
 
 %% The text values of `Keys` in `Map`, or `{error, {missing_param, Key}}`

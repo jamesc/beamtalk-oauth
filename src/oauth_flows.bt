@@ -37,6 +37,8 @@
 ///   `iss` and the callback lacks it;
 /// - `missing_id_token` — the token response carried no ID token;
 /// - `no_userinfo_endpoint` — the provider names no userinfo endpoint;
+/// - `insecure_endpoint` — a userinfo answer names a distributed-claim
+///   source (`_claim_sources`) that is not HTTPS;
 /// - `oidcc_crash` — `oidcc` raised on a malformed provider answer (the
 ///   exception is dropped: its stacktrace could hold secrets);
 /// - `config` — the registration's redirect URI is not acceptable (see
@@ -102,6 +104,11 @@ Object subclass: OAuthFlows
   /// The session's issuer and redirect URI must match `server` and
   /// `reg` (`session_mismatch`), and the redirect URI must pass
   /// `ClientRegistration checkRedirect:`.
+  ///
+  /// A provider that advertises `pushed_authorization_request_endpoint`
+  /// gets the request there first (PAR), through the same HTTP client; an
+  /// error that echoes the client secret or the session's values has them
+  /// redacted.
   class authorizeUrl: server :: OAuthServer client: reg :: ClientRegistration scopes: scopes :: List(String) session: sess :: OAuthSession extraParams: extra :: Dictionary -> Result(String, OAuthError) =>
     (self
       checkSession: sess
@@ -125,9 +132,14 @@ Object subclass: OAuthFlows
       authorize_url: server context
       with: (self clientOf: reg)
       with: params
+    // A pushed authorization request (PAR) sends these to the provider,
+    // whose error could echo them.
+    secrets := self secretsOf: #(reg clientSecret, sess state, sess nonce, sess codeVerifier)
     found ifOk: [:url |
       Result ok: url
-    ] ifError: [:reason | Result error: (OAuthError fromOidcc: reason)]
+    ] ifError: [:reason |
+      Result error: (OAuthError fromOidcc: reason secrets: secrets)
+    ]
 
   /// The preset's `#authorizeParams` overlaid with `extra`, as a list of
   /// `{name, value}` String pairs; or the `OAuthError` for a non-text or

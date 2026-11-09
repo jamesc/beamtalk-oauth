@@ -222,15 +222,18 @@ typed Value subclass: OAuthError
 
   /// `term` with every text (String or raw binary) that contains one of
   /// `secrets`, raw or URL-encoded, replaced by the marker, at any depth
-  /// of tuples, lists and map values. Empty secrets are ignored.
+  /// of tuples, lists, map keys and map values. A binary that is not
+  /// valid UTF-8 cannot be searched and is replaced too. Empty secrets are
+  /// ignored; with none, `term` is answered unchanged.
   class scrub: term :: Object secrets: secrets :: List(String) -> Dynamic =>
-    secrets isEmpty ifTrue: [^term]
+    (secrets anySatisfy: [:secret | secret isEmpty not]) ifFalse: [^term]
     (term isKindOf: Binary)
       ifTrue: [
         text := self textOf: term
-        ^(text notNil and: [
-          self mentions: text secrets: secrets
-        ]) ifTrue: [self redacted] ifFalse: [term]
+        text isNil ifTrue: [^self redacted]
+        ^(self mentions: text secrets: secrets) ifTrue: [
+          self redacted
+        ] ifFalse: [term]
       ]
     (term isKindOf: Tuple)
       ifTrue: [
@@ -245,21 +248,27 @@ typed Value subclass: OAuthError
     (term isKindOf: Dictionary) ifFalse: [^term]
     out := #{}
     @expect type
-    term keysAndValuesDo: [:k :v |
-      out := out at: k put: (self scrub: v secrets: secrets)
-    ]
+    term
+      keysAndValuesDo: [:k :v |
+        out := out at: (self scrub: k secrets: secrets) put: (self scrub: v secrets: secrets)
+      ]
     out
 
-  /// True when `text` contains a non-empty member of `secrets`, raw or
-  /// URL-encoded.
+  /// True when `text` contains a non-empty member of `secrets`, raw,
+  /// URL-encoded or form-encoded (a space as `+`, as `oidcc` sends a
+  /// form body).
   class mentions: text :: String secrets: secrets :: List(String) -> Boolean =>
     secrets
       anySatisfy: [:secret |
         secret isEmpty not
           and: [
-            (text includesSubstring: secret) or: [
-              text includesSubstring: secret urlEncoded
-            ]
+            encoded := secret urlEncoded
+            (text includesSubstring: secret)
+              or: [
+                (text includesSubstring: encoded) or: [
+                  text includesSubstring: (encoded replaceAll: "%20" with: "+")
+                ]
+              ]
           ]
       ]
 

@@ -223,6 +223,7 @@ TestCase subclass: NativeLayerTest
           bin: (Json
             generate: #{
               "sub" => "user-1",
+              "_claim_names" => #{"c" => "b"},
               "_claim_sources" => #{
                 "a" => #{"JWT" => "e30.e30.sig"},
                 "b" => #{"endpoint" => endpoint, "access_token" => "x"}
@@ -241,6 +242,34 @@ TestCase subclass: NativeLayerTest
     self assert: (check value: "http://127.0.0.1:1/b" value: true) isOk
     self assert: (check value: "http://127.0.0.1:1/b" value: false) isError
     self assert: (check value: "http://claims.test/b" value: true) isError
+    // Credentials in the URL stay out of the error.
+    secretUrl := check value: "http://u:pw@claims.test/b?access_token=t#f" value: false
+    self assert: (OAuthError fromOidcc: secretUrl error) description equals: "claim_source must be https: http://claims.test/b"
+    // Not a URL, or not text: refused.
+    self assert: (check value: "mailto:x@y.test" value: false) isError
+    self assert: (check value: "/relative" value: false) isError
+    self assert: (check value: 42 value: false) isError
+    // What oidcc would not fetch is not checked: sources without
+    // `_claim_names`, and a source that carries an aggregated JWT.
+    noNames := Erlang json
+      decode: (self
+        bin: (Json generate: #{
+          "_claim_sources" => #{"b" => #{"endpoint" => "http://claims.test/b"}}
+        }))
+    self assert: (Erlang beamtalk_oauth_oidcc check_claim_sources: noNames with: false) isOk
+    both := Erlang json
+      decode: (self
+        bin: (Json
+          generate: #{
+            "_claim_names" => #{"c" => "b"},
+            "_claim_sources" => #{
+              "b" => #{
+                "JWT" => "e30.e30.sig",
+                "endpoint" => "http://claims.test/b"
+              }
+            }
+          }))
+    self assert: (Erlang beamtalk_oauth_oidcc check_claim_sources: both with: false) isOk
     // No sources, or claims that are not a map: nothing to check.
     noSources := Erlang json decode: (self bin: (Json generate: #{
       "sub" => "u"

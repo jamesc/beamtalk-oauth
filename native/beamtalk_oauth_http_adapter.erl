@@ -85,7 +85,7 @@ malformed_headers | unsupported_ssl_options | insecure_url}}`); any crash answer
 """.
 -spec request(Method, Request, HttpOptions, RequestOptions, Config) ->
     {ok, {{string(), non_neg_integer(), string()}, [{string(), string()}], binary()}}
-    | {error, {http_client, term()} | {insecure_endpoint, atom(), term()}}
+    | {error, term()}
 when
     Method :: oidcc_http_adapter:method(),
     Request :: oidcc_http_adapter:request(),
@@ -132,15 +132,19 @@ do_request(Method, Request, HttpOptions, Client, Config) ->
         ok ?= check_response(Method, Url, Answer, Config),
         Answer
     else
-        {error, {insecure_endpoint, _, _}} = Refused -> Refused;
+        {response_refused, Reason} -> {error, Reason};
         {error, Reason} -> {error, {http_client, Reason}}
     end.
 
-%% The config's `response_check`, if any, on a response that arrived.
+%% The config's `response_check`, if any, on a response that arrived:
+%% `ok`, or `{response_refused, Reason}`, answered as `{error, Reason}`.
 check_response(Method, Url, {ok, _} = Answer, #{response_check := Check} = Config) when
     is_function(Check, 4)
 ->
-    Check(Method, Url, Answer, unsafe(Config));
+    case Check(Method, Url, Answer, unsafe(Config)) of
+        ok -> ok;
+        {error, Reason} -> {response_refused, Reason}
+    end;
 check_response(_Method, _Url, _Answer, _Config) ->
     ok.
 

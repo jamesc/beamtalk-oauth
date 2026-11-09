@@ -161,3 +161,23 @@ TestCase subclass: OAuthErrorTest
   testJsonGenerateHidesDetailSecrets =>
     e := OAuthError fromOidcc: {#bad, self bin: "glpat-abcdefghij1234567890"}
     self deny: ((Json generate: e) includesSubstring: "glpat")
+
+  testScrubRemovesSecretsInEveryShape =>
+    secret := "my secret/x"
+    body := #{
+      (self bin: "error") => (self bin: "invalid_grant"),
+      (self bin: "raw") => (self bin: "echo my secret/x"),
+      (self bin: "url") => (self bin: "echo my%20secret%2Fx"),
+      (self bin: "form") => (self bin: "echo my+secret%2Fx"),
+      (self bin: "my secret/x") => (self bin: "as a key"),
+      (self bin: "bad") => (Binary fromIolist: #(#(255, 254)))
+    }
+    scrubbed := OAuthError scrub: {#http_error, 400, body} secrets: #(secret)
+    text := scrubbed printString
+    self deny: (text includesSubstring: "secret")
+    self assert: (text includesSubstring: "invalid_grant")
+    // With no secrets (or only empty ones) the term is unchanged.
+    self assert: (OAuthError scrub: body secrets: #("")) equals: body
+    err := OAuthError fromOidcc: {#http_error, 400, body} secrets: #(secret)
+    self assert: err code equals: "invalid_grant"
+    self deny: (err detail printString includesSubstring: "secret")

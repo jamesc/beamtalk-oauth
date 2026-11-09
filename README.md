@@ -163,7 +163,7 @@ instead.
 | `bad_subject` | the userinfo `sub` is not the ID token's subject |
 | `parse` | a malformed response or callback |
 | `config` | invalid configuration or a token set missing what the call needs |
-| `insecure_endpoint` | a plain-HTTP endpoint or a non-loopback `http` redirect URI |
+| `insecure_endpoint` | a plain-HTTP endpoint (including a userinfo distributed-claim source) or a non-loopback `http` redirect URI |
 | `session_mismatch` | wrong binding; a session for another issuer or redirect URI; tokens issued to another client |
 | `reused_state` | the session or callback ticket was already used, or is unknown to this store |
 | `expired_session` | the session or callback ticket outlived its TTL (10 minutes by default) |

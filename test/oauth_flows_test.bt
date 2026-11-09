@@ -886,7 +886,7 @@ TestCase subclass: OAuthFlowsTest
   testInsecureClaimSourceInSignedUserinfo =>
     self.server := self signedUserinfoServer
     toks := self exchange
-    sources := self claimsWithSources: #("http://claims.example.test/groups")
+    sources := self claimsWithSources: #("{self.provider issuer}/claims", "http://claims.example.test/groups")
     self.provider
       claims: #{
         "_claim_names" => (sources at: "_claim_names"),
@@ -900,6 +900,30 @@ TestCase subclass: OAuthFlowsTest
     err := (self userInfoFor: toks) error
     self assert: err code equals: "insecure_endpoint"
     self assert: (err description includesSubstring: "claim_source")
+    self assert: (self.provider hits: "/claims") equals: 0
+
+  testClaimSourcesAreFoundWhateverTheContentType =>
+    self.server := self signedUserinfoServer
+    toks := self exchange
+    // oidcc reads `application/jwt+json` as JSON; the check must too.
+    self.provider
+      respond: "/userinfo"
+      status: 200
+      body: (Json generate: (self claimsWithSources: #("{self.provider issuer}/claims", "http://claims.example.test/groups")))
+      contentType: "application/jwt+json"
+    err := (self userInfoFor: toks) error
+    self assert: err code equals: "insecure_endpoint"
+    self assert: (self.provider hits: "/claims") equals: 0
+
+  testClaimSourceUrlCredentialsStayOutOfTheError =>
+    toks := self exchange
+    self userinfoAnswers: (self claimsWithSources: #("http://user:pw-secret@claims.example.test/groups?access_token=qs-secret#frag"))
+    err := (self userInfoFor: toks) error
+    self assert: err code equals: "insecure_endpoint"
+    self assert: err description equals: "claim_source must be https: http://claims.example.test/groups"
+    text := err printString ++ err asJson printString ++ err detail printString
+    self deny: (text includesSubstring: "pw-secret")
+    self deny: (text includesSubstring: "qs-secret")
 
   testAggregatedClaimNeedsNoEndpointCheck =>
     toks := self exchange
@@ -912,7 +936,8 @@ TestCase subclass: OAuthFlowsTest
         "_claim_sources" => #{"src1" => #{"JWT" => "e30.e30.sig"}}
       }
     err := (self userInfoFor: toks) error
-    self deny: err code =:= "insecure_endpoint"
+    // The JWT's header names no `alg`, which makes oidcc raise.
+    self assert: err code equals: "oidcc_crash"
 
   // ===== Non-object JSON bodies =====
   testNonObjectTokenBodyIsAnError =>
@@ -986,6 +1011,29 @@ TestCase subclass: OAuthFlowsTest
     self deny: (url includesSubstring: sess nonce)
     self assert: (self.provider hits: "/par") equals: 1
 
+  testPushedAuthorizationRequestErrorIsRedacted =>
+    self.provider discoveryOverrides: #{
+      "pushed_authorization_request_endpoint" => "{self.provider issuer}/par"
+    }
+    self.server := self discover: #{}
+    sess := self newSession
+    self.provider
+      fail: "/par"
+      status: 400
+      body: #{
+        "error" => "invalid_request",
+        "error_description" => "client {FixtureProvider clientSecret} state {sess state}",
+        sess codeVerifier => sess nonce
+      }
+    err := (OAuthFlows
+      authorizeUrl: self.server
+      client: self.reg
+      scopes: #("openid")
+      session: sess) error
+    self assert: err code equals: "invalid_request"
+    self assert: err status equals: 400
+    self assertRedacted: err of: #(FixtureProvider clientSecret, sess state, sess nonce, sess codeVerifier)
+
   // ===== Redaction =====
   testRefreshErrorEchoingTheRefreshTokenIsRedacted =>
     toks := self exchange
@@ -996,7 +1044,9 @@ TestCase subclass: OAuthFlowsTest
         "error" => "invalid_grant",
         "error_description" => "refresh token rt-1 was revoked",
         "refresh_token" => "rt-1",
-        "hint" => "rt-1"
+        "hint" => "rt-1",
+        "client" => FixtureProvider clientSecret,
+        "rt-1" => "revoked"
       }
     err := (OAuthFlows
       refresh: self.server
@@ -1004,8 +1054,7 @@ TestCase subclass: OAuthFlowsTest
       tokenSet: toks) error
     self assert: err code equals: "invalid_grant"
     self assert: err status equals: 400
-    self deny: (err printString includesSubstring: "rt-1")
-    self deny: (err asJson printString includesSubstring: "rt-1")
+    self assertRedacted: err of: #("rt-1", FixtureProvider clientSecret)
 
   testUserinfoErrorEchoingTheTokensIsRedacted =>
     toks := self exchange
@@ -1020,9 +1069,33 @@ TestCase subclass: OAuthFlowsTest
     err := (self userInfoFor: toks) error
     self assert: err code equals: "invalid_token"
     self assert: err status equals: 401
-    text := err printString ++ err asJson printString
-    self deny: (text includesSubstring: "rt-1")
-    self deny: (text includesSubstring: "at-1")
+    self assertRedacted: err of: #("rt-1", "at-1")
+
+  testExchangeErrorEchoingTheCodeIsRedacted =>
+    sess := self newSession
+    self.provider
+      fail: "/token"
+      status: 400
+      body: #{
+        "error" => "invalid_grant",
+        "error_description" => "code code-1 with verifier {sess codeVerifier}",
+        "secret" => FixtureProvider clientSecret
+      }
+    err := (self
+      exchange: self.server
+      client: self.reg
+      callback: (self callbackFor: sess)) error
+    self assert: err code equals: "invalid_grant"
+    self assertRedacted: err of: #("code-1", sess codeVerifier, FixtureProvider clientSecret)
+
+  // Assert that no part of `err` shows any of `secrets`.
+  assertRedacted: err :: OAuthError of: secrets :: List(String) -> Nil =>
+    text := err printString
+      ++ err description
+      ++ err asJson printString
+      ++ err detail printString
+    secrets do: [:secret | self deny: (text includesSubstring: secret)]
+    nil
 
   // ===== Unsigned ID tokens =====
   // `text` as unpadded base64url.
