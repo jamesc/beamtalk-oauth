@@ -87,7 +87,12 @@ TestCase subclass: TokenInfoTest
       preset: ProviderPresets gitlab
       options: #{#allowUnsafeHttp => true}) unwrap
     self assert: srv tokenInfoEndpoint equals: "{self.provider issuer}/oauth/token/info"
-    self.provider tokenInfo: #{"resource_owner_id" => 7, "scope" => #("api")}
+    self.provider
+      tokenInfo: #{
+        "resource_owner_id" => 7,
+        "scope" => #("api"),
+        "application" => #{"uid" => "client-1"}
+      }
     info := (self info: srv token: self tokens) unwrap
     self assert: (info at: #subject) equals: "7"
     req := self.provider lastRequestTo: "/oauth/token/info"
@@ -123,7 +128,9 @@ TestCase subclass: TokenInfoTest
         #expiresIn => 3599
       }
     req := self lastRequest
-    self assert: ((req at: #query) at: "access_token") equals: "at-1"
+    self assert: (req at: #method) equals: "POST"
+    self assert: ((req at: #form) at: "access_token") equals: "at-1"
+    self deny: ((req at: #query) includesKey: "access_token")
     self deny: ((req at: #headers) includesKey: "authorization")
 
   testGoogleInvalidValueIsInactive =>
@@ -176,6 +183,31 @@ TestCase subclass: TokenInfoTest
       "aud" => "api-audience"
     }
     self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: true
+
+  testFailsClosed =>
+    // No binding field at all.
+    self.provider tokenInfo: #{}
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
+    self.provider tokenInfo: #{"sub" => "user-1", "scope" => "openid"}
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
+    // A 200 carrying an error member.
+    self.provider tokenInfo: #{"error" => "invalid_token", "azp" => "client-1"}
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
+    // aud as a List.
+    self.provider tokenInfo: #{"sub" => "user-1", "aud" => #("other")}
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
+    self.provider tokenInfo: #{
+      "sub" => "user-1",
+      "aud" => #("other", "client-1")
+    }
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: true
+    // A matching aud does not override a foreign azp.
+    self.provider tokenInfo: #{
+      "sub" => "user-1",
+      "azp" => "other",
+      "aud" => "client-1"
+    }
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
 
   // ===== Errors =====
   testOtherErrorsAreErrors =>

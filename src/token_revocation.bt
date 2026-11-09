@@ -61,8 +61,10 @@ Object subclass: TokenRevocation
   ///
   /// Client authentication: a client with no secret sends `client_id` in
   /// the form. A client with a secret uses `client_secret_basic` when the
-  /// provider advertises it (see `authMethodsOf:`), `client_secret_post`
-  /// otherwise.
+  /// provider advertises it (see `authMethodsOf:`; an empty list means
+  /// RFC 8414's default, `client_secret_basic`), else `client_secret_post`
+  /// when advertised; a provider that advertises neither (only
+  /// `private_key_jwt`, say) answers `config` without a request.
   class revoke: server :: OAuthServer client: reg :: ClientRegistration token: tok :: Object hint: hint :: Symbol | Nil -> Result(Nil, OAuthError) =>
     endpoint := server revocationEndpoint
     endpoint isNil ifTrue: [
@@ -78,19 +80,24 @@ Object subclass: TokenRevocation
     ]
     headers := #(#("content-type", "application/x-www-form-urlencoded"), #("accept", "application/json"))
     secret := reg clientSecret ifNil: [""]
-    secret isEmpty
-      ifTrue: [form := form ++ #(#("client_id", reg clientId))]
-      ifFalse: [
-        ((self authMethodsOf: server) includes: "client_secret_basic")
-          ifTrue: [
-            headers := headers ++ #(#("authorization", self basic: reg clientId secret: secret))
-          ]
-          ifFalse: [
-            form := form ++ #(#("client_id", reg clientId), #("client_secret", secret))
-          ]
+    method := secret isEmpty ifTrue: [
+      "none"
+    ] ifFalse: [self authMethodFor: server]
+    method isNil
+      ifTrue: [
+        ^Result error: (OAuthError config: "the provider advertises neither client_secret_basic nor client_secret_post for revocation")
       ]
-    sent := HTTPClient
-      request: #post
+    method =:= "none" ifTrue: [form := form ++ #(#("client_id", reg clientId))]
+    method =:= "client_secret_basic"
+      ifTrue: [
+        headers := headers ++ #(#("authorization", self basic: reg clientId secret: secret))
+      ]
+    method =:= "client_secret_post" ifTrue: [
+      form := form ++ #(#("client_id", reg clientId), #("client_secret", secret))
+    ]
+    secrets := #(token, secret)
+    sent := self
+      send: #post
       url: endpoint
       options: #{
         #headers => headers,
@@ -98,6 +105,7 @@ Object subclass: TokenRevocation
         #timeout => self timeout,
         #maxBodyBytes => self maxBodyBytes
       }
+      secrets: secrets
     sent
       ifOk: [:resp |
         resp status =:= 200
@@ -107,10 +115,21 @@ Object subclass: TokenRevocation
               error: (self
                 errorFor: resp
                 doing: "token revocation"
-                token: token)
+                secrets: secrets)
           ]
       ]
-      ifError: [:e | Result error: (self transportError: e token: token)]
+      ifError: [:err | Result error: err]
+
+  /// The confidential-client method for revocation: `client_secret_basic`
+  /// when advertised (or nothing is advertised: RFC 8414's default), else
+  /// `client_secret_post` when advertised, else nil.
+  class authMethodFor: server :: OAuthServer -> String | Nil =>
+    methods := self authMethodsOf: server
+    (methods isEmpty or: [
+      methods includes: "client_secret_basic"
+    ]) ifTrue: [^"client_secret_basic"]
+    (methods includes: "client_secret_post") ifTrue: [^"client_secret_post"]
+    nil
 
   /// The client-authentication methods the provider advertises for
   /// revocation: `revocation_endpoint_auth_methods_supported`, else
@@ -171,18 +190,21 @@ Object subclass: TokenRevocation
   /// `#{#active => Boolean, #subject => String | nil, #scopes => List(String),
   /// #expiresIn => Integer | nil}`, read through the preset's
   /// `#tokenInfoFields`. `#tokenInfoAuth` `#bearer` sends the token as an
-  /// `Authorization` header (GitLab), `#query` as an `access_token`
-  /// parameter (Google).
+  /// `Authorization` header on a GET (GitLab); `#form` POSTs it as an
+  /// `access_token` form parameter (Google), so it never appears in a URL.
   ///
   /// A token the provider rejects as invalid answers `#active => false`,
   /// not an error: a 401 (GitLab), or a 400 whose `error` is
   /// `invalid_token` or that has no `error` member (Google answers
   /// `{"error_description": "Invalid Value"}`). A nil endpoint answers
-  /// `config`.
+  /// `config`. A 401 always reads as inactive, so for a provider whose
+  /// token-info endpoint needed client authentication, a client-auth
+  /// failure would look like an inactive token; neither preset's does.
   ///
-  /// `reg` is not sent (neither preset's endpoint authenticates the
-  /// client), but a token issued to another client answers
-  /// `#active => false`: see `isForClient:body:`.
+  /// Token info fails closed: a 200 that carries an `error` member, or
+  /// does not show the token was issued to `reg` (see
+  /// `isForClient:body:`), answers `#active => false`. `reg` itself is
+  /// not sent.
   class tokenInfo: server :: OAuthServer client: reg :: ClientRegistration token: tok :: Object -> Result(Dictionary, OAuthError) =>
     endpoint := server tokenInfoEndpoint
     endpoint isNil ifTrue: [
@@ -195,28 +217,31 @@ Object subclass: TokenRevocation
     ]
     preset := server preset
     auth := preset at: #tokenInfoAuth ifAbsent: [#bearer]
-    headers := #(#("accept", "application/json"))
-    url := endpoint
-    (#(#bearer, #query) includes: auth)
+    (#(#bearer, #form) includes: auth)
       ifFalse: [
         ^Result error: (OAuthError config: "unknown #tokenInfoAuth {auth printString}")
       ]
-    auth =:= #bearer
-      ifTrue: [headers := headers ++ #(#("authorization", "Bearer {token}"))]
-      ifFalse: [
-        url := self
-          url: endpoint
-          withParam: "access_token"
-          value: token
+    opts := auth =:= #bearer
+      ifTrue: [
+        #{
+          #headers => #(#("accept", "application/json"), #("authorization", "Bearer {token}")),
+          #timeout => self timeout,
+          #maxBodyBytes => self maxBodyBytes
+        }
       ]
-    sent := HTTPClient
-      request: #get
-      url: url
-      options: #{
-        #headers => headers,
-        #timeout => self timeout,
-        #maxBodyBytes => self maxBodyBytes
-      }
+      ifFalse: [
+        #{
+          #headers => #(#("accept", "application/json"), #("content-type", "application/x-www-form-urlencoded")),
+          #body => (self formBody: #(#("access_token", token))),
+          #timeout => self timeout,
+          #maxBodyBytes => self maxBodyBytes
+        }
+      ]
+    sent := self
+      send: (auth =:= #bearer ifTrue: [#get] ifFalse: [#post])
+      url: endpoint
+      options: opts
+      secrets: #(token)
     sent
       ifOk: [:resp |
         self
@@ -227,7 +252,7 @@ Object subclass: TokenRevocation
           token: token
           client: reg clientId
       ]
-      ifError: [:e | Result error: (self transportError: e token: token)]
+      ifError: [:err | Result error: err]
 
   /// Where the normalized fields live when the preset does not say.
   class defaultTokenInfoFields -> Dictionary =>
@@ -241,9 +266,9 @@ Object subclass: TokenRevocation
         (body isKindOf: Dictionary) ifFalse: [
           ^Result error: (OAuthError parse: "token info is not a JSON object")
         ]
-        (self isForClient: clientId body: body) ifFalse: [
-          ^Result ok: self inactive
-        ]
+        ((body includesKey: "error") or: [
+          (self isForClient: clientId body: body) not
+        ]) ifTrue: [^Result ok: self inactive]
         ^Result ok: (self normalize: body fields: fields)
       ]
     (self isInactive: resp status body: body) ifTrue: [
@@ -253,20 +278,24 @@ Object subclass: TokenRevocation
       error: (self
         errorFor: resp
         doing: "token info"
-        token: token)
+        secrets: #(token))
 
-  /// False when the token-info answer names the client the token was
-  /// issued to and none of the names is `clientId`: Google's `azp` and
-  /// `aud`, GitLab's `application.uid`. True when it names none: the
-  /// token is then not checked against the client.
+  /// True only when the token-info answer shows the token was issued to
+  /// `clientId`. Google: `azp` when present must be `clientId` (a matching
+  /// `aud` does not override a foreign `azp`); otherwise `aud`, a String
+  /// or a List, must name it. GitLab: `application.uid` must be it. An
+  /// answer with none of these fails closed (false).
   class isForClient: clientId :: String body: body :: Dictionary -> Boolean =>
+    azp := body at: "azp" ifAbsent: [nil]
+    azp notNil ifTrue: [^azp =:= clientId]
+    aud := body at: "aud" ifAbsent: [nil]
+    (aud isKindOf: String) ifTrue: [^aud =:= clientId]
+    (aud isKindOf: List) ifTrue: [^aud includes: clientId]
     app := body at: "application" ifAbsent: [nil]
-    names := #(body at: "azp" ifAbsent: [nil], body at: "aud" ifAbsent: [nil])
     (app isKindOf: Dictionary) ifTrue: [
-      names := names ++ #(app at: "uid" ifAbsent: [nil])
+      ^(app at: "uid" ifAbsent: [nil]) =:= clientId
     ]
-    named := names select: [:each | each isKindOf: String]
-    named isEmpty or: [named includes: clientId]
+    false
 
   /// True when a non-200 token-info answer means "this token is not
   /// valid" rather than a failure.
@@ -322,16 +351,17 @@ Object subclass: TokenRevocation
   /// The `OAuthError` for a non-200 answer: the provider's `error` code
   /// (with its status and `error_description`) when the body is a JSON
   /// object that carries one, otherwise `transport` with the status.
-  /// The body is never quoted, and any member that contains the token is
-  /// redacted (see `scrub:token:`).
-  class errorFor: resp :: HTTPResponse doing: what :: String token: token :: String -> OAuthError =>
+  /// The body is never quoted, and any member that contains the token or
+  /// the client secret is redacted (see `scrub:secrets:`).
+  class errorFor: resp :: HTTPResponse doing: what :: String secrets: secrets :: List(String) -> OAuthError =>
     status := resp status
     body := self jsonOf: resp
     ((body isKindOf: Dictionary) and: [
       (body at: "error" ifAbsent: [nil]) isKindOf: String
-    ]) ifTrue: [
-      ^OAuthError fromOidcc: {#http_error, status, self scrub: body token: token}
-    ]
+    ])
+      ifTrue: [
+        ^OAuthError fromOidcc: {#http_error, status, self scrub: body secrets: secrets}
+      ]
     OAuthError
       new: #{
         #code => "transport",
@@ -339,36 +369,66 @@ Object subclass: TokenRevocation
         #status => status
       }
 
-  /// `term` (parsed JSON) with every String that contains `token`
-  /// replaced by `"[redacted]"`, at any depth.
-  class scrub: term :: Object token: token :: String -> Object =>
-    (term isKindOf: String) ifTrue: [
-      ^(term includesSubstring: token) ifTrue: [
-        OAuthError redacted
-      ] ifFalse: [term]
-    ]
+  /// `term` (parsed JSON) with every String that contains one of
+  /// `secrets`, raw or URL-encoded, replaced by `"[redacted]"`, at any
+  /// depth. Empty secrets are ignored.
+  class scrub: term :: Object secrets: secrets :: List(String) -> Object =>
+    (term isKindOf: String)
+      ifTrue: [
+        ^(self mentions: term secrets: secrets) ifTrue: [
+          OAuthError redacted
+        ] ifFalse: [term]
+      ]
     (term isKindOf: List) ifTrue: [
-      ^term collect: [:each | self scrub: each token: token]
+      ^term collect: [:each | self scrub: each secrets: secrets]
     ]
     (term isKindOf: Dictionary) ifFalse: [^term]
     out := #{}
     term keysAndValuesDo: [:k :v |
-      out := out at: k put: (self scrub: v token: token)
+      out := out at: k put: (self scrub: v secrets: secrets)
     ]
     out
 
+  /// True when `text` contains a non-empty member of `secrets`, raw or
+  /// URL-encoded.
+  class mentions: text :: String secrets: secrets :: List(String) -> Boolean =>
+    secrets
+      anySatisfy: [:secret |
+        secret isEmpty not
+          and: [
+            (text includesSubstring: secret) or: [
+              text includesSubstring: secret urlEncoded
+            ]
+          ]
+      ]
+
+  /// One `HTTPClient` request, answering `Result(HTTPResponse, OAuthError)`.
+  /// Any failure, whether a `Result error:` or a raised `Error` (whose
+  /// hint could print the headers or body), becomes a fixed `transport`
+  /// error with no detail. `secrets` are never in it.
+  class send: method :: Symbol url: url :: String options: opts :: Dictionary secrets: secrets :: List(String) -> Result(HTTPResponse, OAuthError) =>
+    sent := [
+      HTTPClient
+        request: method
+        url: url
+        options: opts
+    ] on: Error do: [:e | nil]
+    sent isNil ifTrue: [
+      ^Result error: (OAuthError transport: "HTTP request failed")
+    ]
+    sent ifOk: [:resp |
+      Result ok: resp
+    ] ifError: [:e | Result error: (self transportError: e secrets: secrets)]
+
   /// The `OAuthError` (`transport`, no detail) for a request that got no
   /// response. `HTTPClient` builds its messages from fixed hints and the
-  /// transport reason, never the request; a message holding `token`, raw
-  /// or URL-encoded, is replaced anyway.
-  class transportError: e :: Object token: token :: String -> OAuthError =>
+  /// transport reason, never the request; a message mentioning one of
+  /// `secrets` is replaced anyway.
+  class transportError: e :: Object secrets: secrets :: List(String) -> OAuthError =>
     message := (e respondsTo: #message) ifTrue: [e message] ifFalse: [nil]
-    safe := (message isKindOf: String)
-      and: [
-        (message includesSubstring: token) not and: [
-          (message includesSubstring: token urlEncoded) not
-        ]
-      ]
+    safe := (message isKindOf: String) and: [
+      (self mentions: message secrets: secrets) not
+    ]
     OAuthError transport: (safe ifTrue: [
       message
     ] ifFalse: ["HTTP request failed"])
@@ -407,11 +467,6 @@ Object subclass: TokenRevocation
     encoded inject: "" into: [:acc :each |
       acc isEmpty ifTrue: [each] ifFalse: [acc ++ "&" ++ each]
     ]
-
-  /// `url` with `name=value` appended to its query.
-  class url: url :: String withParam: name :: String value: value :: String -> String =>
-    sep := (url includesSubstring: "?") ifTrue: ["&"] ifFalse: ["?"]
-    "{url}{sep}{name urlEncoded}={value urlEncoded}"
 
   /// The `client_secret_basic` header value (RFC 6749 §2.3.1: id and
   /// secret are form-encoded before base64).

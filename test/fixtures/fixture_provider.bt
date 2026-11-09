@@ -27,7 +27,8 @@
 /// answers a raw body (empty, text or JSON) instead, `tokenInfo:` sets the
 /// token-info answer, and `lastRequestTo:` answers the last request's
 /// method, form, query and headers. `/tokeninfo` takes the token as a
-/// bearer header or an `access_token` query parameter.
+/// bearer header or an `access_token` form parameter. `redirect:to:`
+/// answers a 302 with a `Location`.
 ///
 /// ID tokens are signed with the actor's own P-256 key through `jose`.
 /// `keyId:` names the key (a `kid` in the JWKS and the ID-token header);
@@ -172,7 +173,12 @@ Actor subclass: FixtureProvider
   /// Answer `status` with the raw `body` and `contentType` on `path`
   /// until `reset`.
   respond: path :: String status: status :: Integer body: body :: String contentType: contentType :: String -> Nil =>
-    self.responses := self.responses at: path put: {status, body, contentType}
+    self.responses := self.responses at: path put: {status, body, contentType, #()}
+    nil
+
+  /// Answer a 302 to `location` on `path` until `reset`.
+  redirect: path :: String to: location :: String -> Nil =>
+    self.responses := self.responses at: path put: {302, "", "text/plain", #(#("location", location))}
     nil
 
   /// Set the `/tokeninfo` answer for the active token `at-1`.
@@ -205,7 +211,7 @@ Actor subclass: FixtureProvider
         ^HTTPResponse
           new: #{
             #status => (raw at: 1),
-            #headers => #(#("content-type", raw at: 3)),
+            #headers => #(#("content-type", raw at: 3)) ++ (raw at: 4),
             #body => (raw at: 2)
           }
       ]
@@ -306,7 +312,9 @@ Actor subclass: FixtureProvider
     auth := (self headersOf: req) at: "authorization" ifAbsent: [""]
     token := (auth startsWith: "Bearer ") ifTrue: [
       auth drop: 7
-    ] ifFalse: [req queryParams at: "access_token" ifAbsent: [""]]
+    ] ifFalse: [
+      ((self recordOf: req) at: #form) at: "access_token" ifAbsent: [""]
+    ]
     token =:= "at-1" ifFalse: [
       ^self json: #{"error" => "invalid_token"} status: 401
     ]

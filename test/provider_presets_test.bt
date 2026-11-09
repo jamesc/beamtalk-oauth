@@ -23,7 +23,7 @@ TestCase subclass: ProviderPresetsTest
     extras := p at: #authorizeParams
     self assert: (extras at: "access_type") equals: "offline"
     self assert: (extras at: "prompt") equals: "consent"
-    self assert: (p at: #tokenInfoAuth) equals: #query
+    self assert: (p at: #tokenInfoAuth) equals: #form
     self assert: (p at: #documentOverrides) equals: #{}
 
   testEndpointsAreHttps =>

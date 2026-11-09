@@ -170,6 +170,24 @@ TestCase subclass: RevocationTest
     self assert: (self lastForm at: "client_id") equals: "client-1"
     self assert: (self lastForm at: "client_secret") equals: "secret-1"
 
+  testConfidentialClientWithoutSecretMethodIsConfigError =>
+    self.provider discoveryOverrides: #{
+      "revocation_endpoint_auth_methods_supported" => #("private_key_jwt")
+    }
+    got := TokenRevocation
+      revoke: self server
+      client: self confidentialClient
+      token: self tokens
+    self assert: got error code equals: "config"
+    self assert: (self.provider lastRequestTo: "/revoke") equals: nil
+    self deny: (got error printString includesSubstring: "secret-1")
+
+  testEmptyAuthMethodsMeanBasic =>
+    srv := self server
+    bare := srv withMetadata: ((srv metadata removeKey: #revocation_endpoint_auth_methods_supported) removeKey: #token_endpoint_auth_methods_supported)
+    self assert: (TokenRevocation authMethodFor: bare) equals: "client_secret_basic"
+    self assert: (TokenRevocation authMethodFor: (srv withMetadata: (bare metadata at: #revocation_endpoint_auth_methods_supported put: #()))) equals: "client_secret_basic"
+
   testFallsBackToTokenEndpointAuthMethods =>
     srv := self server
     meta := (srv metadata removeKey: #revocation_endpoint_auth_methods_supported) at: #token_endpoint_auth_methods_supported put: #("client_secret_post")
@@ -233,14 +251,12 @@ TestCase subclass: RevocationTest
     self assert: err status equals: 503
 
   testRedirectIsNotFollowed =>
-    self.provider
-      respond: "/revoke"
-      status: 302
-      body: ""
-      contentType: "text/plain"
+    self.provider redirect: "/revoke" to: "{self.provider issuer}/token"
     err := (self revoke: self tokens) error
     self assert: err code equals: "transport"
     self assert: err status equals: 302
+    self assert: (self.provider hits: "/token") equals: 0
+    self assert: self.provider lastTokenRequest equals: nil
 
   testMissingEndpointIsConfigError =>
     self.provider discoveryOverrides: #{"revocation_endpoint" => nil}
@@ -280,6 +296,39 @@ TestCase subclass: RevocationTest
     self assert: err code equals: "invalid_request"
     self deny: (err printString includesSubstring: "rt-1")
     self deny: (err asJson printString includesSubstring: "rt-1")
+
+  testErrorsNeverCarryEncodedTokenOrSecret =>
+    self.provider discoveryOverrides: #{
+      "revocation_endpoint_auth_methods_supported" => #("client_secret_post")
+    }
+    self.provider
+      fail: "/revoke"
+      status: 400
+      body: #{
+        "error" => "invalid_client",
+        "error_description" => "bad secret secret-1",
+        "hint" => "token was {"r t/1" urlEncoded}"
+      }
+    err := (TokenRevocation
+      revoke: self server
+      client: self confidentialClient
+      token: "r t/1") error
+    self assert: err code equals: "invalid_client"
+    text := err printString ++ err asJson printString
+    self deny: (text includesSubstring: "secret-1")
+    self deny: (text includesSubstring: "r t/1" urlEncoded)
+
+  testRaisedHttpClientErrorIsFixedTransport =>
+    // Unknown options make HTTPClient raise a type_error whose hint prints
+    // them; send: must answer a fixed transport error instead.
+    got := TokenRevocation
+      send: #post
+      url: "{self.provider issuer}/revoke"
+      options: #{#bogus => "secret-xyz"}
+      secrets: #("secret-xyz")
+    self assert: got error code equals: "transport"
+    self assert: got error detail equals: nil
+    self deny: (got error printString includesSubstring: "secret-xyz")
 
   testTransportErrorNeverCarriesTheToken =>
     srv := HTTPServer start: 0 handler: [:req |
