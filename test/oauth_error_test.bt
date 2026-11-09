@@ -15,6 +15,11 @@ TestCase subclass: OAuthErrorTest
     self assert: OAuthError reusedState code equals: "reused_state"
     self assert: OAuthError sessionMismatch code equals: "session_mismatch"
     self assert: OAuthError callbackTimeout code equals: "callback_timeout"
+    self assert: (OAuthError callbackTimeoutRefusing: 0) description equals: OAuthError callbackTimeout description
+    refused := OAuthError callbackTimeoutRefusing: 3
+    self assert: refused code equals: "callback_timeout"
+    self assert: refused detail equals: 3
+    self assert: (refused description includesSubstring: "3 callback")
 
   testLocalConstructorKeepsDescription =>
     e := OAuthError transport: "connection refused"

@@ -3,11 +3,33 @@
 
 /// LoopbackGate — the one-shot request handler behind a `LoopbackReceiver`.
 ///
-/// It is the `HTTPServer`'s `HTTPHandler`, so every request runs in this
-/// actor's process, one at a time: the first `GET /callback` is recorded
-/// and every other request answers 404 without touching it. Browsers
-/// fetch `/favicon.ico` right after the redirect, so recording every
-/// request would overwrite the callback.
+/// The receiver's `HTTPServer` runs a small block handler that reads the
+/// raw query string (only the connection process can) and forwards each
+/// request to `handle:rawQuery:` here, so every request runs in this
+/// actor's process, one at a time. The first `GET /callback` that passes
+/// every check below is recorded; every other request answers 404 without
+/// touching it. Browsers fetch `/favicon.ico` right after the redirect,
+/// so recording every request would overwrite the callback.
+///
+/// A callback is recorded only when:
+///
+/// - its `Host` header is exactly `127.0.0.1:{port}`, a cheap defence
+///   against DNS rebinding;
+/// - its `state` matches the flow's expected state (`expectState:`),
+///   compared in constant time over SHA-256 digests. Nothing is recorded
+///   before the expected state is known. Any web page can fire
+///   `<img src="http://127.0.0.1:PORT/callback">`, and any local process
+///   can scan for the port; without this check either one would use up
+///   the slot and the real redirect would get a 404. A provider error
+///   callback (`error=...&state=...`) carries the state too, so it is
+///   recorded the same way;
+/// - none of `code`, `state`, `error`, `error_description`, `error_uri`
+///   or `iss` appears more than once in the raw query (RFC 6749 §3.1).
+///   `queryParams` keeps only the last value, so a duplicate could
+///   otherwise smuggle a second value past the state check.
+///
+/// A rejected callback answers 404 and leaves the slot open for the real
+/// one.
 ///
 /// The gate also holds at most one waiter, a `{Pid, Reference}` pair
 /// registered by `awaitFrom:tag:`. When both the query and the waiter are
@@ -16,18 +38,28 @@
 /// own mailbox, not in an actor call, so the wait is not bounded by the
 /// 5 s call timeout.
 ///
-/// Requests whose `Host` is not exactly `127.0.0.1:{port}` answer 404 too,
-/// a cheap defence against DNS rebinding.
-///
 /// Internal to `LoopbackReceiver`; applications do not use it directly.
 typed Actor subclass: LoopbackGate
-  /// The recorded callback query; nil until the first `GET /callback`.
+  /// The recorded callback query; nil until the first accepted callback.
   state: query :: Dictionary | Nil = nil
   /// The process waiting for the query, as `{Pid, Reference}`.
   state: waiter :: Tuple | Nil = nil
   /// The only `Host` header accepted, `127.0.0.1:{port}`; nil until the
   /// receiver knows its port, and nothing is recorded before then.
   state: host :: String | Nil = nil
+  /// SHA-256 digest of the flow's expected `state`; nil until
+  /// `expectState:`, and nothing is recorded before then.
+  state: stateDigest :: Binary | Nil = nil
+  /// How many `GET /callback` requests for this listener were refused for
+  /// a missing, wrong or repeated parameter: reported on a timeout, so a
+  /// flow armed with the wrong state can be told from a user who never
+  /// signed in.
+  state: refused :: Integer = 0
+
+  /// The callback parameters that must appear at most once (RFC 6749
+  /// §3.1, RFC 9207 for `iss`).
+  class singleParams -> List(String) =>
+    #("code", "state", "error", "error_description", "error_uri", "iss")
 
   /// The page shown after the redirect. Static: it echoes no provider data.
   class closeTabPage -> HTTPResponse =>
@@ -47,16 +79,79 @@ typed Actor subclass: LoopbackGate
         #body => "Not Found"
       }
 
-  /// Record the first `GET /callback` and answer the static close-this-tab
+  /// Record the first `GET /callback` that passes the host, state and
+  /// duplicate-parameter checks, and answer the static close-this-tab
   /// page; answer 404 to anything else, including a second callback.
-  handle: req :: HTTPRequest -> HTTPResponse =>
+  ///
+  /// `raw` is the request's undecoded query string (nil when it has
+  /// none). The recorded query is parsed from `raw` here, with
+  /// `QueryParser`, not taken from `req queryParams`: that keeps only the
+  /// last of a repeated parameter, and one source for both the duplicate
+  /// check and the recorded query means they cannot disagree.
+  handle: req :: HTTPRequest rawQuery: raw :: String | Nil -> HTTPResponse =>
     isCallback := (req method =:= "GET") and: [req path =:= "/callback"]
     (isCallback and: [
       self.query isNil and: [self acceptsHostOf: req]
     ]) ifFalse: [^self class notFound]
-    self.query := req queryParams
+    params := QueryParser parse: raw
+    ok := params notNil
+      and: [
+        (self hasDuplicateParams: raw) not and: [
+          self matchesState: (params at: "state" ifAbsent: [nil])
+        ]
+      ]
+    ok
+      ifFalse: [
+        self.refused := self.refused + 1
+        ^self class notFound
+      ]
+    self.query := params
     self notifyWaiter
     self class closeTabPage
+
+  /// Accept only callbacks whose `state` is `expected`. Raises, and
+  /// changes nothing, when `expected` is nil, empty or not a String, or a
+  /// state is already expected: one receiver serves one flow, and
+  /// re-arming it would silently drop the first flow's redirect.
+  expectState: expected :: String -> Nil =>
+    ((expected isKindOf: String) and: [
+      expected isEmpty not
+    ]) ifFalse: [
+      self error: "LoopbackGate: the expected state must be a non-empty String"
+    ]
+    self.stateDigest isNil
+      ifFalse: [
+        self error: "LoopbackGate: a state is already expected; start a new LoopbackReceiver for another flow"
+      ]
+    self.stateDigest := Erlang crypto hash: #sha256 with: expected
+    nil
+
+  /// How many callbacks were refused for a missing, wrong or repeated
+  /// parameter.
+  refusedCount -> Integer => self.refused
+
+  /// Whether `candidate` is the expected state, in constant time. False
+  /// when no state is expected yet or `candidate` is not a String.
+  internal matchesState: candidate :: Object -> Boolean =>
+    self.stateDigest isNil ifTrue: [^false]
+    (candidate isKindOf: String) ifFalse: [^false]
+    Erlang crypto hash_equals: self.stateDigest with: (Erlang crypto hash: #sha256 with: candidate)
+
+  /// Whether one of `singleParams` appears more than once in the raw
+  /// query `raw`. Names are split and decoded exactly as `QueryParser`
+  /// does, so `st%61te` counts as `state`.
+  internal hasDuplicateParams: raw :: String | Nil -> Boolean =>
+    raw isNil ifTrue: [^false]
+    names := ((raw split: "&") reject: [:part | part isEmpty])
+      collect: [:part |
+        idx := part indexOf: "="
+        QueryParser decodePart: (idx isNil ifTrue: [
+          part
+        ] ifFalse: [part take: idx - 1])
+      ]
+    self class singleParams anySatisfy: [:name |
+      (names count: [:n | n =:= name]) > 1
+    ]
 
   /// Accept only requests whose `Host` header is `host`.
   expectHost: host :: String -> Nil =>
@@ -76,18 +171,23 @@ typed Actor subclass: LoopbackGate
     found
 
   /// Register the process `pid` to receive the query tagged with `tag`,
-  /// answering true. A query that already arrived is sent at once. Answers
-  /// false, and changes nothing, while another live process is waiting:
-  /// the receiver has a single consumer.
-  awaitFrom: pid :: Pid tag: tag :: Reference -> Boolean =>
+  /// answering `#ok`. A query that already arrived is sent at once.
+  /// Answers, and changes nothing:
+  ///
+  /// - `#busy` while another live process is waiting: the receiver has a
+  ///   single consumer;
+  /// - `#noState` when `expectState:` was never called, so no callback
+  ///   could ever be recorded.
+  awaitFrom: pid :: Pid tag: tag :: Reference -> Symbol =>
+    self.stateDigest isNil ifTrue: [^#noState]
     self.waiter isNil
       ifFalse: [
         {other, _} := self.waiter
-        ((other =/= pid) and: [other isAlive]) ifTrue: [^false]
+        ((other =/= pid) and: [other isAlive]) ifTrue: [^#busy]
       ]
     self.waiter := {pid, tag}
     self notifyWaiter
-    true
+    #ok
 
   /// Send the query to the waiter when both are present.
   notifyWaiter -> Nil =>
