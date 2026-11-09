@@ -43,7 +43,7 @@ TestCase subclass: OAuthFlowsTest
   // the fixture's ID token carrying its nonce.
   newSession -> OAuthSession =>
     sess := OAuthSession newSessionFor: self.server client: self.reg
-    self.store create: sess boundTo: self.binding
+    (self.store create: sess boundTo: self.binding) unwrap
     self.provider claims: #{"nonce" => sess nonce}
     sess
 
@@ -191,6 +191,20 @@ TestCase subclass: OAuthFlowsTest
       store: self.store
       boundTo: self.binding
     self assert: (self codeOf: again) equals: "reused_state"
+
+  testHandleCallbackWithFullTicketTable =>
+    store := SessionStore spawnWith: #{#maxSessions => 1}
+    sess := OAuthSession newSessionFor: self.server client: self.reg
+    (store create: sess boundTo: self.binding) unwrap
+    (store issueTicket: Secrets generate forState: "other") unwrap
+    got := OAuthFlows
+      handleCallback: #(#("code", "code-1"), #("state", sess state))
+      store: store
+      boundTo: self.binding
+    self assert: (self codeOf: got) equals: "session_store_full"
+    // The session is left for a retry once a ticket slot frees up.
+    self assert: store size equals: 1
+    store stop
 
   testHandleCallbackAcceptsQueryStringAndUrl =>
     sess := self newSession

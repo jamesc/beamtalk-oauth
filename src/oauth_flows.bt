@@ -54,7 +54,7 @@
 /// reg := (ClientRegistration forClient: "APP_ID" redirect: rx redirectUri) unwrap
 /// store := SessionStore spawn
 /// sess := OAuthSession newSessionFor: server client: reg
-/// store create: sess boundTo: rx binding
+/// (store create: sess boundTo: rx binding) unwrap
 /// rx expectState: sess state
 /// url := (OAuthFlows authorizeUrl: server client: reg scopes: #("openid", "read_user") session: sess) unwrap
 /// query := (rx awaitCallback: 300000) unwrap
@@ -188,6 +188,10 @@ Object subclass: OAuthFlows
   ///   (`SessionStore consume:boundTo:`: `session_mismatch`,
   ///   `reused_state`, `expired_session`), and an `iss` parameter
   ///   (RFC 9207) must equal the session's issuer (`issuer_mismatch`).
+  /// - A store already holding its cap of callback tickets answers
+  ///   `session_store_full` (`SessionStore hasTicketRoom`) before the
+  ///   session is consumed, so the login can be retried; this is the one
+  ///   failure that does not burn the session.
   ///
   /// Text taken from the callback (`iss`, `error_description`, an
   /// unregistered error code) is stripped of control characters and cut
@@ -206,6 +210,13 @@ Object subclass: OAuthFlows
         ^Result error: parsed
       ]
     state := parsed at: "state" ifAbsent: [""]
+    // A full ticket table would refuse the ticket after the session is
+    // burned: refuse first, and leave the session for a retry.
+    (state isEmpty not and: [
+      (parsed at: "error" ifAbsent: [nil]) isNil
+    ]) ifTrue: [
+      store hasTicketRoom ifFalse: [^Result error: OAuthError sessionStoreFull]
+    ]
     burned := state isEmpty ifTrue: [
       nil
     ] ifFalse: [store consume: state boundTo: binding]
@@ -238,7 +249,8 @@ Object subclass: OAuthFlows
         ^Result error: (OAuthError code: "issuer_mismatch" description: "callback iss {self echo: iss} is not the session's issuer {sess issuer}")
       ]
     ticket := Secrets generate
-    store issueTicket: ticket forState: sess state
+    issued := store issueTicket: ticket forState: sess state
+    issued isError ifTrue: [^Result error: issued error]
     Result
       ok: (Callback
         code: code

@@ -86,7 +86,7 @@ TestCase subclass: E2eNativeLoginTest
   signIn: server :: OAuthServer -> Tuple =>
     reg := (ClientRegistration forClient: FixtureProvider clientId redirect: self.rx redirectUri) unwrap
     sess := OAuthSession newSessionFor: server client: reg
-    self.store create: sess boundTo: self.rx binding
+    (self.store create: sess boundTo: self.rx binding) unwrap
     self.rx expectState: sess state
     url := (OAuthFlows
       authorizeUrl: server

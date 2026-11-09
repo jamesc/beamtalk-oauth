@@ -12,7 +12,7 @@
 ///   `no_supported_auth_method`, ...);
 /// - local codes: `transport`, `parse`, `config`, `expired_session`,
 ///   `reused_state`, `session_mismatch`, `insecure_endpoint`,
-///   `callback_timeout`.
+///   `callback_timeout`, `session_store_full`.
 ///
 /// `detail` keeps the original term for debugging, with every token-like
 /// binary and every claims map replaced by `"[redacted]"`.
@@ -63,6 +63,11 @@ typed Value subclass: OAuthError
   /// The callback came from a different user agent, issuer or redirect.
   class sessionMismatch -> OAuthError =>
     self code: "session_mismatch" description: "login session does not match"
+
+  /// The `SessionStore` holds `#maxSessions` live sessions (or callback
+  /// tickets) and refused a new one. See `SessionStore`, "Size cap".
+  class sessionStoreFull -> OAuthError =>
+    self code: "session_store_full" description: "too many logins in progress; try again later"
 
   /// No callback arrived before the deadline.
   class callbackTimeout -> OAuthError =>

@@ -299,7 +299,8 @@ Object subclass: ProviderPresets
 Actor subclass: SessionStore
   state: table = nil   // private ETS table, created in initialize
 
-  create: sess :: OAuthSession boundTo: binding :: String -> Nil => ...
+  create: sess :: OAuthSession boundTo: binding :: String -> Result(OAuthSession, OAuthError) => ...
+    // refuses with "session_store_full" once #maxSessions are held (BT-4568)
   consume: state :: String boundTo: binding :: String -> Result(OAuthSession, OAuthError) => ...
     // single-use: second consume fails with "reused_state";
     // consume past TTL fails with "expired_session";
@@ -465,7 +466,7 @@ rx := LoopbackReceiver start unwrap
 reg := (ClientRegistration forClient: "APP_ID" redirect: rx redirectUri) unwrap
 store := SessionStore spawn
 sess := OAuthSession newSessionFor: server client: reg
-store create: sess boundTo: rx binding
+(store create: sess boundTo: rx binding) unwrap
 rx expectState: sess state                // before the URL is opened
 url := (OAuthFlows authorizeUrl: server client: reg scopes: #("openid", "read_user") session: sess) unwrap
 Transcript showCr: url                    // or open the system browser
