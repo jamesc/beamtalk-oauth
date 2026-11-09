@@ -1,4 +1,4 @@
-// Copyright 2026 oauth authors
+// Copyright 2026 James Casey
 // SPDX-License-Identifier: Apache-2.0
 
 /// Test stand-in for `OAuthServer` (arrives with BT-4561): anything that

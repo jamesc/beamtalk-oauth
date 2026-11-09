@@ -1,4 +1,4 @@
-// Copyright 2026 oauth authors
+// Copyright 2026 James Casey
 // SPDX-License-Identifier: Apache-2.0
 
 /// Test clock: a settable time in milliseconds, read by the block a test

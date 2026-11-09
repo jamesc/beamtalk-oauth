@@ -1,4 +1,4 @@
-%% Copyright 2026 oauth authors
+%% Copyright 2026 James Casey
 %% SPDX-License-Identifier: Apache-2.0
 
 -module(beamtalk_oauth_http_adapter).
