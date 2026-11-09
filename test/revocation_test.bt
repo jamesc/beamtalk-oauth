@@ -104,6 +104,29 @@ TestCase subclass: RevocationTest
     self assert: (self.provider lastRequestTo: "/revoke") equals: nil
     self assert: (self revoke: nil) error code equals: "config"
 
+  testRefreshHintWithoutRefreshTokenIsConfigError =>
+    got := TokenRevocation
+      revoke: self server
+      client: self publicClient
+      token: (TokenSet new: #{#accessToken => "at-1"})
+      hint: #refresh_token
+    self assert: got error code equals: "config"
+
+  testTokenWithLineBreakIsConfigError =>
+    got := self revoke: "at-1\r\nx-evil: 1"
+    self assert: got error code equals: "config"
+    self deny: (got error printString includesSubstring: "at-1")
+
+  testOversizedResponseIsTransportError =>
+    big := "x" repeat: 1048577
+    self.provider
+      respond: "/revoke"
+      status: 400
+      body: big
+      contentType: "text/plain"
+    err := (self revoke: self tokens) error
+    self assert: err code equals: "transport"
+
   testUnknownHintIsConfigError =>
     got := TokenRevocation
       revoke: self server
@@ -162,7 +185,7 @@ TestCase subclass: RevocationTest
   testBasicCredentialsAreFormEncoded =>
     header := TokenRevocation basic: "id:1" secret: "s p"
     decoded := (Binary fromBase64: (header drop: 6)) unwrap asStringUnchecked
-    self assert: decoded equals: "id%3A1:s%20p"
+    self assert: decoded equals: "id%3A1:s+p"
 
   // ===== Responses =====
   testAny200IsSuccess =>

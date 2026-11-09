@@ -121,6 +121,38 @@ TestCase subclass: TokenInfoTest
     self.provider tokenInfo: #{"active" => false, "sub" => "user-1"}
     self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
 
+  testGitlabNullFieldsNormalize =>
+    self.provider
+      tokenInfo: #{
+        "resource_owner_id" => nil,
+        "scope" => #("api"),
+        "expires_in" => nil,
+        "application" => #{"uid" => "client-1"}
+      }
+    info := (self info: self gitlab token: self tokens) unwrap
+    self assert: (info at: #active) equals: true
+    self assert: (info at: #subject) equals: nil
+    self assert: (info at: #expiresIn) equals: nil
+
+  testTokenForAnotherClientIsInactive =>
+    self.provider tokenInfo: #{
+      "resource_owner_id" => 42,
+      "application" => #{"uid" => "other-app"}
+    }
+    self assert: ((self info: self gitlab token: self tokens) unwrap at: #active) equals: false
+    self.provider tokenInfo: #{
+      "sub" => "user-1",
+      "azp" => "other-app",
+      "aud" => "other-app"
+    }
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
+    self.provider tokenInfo: #{
+      "sub" => "user-1",
+      "azp" => "client-1",
+      "aud" => "api-audience"
+    }
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: true
+
   // ===== Errors =====
   testOtherErrorsAreErrors =>
     self.provider
