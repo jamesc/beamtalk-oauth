@@ -1,0 +1,247 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+/// FixtureProvider — a local OpenID provider for tests, so no test hits
+/// the network.
+///
+/// An `HTTPServer` on an ephemeral port (plain HTTP, so discovery needs
+/// `#allowUnsafeHttp`) with this actor as its handler:
+///
+/// | Path                                | Answers                                |
+/// |-------------------------------------|----------------------------------------|
+/// | `/.well-known/openid-configuration` | the discovery document                 |
+/// | `/jwks`                             | the public half of an ES256 test key   |
+/// | `/token`                            | a token response with a signed ID token|
+/// | `/userinfo`                         | userinfo claims (401 without a bearer) |
+///
+/// Configure it per test: `claims:` (ID-token claims), `tokenFields:`
+/// (token-response members), `discoveryOverrides:`, and
+/// `fail:status:body:` for an error answer on any path. A nil value in
+/// any of those dictionaries removes the member. `reset` restores the
+/// defaults. `lastTokenRequest` answers the last `/token` request's form
+/// body and headers.
+///
+/// ID tokens are signed with the actor's own P-256 key through `jose`.
+/// Default claims: `iss` (the issuer), `sub` `user-1`, `aud` `client-1`,
+/// `nonce` `nonce-1`, `iat` now and `exp` five minutes on.
+///
+/// ## Examples
+/// ```beamtalk
+/// provider := FixtureProvider start
+/// opts := #{#allowUnsafeHttp => true}
+/// server := (OAuthServer fromDiscovery: provider issuer preset: #{} options: opts) unwrap
+/// provider fail: "/token" status: 400 body: #{"error" => "invalid_grant"}
+/// provider stop
+/// ```
+Actor subclass: FixtureProvider
+  /// The `HTTPServer` serving this provider.
+  state: server = nil
+  /// `http://127.0.0.1:<port>`.
+  state: issuer :: String = ""
+  /// The `jose` EC private key ID tokens are signed with.
+  state: key = nil
+  /// ID-token claim overrides (String keys; nil removes a claim).
+  state: claims :: Dictionary = #{}
+  /// Token-response member overrides (nil removes a member).
+  state: tokenFields :: Dictionary = #{}
+  /// Discovery-document member overrides (nil removes a member).
+  state: discoveryOverrides :: Dictionary = #{}
+  /// Path -> {status, body Dictionary}: answer that instead.
+  state: failures :: Dictionary = #{}
+  /// `#{#form => Dictionary, #headers => Dictionary}` of the last `/token`
+  /// request, or nil.
+  state: lastTokenRequest = nil
+
+  /// Start a provider on an ephemeral port. `stop` it when done.
+  class start -> FixtureProvider =>
+    Erlang beamtalk_oauth_oidcc ensure_started
+    provider := self spawnWith: #{
+      #key => (Erlang jose_jwk generate_key: {#ec, #secp256r1})
+    }
+    provider attach: (HTTPServer start: 0 handler: provider)
+    provider
+
+  /// The client id the default `aud` claim names.
+  class clientId -> String => "client-1"
+
+  /// The client secret tests register with.
+  class clientSecret -> String => "secret-1"
+
+  /// The nonce the default ID token carries.
+  class nonce -> String => "nonce-1"
+
+  /// Record the server and derive the issuer from its port.
+  attach: srv :: HTTPServer -> Nil =>
+    self.server := srv
+    self.issuer := "http://127.0.0.1:{srv port}"
+    nil
+
+  /// `http://127.0.0.1:<port>`.
+  issuer -> String => self.issuer
+
+  /// The port the provider listens on.
+  port -> Integer => self.server port
+
+  /// Override ID-token claims (merged over the defaults).
+  claims: overrides :: Dictionary -> Nil =>
+    self.claims := overrides
+    nil
+
+  /// Override token-response members (merged over the defaults).
+  tokenFields: overrides :: Dictionary -> Nil =>
+    self.tokenFields := overrides
+    nil
+
+  /// Override discovery-document members (merged over the defaults).
+  discoveryOverrides: overrides :: Dictionary -> Nil =>
+    self.discoveryOverrides := overrides
+    nil
+
+  /// Answer `status` with `body` as JSON on `path` until `reset`.
+  fail: path :: String status: status :: Integer body: body :: Dictionary -> Nil =>
+    self.failures := self.failures at: path put: {status, body}
+    nil
+
+  /// Back to the defaults: no overrides, no failures, no recorded request.
+  reset -> Nil =>
+    self.claims := #{}
+    self.tokenFields := #{}
+    self.discoveryOverrides := #{}
+    self.failures := #{}
+    self.lastTokenRequest := nil
+    nil
+
+  /// The last `/token` request: `#{#form => ..., #headers => ...}`, both
+  /// with String keys (header names lowercase), or nil.
+  lastTokenRequest -> Dictionary | Nil => self.lastTokenRequest
+
+  /// Answer one request (the `HTTPHandler` protocol).
+  handle: req :: HTTPRequest -> HTTPResponse =>
+    path := req path
+    failure := self.failures at: path ifAbsent: [nil]
+    path =:= "/token" ifTrue: [self.lastTokenRequest := self recordOf: req]
+    failure notNil ifTrue: [^self json: (failure at: 2) status: (failure at: 1)]
+    path match: [
+      "/.well-known/openid-configuration" -> self json: self discoveryDocument status: 200;
+      "/jwks" -> self jwksResponse;
+      "/token" -> self json: self tokenResponse status: 200;
+      "/userinfo" -> self userinfoFor: req;
+      _ -> HTTPResponse new: #{#status => 404, #body => "not found"}
+    ]
+
+  /// The discovery document, overrides applied.
+  discoveryDocument -> Dictionary =>
+    base := self.issuer
+    doc := #{
+      "issuer" => base,
+      "authorization_endpoint" => "{base}/authorize",
+      "token_endpoint" => "{base}/token",
+      "userinfo_endpoint" => "{base}/userinfo",
+      "jwks_uri" => "{base}/jwks",
+      "revocation_endpoint" => "{base}/revoke",
+      "response_types_supported" => #("code"),
+      "grant_types_supported" => #("authorization_code", "refresh_token"),
+      "scopes_supported" => #("openid", "profile", "email"),
+      "subject_types_supported" => #("public"),
+      "id_token_signing_alg_values_supported" => #("ES256"),
+      "token_endpoint_auth_methods_supported" => #("client_secret_basic", "client_secret_post"),
+      "code_challenge_methods_supported" => #("S256")
+    }
+    self merge: self.discoveryOverrides into: doc
+
+  /// The token response: fixed tokens and a freshly signed ID token.
+  tokenResponse -> Dictionary =>
+    body := #{
+      "access_token" => "at-1",
+      "token_type" => "Bearer",
+      "expires_in" => 3600,
+      "refresh_token" => "rt-1",
+      "scope" => "openid profile email",
+      "id_token" => self idToken
+    }
+    self merge: self.tokenFields into: body
+
+  /// The ID-token claims: defaults with `claims:` overrides applied.
+  idTokenClaims -> Dictionary =>
+    now := Erlang erlang system_time: #second
+    defaults := #{
+      "iss" => self.issuer,
+      "sub" => "user-1",
+      "aud" => FixtureProvider clientId,
+      "iat" => now,
+      "exp" => now + 300,
+      "nonce" => FixtureProvider nonce
+    }
+    self merge: self.claims into: defaults
+
+  /// A compact ES256 JWT over `idTokenClaims`, signed with the key.
+  idToken -> String =>
+    header := Json generate: #{"alg" => "ES256", "typ" => "JWT"}
+    signed := Erlang jose_jwt
+      sign: self.key
+      with: header
+      with: (Json generate: self idTokenClaims)
+    {_, compact} := Erlang jose_jws compact: signed
+    compact asStringUnchecked
+
+  /// The JWKS: the public half of the key.
+  jwksResponse -> HTTPResponse =>
+    {_, jwk} := Erlang jose_jwk to_binary: (Erlang jose_jwk to_public: self.key)
+    public := (Json parse: jwk asStringUnchecked) unwrap
+    self json: #{"keys" => #(public)} status: 200
+
+  /// Userinfo for a request with a bearer token; 401 without one.
+  userinfoFor: req :: HTTPRequest -> HTTPResponse =>
+    auth := (self headersOf: req) at: "authorization" ifAbsent: [""]
+    (auth startsWith: "Bearer ") ifFalse: [
+      ^self json: #{"error" => "invalid_token"} status: 401
+    ]
+    claims := self idTokenClaims
+    self
+      json: #{
+        "sub" => (claims at: "sub" ifAbsent: [nil]),
+        "name" => "Fixture User",
+        "email" => "user-1@example.test"
+      }
+      status: 200
+
+  /// The form body and headers of `req`, for `lastTokenRequest`.
+  recordOf: req :: HTTPRequest -> Dictionary =>
+    form := #{}
+    pairs := Erlang uri_string dissect_query: req body asStringUnchecked
+    pairs
+      do: [:pair |
+        form := form at: (pair at: 1) asStringUnchecked put: (pair at: 2) asStringUnchecked
+      ]
+    #{#form => form, #headers => (self headersOf: req)}
+
+  /// Request headers as a Dictionary, names lowercased.
+  headersOf: req :: HTTPRequest -> Dictionary =>
+    out := #{}
+    req headers
+      do: [:pair |
+        out := out at: (pair at: 1) asStringUnchecked lowercase put: (pair at: 2) asStringUnchecked
+      ]
+    out
+
+  /// `body` as a JSON response with `status`.
+  json: body :: Dictionary status: status :: Integer -> HTTPResponse =>
+    HTTPResponse
+      new: #{
+        #status => status,
+        #headers => #(#("content-type", "application/json")),
+        #body => (Json generate: body)
+      }
+
+  /// `base` with `overrides` applied; a nil override removes the member.
+  merge: overrides :: Dictionary into: base :: Dictionary -> Dictionary =>
+    out := base
+    overrides keysAndValuesDo: [:k :v |
+      out := v isNil ifTrue: [out removeKey: k] ifFalse: [out at: k put: v]
+    ]
+    out
+
+  /// Stop the HTTP server with the actor.
+  terminate: _reason :: Object -> Nil =>
+    self.server isNil ifFalse: [[self.server stop] on: Exception do: [:e | nil]]
+    nil

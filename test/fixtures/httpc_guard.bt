@@ -1,0 +1,70 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+/// HttpcGuard — proves `oidcc` never falls back to `httpc`.
+///
+/// `install` turns on the VM's call counters for `httpc:request/4,5` (the
+/// arities `oidcc`'s default adapter uses), node-wide and without a
+/// tracer process; `calls` reads them. The counters are never reset, so
+/// once installed, any `httpc` request anywhere in the suite shows up in
+/// every later check. Test classes that make provider calls install it in
+/// `setUpOnce` and assert `HttpcGuard calls` is 0 in `tearDown`.
+///
+/// ## Examples
+/// ```beamtalk
+/// HttpcGuard install
+/// // ... provider calls ...
+/// HttpcGuard calls   // => 0
+/// ```
+Object subclass: HttpcGuard
+
+  /// The `httpc:request` arities that are counted.
+  class arities -> List(Integer) => #(4, 5)
+
+  /// Start counting `httpc:request/4,5` calls. Idempotent: counters that
+  /// are already on are left alone (turning them on again would reset
+  /// them).
+  class install -> Nil =>
+    self arities
+      do: [:arity |
+        self
+          count: #httpc
+          function: #request
+          arity: arity
+      ]
+    nil
+
+  /// The number of `httpc:request/4,5` calls since `install`.
+  class calls -> Integer =>
+    self arities
+      inject: 0
+      into: [:sum :arity |
+        sum + (self
+          callsTo: #httpc
+          function: #request
+          arity: arity)
+      ]
+
+  /// Turn on the call counter for `module:function/arity` unless it is
+  /// already on. The module is loaded first: a pattern set on an unloaded
+  /// module matches nothing.
+  class count: module :: Symbol function: name :: Symbol arity: arity :: Integer -> Nil =>
+    Erlang code ensure_loaded: module
+    mfa := {module, name, arity}
+    {_, current} := Erlang erlang trace_info: mfa with: #call_count
+    current =:= false
+      ifTrue: [
+        // The spec's first argument is a union the checker reads as Symbol.
+        @expect type
+        Erlang erlang
+          trace_pattern: mfa
+          with: true
+          with: #(#call_count)
+      ]
+    nil
+
+  /// Calls to `module:function/arity` since its counter was turned on; 0
+  /// when it is off.
+  class callsTo: module :: Symbol function: name :: Symbol arity: arity :: Integer -> Integer =>
+    {_, n} := Erlang erlang trace_info: {module, name, arity} with: #call_count
+    (n isKindOf: Integer) ifTrue: [n] ifFalse: [0]

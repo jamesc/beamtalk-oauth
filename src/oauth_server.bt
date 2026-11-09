@@ -1,0 +1,128 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+/// OAuthServer — an OpenID provider, as discovered.
+///
+/// Holds the issuer and an opaque `oidcc` provider context (the provider
+/// configuration and its JWKS) that flows hand back to the native shim.
+/// `printString` and `asJson` never show the context.
+///
+/// Endpoints `oidcc` does not model come from discovery or the preset:
+/// `revocationEndpoint` from the discovery document, else the preset;
+/// `tokenInfoEndpoint` from the preset (no standard names it).
+///
+/// Every request goes through the `http` package's `HTTPClient`, never
+/// `httpc`. The issuer and every endpoint the discovery document names
+/// must be HTTPS; anything else answers `insecure_endpoint`.
+///
+/// `fromDiscovery:` loads the configuration once. That suits scripts,
+/// CLIs and the REPL; ID-token validation still reloads the JWKS when a
+/// token names an unknown key.
+///
+/// ## Examples
+/// ```beamtalk
+/// server := (OAuthServer fromDiscovery: "https://gitlab.com") unwrap
+/// server issuer        // => "https://gitlab.com"
+/// server := (OAuthServer fromPreset: ProviderPresets gitlab) unwrap
+/// (OAuthServer fromDiscovery: "http://example.com") error code
+/// // => "insecure_endpoint"
+/// ```
+typed Value subclass: OAuthServer
+  /// The issuer, as the discovery document states it.
+  field: issuer :: String = ""
+  /// The opaque `oidcc` provider context. Never printed.
+  field: context :: Object = nil
+  /// RFC 7009 revocation endpoint, from discovery or the preset.
+  field: revocationEndpoint :: String | Nil = nil
+  /// The provider's token-info endpoint, from the preset.
+  field: tokenInfoEndpoint :: String | Nil = nil
+  /// The provider configuration as discovered (overrides applied), keyed
+  /// by `oidcc` field name: `#token_endpoint`,
+  /// `#token_endpoint_auth_methods_supported`, ...
+  field: metadata :: Dictionary = #{}
+  /// The preset the server was discovered with (`#{}` for none). See
+  /// `ProviderPresets`.
+  field: preset :: Dictionary = #{}
+
+  /// Discover the provider at `issuer`, with no preset.
+  class fromDiscovery: issuer :: String -> Result(OAuthServer, OAuthError) =>
+    self fromDiscovery: issuer preset: #{}
+
+  /// Discover the provider a preset names (`#issuer`), with its quirks.
+  class fromPreset: preset :: Dictionary -> Result(OAuthServer, OAuthError) =>
+    issuer := preset at: #issuer ifAbsent: [nil]
+    (issuer isKindOf: String) ifFalse: [
+      ^Result error: (OAuthError config: "preset has no #issuer")
+    ]
+    self fromDiscovery: issuer preset: preset
+
+  /// Discover the provider at `issuer`, applying the preset's
+  /// `#documentOverrides` and endpoints (see `ProviderPresets`).
+  class fromDiscovery: issuer :: String preset: preset :: Dictionary -> Result(OAuthServer, OAuthError) =>
+    self
+      fromDiscovery: issuer
+      preset: preset
+      options: #{}
+
+  /// As `fromDiscovery:preset:`, with transport options:
+  ///
+  /// - `#maxBodyBytes` — the response cap (default 1 MiB);
+  /// - `#timeout` — per-request timeout in milliseconds;
+  /// - `#allowUnsafeHttp` — `true` accepts plain-HTTP endpoints. **Tests
+  ///   only**: the fixture provider is plain HTTP. Never set it for a real
+  ///   provider.
+  ///
+  /// An unknown option raises.
+  class fromDiscovery: issuer :: String preset: preset :: Dictionary options: opts :: Dictionary -> Result(OAuthServer, OAuthError) =>
+    known := #(#maxBodyBytes, #timeout, #allowUnsafeHttp)
+    bad := opts keys reject: [:k | known includes: k]
+    bad isEmpty ifFalse: [
+      Error signal: "OAuthServer: unknown options {bad printString}"
+    ]
+    shimOpts := #{
+      #client => HTTPClient,
+      #document_overrides => (preset at: #documentOverrides ifAbsent: [#{}]),
+      #allow_unsafe_http => (opts at: #allowUnsafeHttp ifAbsent: [false])
+    }
+    (opts includesKey: #maxBodyBytes) ifTrue: [
+      shimOpts := shimOpts at: #max_body_bytes put: (opts at: #maxBodyBytes)
+    ]
+    (opts includesKey: #timeout) ifTrue: [
+      shimOpts := shimOpts at: #timeout put: (opts at: #timeout)
+    ]
+    found := Erlang beamtalk_oauth_oidcc discover: issuer with: shimOpts
+    found ifOk: [:info |
+      Result ok: (self fromShim: info preset: preset)
+    ] ifError: [:reason | Result error: (OAuthError fromOidcc: reason)]
+
+  /// Build the server from the shim's discovery answer.
+  class fromShim: info :: Dictionary preset: preset :: Dictionary -> OAuthServer =>
+    revocation := (info at: #revocation_endpoint) ifNil: [
+      preset at: #revocationEndpoint ifAbsent: [nil]
+    ]
+    self
+      new: #{
+        #issuer => (info at: #issuer),
+        #context => (info at: #context),
+        #revocationEndpoint => revocation,
+        #tokenInfoEndpoint => (preset at: #tokenInfoEndpoint ifAbsent: [nil]),
+        #metadata => (info at: #metadata),
+        #preset => preset
+      }
+
+  /// The token endpoint from discovery, or nil.
+  tokenEndpoint -> String | Nil =>
+    self.metadata at: #token_endpoint ifAbsent: [nil]
+
+  /// `OAuthServer(issuer: ..., revocationEndpoint: ..., tokenInfoEndpoint: ...)`.
+  /// The context is never shown.
+  printString -> String =>
+    "OAuthServer(issuer: {self.issuer}, revocationEndpoint: {self.revocationEndpoint}, tokenInfoEndpoint: {self.tokenInfoEndpoint})"
+
+  /// The JSON shape: issuer and endpoints. The context is never included.
+  asJson -> Dictionary =>
+    #{
+      "issuer" => self.issuer,
+      "revocationEndpoint" => self.revocationEndpoint,
+      "tokenInfoEndpoint" => self.tokenInfoEndpoint
+    }

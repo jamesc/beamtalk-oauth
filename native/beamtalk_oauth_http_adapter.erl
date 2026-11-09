@@ -5,17 +5,24 @@
 
 -moduledoc """
 `oidcc_http_adapter` over Beamtalk's `HTTPClient` (Mint), so every call
-oidcc makes shares the package's TLS, redirect, body-cap and proxy
-behaviour instead of using `httpc`.
+`oidcc` makes shares the package's TLS, no-redirect and body-cap behaviour
+instead of using `httpc`.
 
 Adapter config: `#{client => HTTPClient class object, max_body_bytes =>
-integer() | unlimited}`. The class object is passed in from Beamtalk and
-messaged through `beamtalk_message_dispatch:send/3`, so this module does
-not depend on how class methods are compiled.
+non_neg_integer() | unlimited}`. The class object is passed in from
+Beamtalk and messaged through `beamtalk_message_dispatch:send/3`, so this
+module does not depend on how class methods are compiled. (That module is
+internal to the Beamtalk runtime; BT-4556 tracks a supported API.)
 
-Beamtalk Strings cross as `{beamtalk_string, Bin}`; responses are
-converted back to the `httpc` shape oidcc expects: lowercase charlist
-header names and a binary body.
+Beamtalk Strings cross as `{beamtalk_string, Bin}`, and a `Result` arrives
+as a map. Requests are tagged on the way out; responses are converted
+back to the `httpc` shape `oidcc` expects: lowercase charlist header names
+and a binary body.
+
+Every failure answers `{error, {http_client, Reason}}`, where `Reason` is
+the `HTTPClient` error's message (a binary) or a fixed atom. It never
+carries the request: no URL query, headers or body, which hold codes,
+secrets and tokens.
 """.
 
 -behaviour(oidcc_http_adapter).
@@ -23,40 +30,91 @@ header names and a binary body.
 -export([request/5]).
 
 -define(DEFAULT_MAX_BODY, 1048576).
+%% oidcc's own default; used when oidcc passes `infinity`, which
+%% `HTTPClient` does not accept.
+-define(DEFAULT_TIMEOUT, 60000).
 
--doc "Perform one oidcc request through `HTTPClient request:url:options:`.".
+-doc """
+Perform one `oidcc` request through `HTTPClient request:url:options:`.
+
+`#maxBodyBytes` defaults to 1 MiB and the timeout comes from `oidcc`'s
+`HttpOptions`. A streaming request body, malformed headers and `ssl`
+options are refused (`{error, {http_client, streaming_request_body |
+malformed_headers | unsupported_ssl_options}}`); any crash answers
+`{error, {http_client, {raised, Class}}}`.
+""".
 -spec request(Method, Request, HttpOptions, RequestOptions, Config) ->
     {ok, {{string(), non_neg_integer(), string()}, [{string(), string()}], binary()}}
-    | {error, term()}
+    | {error, {http_client, term()}}
 when
     Method :: oidcc_http_adapter:method(),
     Request :: oidcc_http_adapter:request(),
-    HttpOptions :: list(),
-    RequestOptions :: list(),
-    Config :: #{client := term(), max_body_bytes => integer() | unlimited}.
+    HttpOptions :: oidcc_http_adapter:http_options(),
+    RequestOptions :: oidcc_http_adapter:request_options(),
+    Config :: #{client := term(), max_body_bytes => non_neg_integer() | unlimited}.
 request(Method, Request, HttpOptions, _RequestOptions, #{client := Client} = Config) ->
-    {Url, Headers, Body} = split_request(Request),
-    Opts0 = #{
-        headers => [[str(K), str(V)] || {K, V} <- Headers],
-        timeout => proplists:get_value(timeout, HttpOptions, 30000),
-        maxBodyBytes => maps:get(max_body_bytes, Config, ?DEFAULT_MAX_BODY)
-    },
-    Opts =
-        case Body of
-            none -> Opts0;
-            _ -> Opts0#{body => str(Body)}
-        end,
-    Result = beamtalk_message_dispatch:send(
-        Client, 'request:url:options:', [Method, str(Url), Opts]
-    ),
-    from_result(Result).
+    %% Everything runs inside the try: a crash anywhere here (a header
+    %% value that is not iodata, a response of an unexpected shape) must
+    %% not escape with the request in its stacktrace or arguments, where
+    %% oidcc's telemetry span would re-emit it. It becomes a fixed reason.
+    try
+        do_request(Method, Request, HttpOptions, Client, Config)
+    catch
+        Class:_Reason -> {error, {http_client, {raised, Class}}}
+    end.
+
+do_request(Method, Request, HttpOptions, Client, Config) ->
+    maybe
+        ok ?= check_http_options(HttpOptions),
+        {Url, Headers, Body} ?= split_request(Request),
+        {ok, HeaderPairs} ?= headers(Headers),
+        Opts0 = #{
+            headers => HeaderPairs,
+            timeout => timeout(proplists:get_value(timeout, HttpOptions, ?DEFAULT_TIMEOUT)),
+            maxBodyBytes => maps:get(max_body_bytes, Config, ?DEFAULT_MAX_BODY)
+        },
+        Opts =
+            case Body of
+                none -> Opts0;
+                _ -> Opts0#{body => str(Body)}
+            end,
+        from_result(
+            beamtalk_message_dispatch:send(Client, 'request:url:options:', [Method, str(Url), Opts])
+        )
+    else
+        {error, Reason} -> {error, {http_client, Reason}}
+    end.
+
+%% `HTTPClient` has no per-request TLS options, so `ssl` options (custom
+%% CAs, client certificates for `tls_client_auth`) would be silently
+%% dropped. Refuse them instead.
+check_http_options(HttpOptions) ->
+    case proplists:is_defined(ssl, HttpOptions) of
+        true -> {error, unsupported_ssl_options};
+        false -> ok
+    end.
+
+%% Request headers as `[Name, Value]` String pairs; anything that is not
+%% a `{Name, Value}` pair is refused rather than dropped.
+headers(Headers) when is_list(Headers) ->
+    case lists:all(fun(H) -> is_tuple(H) andalso tuple_size(H) =:= 2 end, Headers) of
+        true -> {ok, [[str(K), str(V)] || {K, V} <- Headers]};
+        false -> {error, malformed_headers}
+    end;
+headers(_) ->
+    {error, malformed_headers}.
 
 split_request({Url, Headers}) ->
     {Url, Headers, none};
 split_request({Url, Headers, ContentType, Body}) when is_binary(Body); is_list(Body) ->
     {Url, [{"content-type", ContentType} | Headers], iolist_to_binary(Body)};
 split_request({_Url, _Headers, _ContentType, _StreamingBody}) ->
-    erlang:error({unsupported_request_body, streaming}).
+    {error, streaming_request_body};
+split_request(_Other) ->
+    {error, malformed_request}.
+
+timeout(T) when is_integer(T), T >= 0 -> T;
+timeout(_) -> ?DEFAULT_TIMEOUT.
 
 from_result(#{'$beamtalk_class' := 'Result', isOk := true, okValue := Response}) ->
     #{status := Status, headers := Headers, body := Body} = Response,
@@ -66,7 +124,21 @@ from_result(#{'$beamtalk_class' := 'Result', isOk := true, okValue := Response})
         bin(Body)
     }};
 from_result(#{'$beamtalk_class' := 'Result', isOk := false, errReason := Reason}) ->
-    {error, {http_client, Reason}}.
+    {error, {http_client, message(Reason)}};
+from_result(_Other) ->
+    {error, {http_client, unexpected_result}}.
+
+%% The error's message text. `HTTPClient` builds it from a fixed hint and
+%% the transport reason (`Request failed (econnrefused)`), never from the
+%% request.
+message(Reason) ->
+    try beamtalk_message_dispatch:send(Reason, message, []) of
+        {beamtalk_string, Text} -> Text;
+        Text when is_binary(Text) -> Text;
+        _ -> unknown
+    catch
+        _:_ -> unknown
+    end.
 
 str(V) -> {beamtalk_string, iolist_to_binary(V)}.
 

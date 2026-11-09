@@ -5,7 +5,7 @@ TestCase subclass: OAuthSessionTest
   field: session = nil
 
   setUp =>
-    server := FakeServer issuer: "https://gitlab.com"
+    server := OAuthServer new: #{#issuer => "https://gitlab.com"}
     reg := (ClientRegistration forClient: "app" redirect: "http://127.0.0.1:50278/callback") unwrap
     self.session := OAuthSession newSessionFor: server client: reg
 

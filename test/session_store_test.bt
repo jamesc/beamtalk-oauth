@@ -6,7 +6,7 @@ TestCase subclass: SessionStoreTest
   field: binding = nil
 
   setUp =>
-    server := FakeServer issuer: "https://gitlab.com"
+    server := OAuthServer new: #{#issuer => "https://gitlab.com"}
     reg := (ClientRegistration forClient: "app" redirect: "http://127.0.0.1:50278/callback") unwrap
     self.session := OAuthSession newSessionFor: server client: reg
     self.binding := Secrets generate
@@ -18,7 +18,7 @@ TestCase subclass: SessionStoreTest
 
   /// A fresh session from the same setUp recipe, with another state.
   otherSession =>
-    server := FakeServer issuer: "https://gitlab.com"
+    server := OAuthServer new: #{#issuer => "https://gitlab.com"}
     reg := (ClientRegistration forClient: "app" redirect: "http://127.0.0.1:50278/callback") unwrap
     OAuthSession newSessionFor: server client: reg
 

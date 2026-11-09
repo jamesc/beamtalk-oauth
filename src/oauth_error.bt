@@ -73,15 +73,25 @@ typed Value subclass: OAuthError
   /// - `{http_error, Status, #{<<"error">> := Code}}` answers the provider
   ///   code verbatim, with the status and any `error_description`;
   ///   an `http_error` without an `error` member answers `http_error`.
+  /// - `{http_client, Reason}` (the HTTP adapter got no response) answers
+  ///   `transport`.
+  /// - `{insecure_endpoint, Field, Url}` (the shim's HTTPS-only check)
+  ///   answers `insecure_endpoint`, naming the field and URL.
   /// - An atom, or a tuple whose first element is an atom, answers that
   ///   atom's name (`missing_claim`, `token_expired`, ...).
   /// - Anything else answers `transport`.
   ///
-  /// Wrapping `{error, Reason}` tuples are unwrapped first, at any depth.
+  /// An Exception (how an FFI `{error, R}` arrives) is unwrapped to its
+  /// `reason`, and wrapping `{error, Reason}` tuples are unwrapped, at any
+  /// depth.
   /// `undefined`, `true` and `false` are not reasons and answer `transport`.
   /// `detail` always holds the redacted original term (see `redact:`).
   class fromOidcc: reason :: Object -> OAuthError =>
-    term := reason
+    // An FFI `{error, R}` arrives as `Result error:` an Exception whose
+    // `reason` is `R`.
+    term := (reason isKindOf: Exception) ifTrue: [
+      reason reason
+    ] ifFalse: [reason]
     [
       (term isKindOf: Tuple) and: [
         (term size =:= 2) and: [(term at: 1) =:= #error]
@@ -104,8 +114,22 @@ typed Value subclass: OAuthError
             #detail => detail
           }
       ]
-    // `term` is a Tuple here: only a tuple reason can carry this tag and a status.
-    @expect type
+    (tag =:= #http_client and: [
+      term isKindOf: Tuple
+    ]) ifTrue: [^self fromHttpClient: term detail: detail]
+    ((tag =:= #insecure_endpoint and: [
+      term isKindOf: Tuple
+    ]) and: [term size =:= 3])
+      ifTrue: [
+        field := (self textOf: (term at: 2)) ifNil: ["endpoint"]
+        url := (self textOf: (term at: 3)) ifNil: [""]
+        ^self
+          new: #{
+            #code => "insecure_endpoint",
+            #description => "{field} must be https: {url}",
+            #detail => detail
+          }
+      ]
     ((tag =:= #http_error)
       and: [
         (term isKindOf: Tuple) and: [
@@ -113,6 +137,23 @@ typed Value subclass: OAuthError
         ]
       ]) ifTrue: [^self fromHttpError: term detail: detail]
     self new: #{#code => tag asString, #detail => detail}
+
+  /// `{http_client, Reason}` from the HTTP adapter: the request never got
+  /// a response (connect, TLS, timeout, body over the cap). Answers
+  /// `transport`, described by `Reason` when it is text that does not look
+  /// secret (see `looksSecret:`).
+  class fromHttpClient: term :: Tuple detail: detail :: Object -> OAuthError =>
+    reason := term size >= 2 ifTrue: [term at: 2] ifFalse: [nil]
+    text := self textOf: reason
+    // A Symbol is one of the adapter's fixed reasons; text came from the
+    // HTTP client and is redacted like a detail.
+    (text isNil
+      or: [
+        (reason isKindOf: Symbol) not and: [
+          self looksSecret: (Binary fromIolist: #(text))
+        ]
+      ]) ifTrue: [text := "HTTP request failed"]
+    self new: #{#code => "transport", #description => text, #detail => detail}
 
   /// `{http_error, Status, Body}`: the provider's `error` member when the
   /// body is a map that carries one, `http_error` otherwise.

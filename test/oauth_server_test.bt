@@ -1,0 +1,137 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+// OAuthServer discovery against the local FixtureProvider. No test hits
+// the network, and none may reach httpc (HttpcGuard).
+
+TestCase subclass: OAuthServerTest
+  field: provider = nil
+
+  setUp =>
+    HttpcGuard install
+    self.provider := FixtureProvider start
+
+  tearDown =>
+    self.provider stop
+    self assert: HttpcGuard calls equals: 0
+    nil
+
+  provider => self.provider
+
+  unsafe -> Dictionary => #{#allowUnsafeHttp => true}
+
+  discover: preset :: Dictionary -> Result(OAuthServer, OAuthError) =>
+    OAuthServer
+      fromDiscovery: self provider issuer
+      preset: preset
+      options: self unsafe
+
+  testDiscoverySucceeds =>
+    server := self assertOk: (self discover: #{})
+    issuer := self provider issuer
+    self assert: server issuer equals: issuer
+    self assert: server tokenEndpoint equals: "{issuer}/token"
+    self assert: server revocationEndpoint equals: "{issuer}/revoke"
+    self assert: server tokenInfoEndpoint equals: nil
+    self deny: server context isNil
+
+  testPrintStringHidesContext =>
+    server := self assertOk: (self discover: #{})
+    text := server printString
+    self assert: (text startsWith: "OAuthServer(issuer: ")
+    self deny: (text includesSubstring: "beamtalk_oauth_provider")
+    self deny: (text includesSubstring: "jose")
+    self deny: (server asJson includesKey: "context")
+
+  testPresetSuppliesMissingRevocationAndTokenInfo =>
+    self provider discoveryOverrides: #{"revocation_endpoint" => nil}
+    preset := #{
+      #revocationEndpoint => "https://example.test/revoke",
+      #tokenInfoEndpoint => "https://example.test/tokeninfo"
+    }
+    server := self assertOk: (self discover: preset)
+    self assert: server revocationEndpoint equals: "https://example.test/revoke"
+    self assert: server tokenInfoEndpoint equals: "https://example.test/tokeninfo"
+    self assert: server preset equals: preset
+
+  testDiscoveryRevocationWinsOverPreset =>
+    server := self assertOk: (self discover: #{
+      #revocationEndpoint => "https://example.test/revoke"
+    })
+    self assert: server revocationEndpoint equals: "{self provider issuer}/revoke"
+
+  testGitlabOverrideIsApplied =>
+    plain := self assertOk: (self discover: #{})
+    methods := plain metadata at: #token_endpoint_auth_methods_supported
+    self deny: (methods includes: "none")
+    overridden := self assertOk: (self discover: ProviderPresets gitlab)
+    methods2 := overridden metadata at: #token_endpoint_auth_methods_supported
+    self assert: (methods2 includes: "none")
+    self assert: overridden tokenInfoEndpoint equals: "https://gitlab.com/oauth/token/info"
+
+  testNonHttpsIssuerIsInsecure =>
+    // No allowUnsafeHttp: refused before any request is made.
+    result := OAuthServer fromDiscovery: self provider issuer
+    self assert: result isError
+    self assert: result error code equals: "insecure_endpoint"
+
+  testPlainHttpIssuerWithoutHostIsInsecure =>
+    result := OAuthServer fromDiscovery: "http://example.com"
+    self assert: result error code equals: "insecure_endpoint"
+
+  testUnsafeHttpIsLoopbackOnly =>
+    result := OAuthServer
+      fromDiscovery: "http://example.com"
+      preset: #{}
+      options: self unsafe
+    self assert: result error code equals: "insecure_endpoint"
+
+  testTransportFailure =>
+    // A port nothing listens on: the connection is refused.
+    srv := HTTPServer start: 0 handler: [:req |
+      HTTPResponse new: #{#status => 404}
+    ]
+    port := srv port
+    srv stop
+    result := OAuthServer
+      fromDiscovery: "http://127.0.0.1:{port}"
+      preset: #{}
+      options: self unsafe
+    self assert: result isError
+    self assert: result error code equals: "transport"
+    self assert: (result error description includesSubstring: "Could not open connection")
+
+  testProviderErrorStatus =>
+    self provider
+      fail: "/.well-known/openid-configuration"
+      status: 500
+      body: #{"error" => "server_error"}
+    result := self discover: #{}
+    self assert: result error code equals: "server_error"
+    self assert: result error status equals: 500
+
+  testBodyCapIsEnforced =>
+    result := OAuthServer
+      fromDiscovery: self provider issuer
+      preset: #{}
+      options: #{#allowUnsafeHttp => true, #maxBodyBytes => 10}
+    self assert: result error code equals: "transport"
+    self assert: (result error description includesSubstring: "exceeded limit")
+
+  testIssuerMismatch =>
+    self provider discoveryOverrides: #{"issuer" => "http://127.0.0.1:1"}
+    result := self discover: #{}
+    self assert: result error code equals: "issuer_mismatch"
+
+  testFromPresetNeedsIssuer =>
+    self assert: (OAuthServer fromPreset: #{}) error code equals: "config"
+
+  testUnknownOptionRaises =>
+    self
+      should: [
+        OAuthServer
+          fromDiscovery: "https://example.test"
+          preset: #{}
+          options: #{#allowUnsafe => true}
+      ]
+      raise: #signal
