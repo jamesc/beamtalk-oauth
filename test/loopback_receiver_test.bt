@@ -433,12 +433,12 @@ TestCase subclass: LoopbackReceiverTest
       by: [:started |
         started expectState: "w"
         table at: #armed put: true
-        Timer sleep: 300
+        Timer sleep: 500
         Erlang erlang exit: #boom
       ]
     100 timesRepeat: [(table at: #armed) isNil ifTrue: [Timer sleep: 10]]
     [
-      Timer sleep: 600
+      Timer sleep: 900
       HTTPClient get: rx redirectUri ++ "?code=waited&state=w"
     ] fork
     self assert: ((rx awaitCallback: 5000) unwrap at: "code") equals: "waited"
