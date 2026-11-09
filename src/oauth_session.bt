@@ -28,7 +28,8 @@ typed Value subclass: OAuthSession
   field: issuer :: String = ""
   /// Redirect URI of the registration the session was created for.
   field: redirectUri :: String = ""
-  /// When the session store accepted the session; 0 until then.
+  /// When the session store accepted the session, in Unix milliseconds;
+  /// 0 until then.
   field: createdAt :: Integer = 0
 
   /// A fresh session for `server` (anything answering `issuer`, normally

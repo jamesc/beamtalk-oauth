@@ -1,0 +1,198 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// SessionStore — in-flight `OAuthSession`s, single-use, each bound to the
+/// user agent that started the flow.
+///
+/// `state` alone does not stop login CSRF in a shared store (RFC 6749
+/// §10.12): an attacker can start a login, approve it with their own
+/// account and send the victim the callback URL. So every session is
+/// stored with a binding (an opaque value tied to whoever started the
+/// flow: a per-flow `Secrets generate` held by a native app, or a cookie
+/// value in a server-side web app), and `consume:boundTo:` only answers
+/// the session to a caller presenting the same binding. There is no
+/// `create:` or `consume:` without `boundTo:`, and an empty or nil binding
+/// raises: it is a programming error, not a login failure.
+///
+/// The binding must be high-entropy and unique to the flow
+/// (`Secrets generate`): a constant such as `"web"` turns the defense off.
+/// A binding equal to the session's own `state` raises, since the callback
+/// URL carries `state` and so proves nothing about the user agent.
+///
+/// The app spawns the store explicitly; there is no global store.
+/// `spawnWith:` takes `#ttl` (milliseconds, 10 minutes by default) and
+/// `#now` (a block answering the time in milliseconds, for tests). By
+/// default TTLs run on the monotonic clock, so wall-clock steps neither
+/// extend nor cut short a session, and `createdAt` is stamped in Unix
+/// milliseconds; with `#now`, both use the injected clock.
+///
+/// ## Checks and burning
+///
+/// `consume:boundTo:` removes the session it finds before checking it, so
+/// a probed, mismatched or expired state can never be retried. The binding
+/// is checked before expiry, so a caller with the wrong binding learns
+/// only `session_mismatch`, never the session's age. Apps should show the
+/// user one generic failure and log the specific code.
+///
+/// ## Expiry and the sweep
+///
+/// A session is expired once `ttl` has passed since `create:boundTo:`.
+/// Every `create:boundTo:` and `consume:boundTo:` first sweeps the store
+/// (there is no timer), dropping sessions that expired more than one
+/// further `ttl` ago, so abandoned attempts cannot accumulate. Within that
+/// grace a late callback answers `expired_session`; after it the state is
+/// unknown and answers `reused_state`.
+///
+/// ## Redaction
+///
+/// Beamtalk actors have no `format_status/1` hook, so sessions do not
+/// live in the actor's state at all: they are kept in a private ETS table
+/// that the actor owns. `sys:get_state/1`, `sys:get_status/1` and crash
+/// reports show only the table's reference, and no other process (nor
+/// `observer`) can read a private table. Bindings are kept only as SHA-256
+/// digests. The table survives hot code reloading and is deleted with the
+/// actor, so a crashed store loses its sessions: it fails closed.
+///
+/// Arguments and replies still cross the mailbox in the clear: with
+/// `sys:log/2` or `sys:trace/2` turned on, or in the "last message" of a
+/// crash report, a `create:boundTo:` or a consumed session is visible.
+/// Do not enable `sys` debugging on a store in production.
+///
+/// ## Examples
+/// ```beamtalk
+/// store := SessionStore spawn
+/// binding := Secrets generate
+/// store create: sess boundTo: binding
+/// (store consume: sess state boundTo: binding) unwrap   // => the session
+/// (store consume: sess state boundTo: binding) error code
+/// // => "reused_state"
+/// ```
+typed Actor subclass: SessionStore
+  /// Session lifetime in milliseconds.
+  state: ttl :: Integer = 600000
+  /// The clock, answering milliseconds; nil for the system clocks.
+  state: now :: Block(Integer) | Nil = nil
+  /// The private ETS table of `{stateDigest, stamp, session,
+  /// bindingDigest}` rows. See "Redaction".
+  state: table :: Object = nil
+
+  /// The default session lifetime: 10 minutes, in milliseconds.
+  class defaultTtl -> Integer => 600000
+
+  /// Check the configuration and create the private table. A `#ttl` that
+  /// is not a positive Integer, or a `#now` that is not a Block, fails the
+  /// spawn.
+  initialize -> Nil =>
+    ((self.ttl isKindOf: Integer) and: [
+      self.ttl > 0
+    ]) ifFalse: [
+      self error: "SessionStore: #ttl must be a positive Integer of milliseconds"
+    ]
+    (self.now isNil or: [
+      self.now isKindOf: Block
+    ]) ifFalse: [
+      self error: "SessionStore: #now must be a Block answering milliseconds"
+    ]
+    self.table := Erlang ets new: #oauth_session_store with: #(#set, #private)
+    nil
+
+  /// Store `sess` under its `state`, bound to `binding`, and stamp its
+  /// `createdAt` with the current time.
+  ///
+  /// Raises when `binding` is nil, empty or equal to the session's state,
+  /// when `sess` has no state, or when a session with the same state is
+  /// already stored: each is a programming error.
+  create: sess :: OAuthSession boundTo: binding :: String -> Nil =>
+    digest := self digestOf: binding
+    sess state isEmpty ifTrue: [
+      self error: "SessionStore: the session has no state"
+    ]
+    binding =:= sess state ifTrue: [
+      self error: "SessionStore: the binding must not be the session's state"
+    ]
+    stamp := self clock
+    self sweepAt: stamp
+    key := self keyOf: sess state
+    (Erlang ets member: self.table with: key) ifTrue: [
+      self error: "SessionStore: a session with this state is already stored"
+    ]
+    stamped := sess withCreatedAt: (self createdAtFor: stamp)
+    Erlang ets insert: self.table with: {key, stamp, stamped, digest}
+    nil
+
+  /// Take the session stored under `state`, if `binding` matches the one
+  /// it was created with.
+  ///
+  /// Answers the session, removed from the store (single use), or an
+  /// `OAuthError`:
+  ///
+  /// - `reused_state` when no session is stored under `state` (unknown,
+  ///   already consumed, or swept);
+  /// - `session_mismatch` when `binding` differs, compared in constant
+  ///   time (`crypto:hash_equals/2` over SHA-256 digests);
+  /// - `expired_session` when the session is past its TTL.
+  ///
+  /// A session found under `state` is removed whatever the outcome, so a
+  /// probed or expired state cannot be retried. Raises when `binding` is
+  /// nil or empty, without touching the store.
+  consume: state :: String boundTo: binding :: String -> Result(OAuthSession, OAuthError) =>
+    digest := self digestOf: binding
+    stamp := self clock
+    self sweepAt: stamp
+    rows := Erlang ets take: self.table with: (self keyOf: state)
+    rows isEmpty ifTrue: [^Result error: OAuthError reusedState]
+    {_, created, sess, stored} := rows first
+    (Erlang crypto hash_equals: stored with: digest) ifFalse: [
+      ^Result error: OAuthError sessionMismatch
+    ]
+    stamp >= (created + self.ttl) ifTrue: [
+      ^Result error: OAuthError expiredSession
+    ]
+    Result ok: sess
+
+  /// The number of sessions held, including expired ones not yet swept.
+  /// For tests and monitoring.
+  size -> Integer => Erlang ets info: self.table with: #size
+
+  /// The TTL clock in milliseconds: the injected clock, or the monotonic
+  /// clock.
+  internal clock -> Integer =>
+    self.now isNil ifTrue: [
+      Erlang erlang monotonic_time: #millisecond
+    ] ifFalse: [self.now value]
+
+  /// The `createdAt` for a session stored at `stamp`: Unix milliseconds,
+  /// or `stamp` itself under an injected clock.
+  internal createdAtFor: stamp :: Integer -> Integer =>
+    self.now isNil ifTrue: [
+      Erlang erlang system_time: #millisecond
+    ] ifFalse: [stamp]
+
+  /// Drop the sessions that expired more than one further TTL before
+  /// `stamp`.
+  internal sweepAt: stamp :: Integer -> Nil =>
+    cutoff := stamp - (2 * self.ttl)
+    (Erlang ets tab2list: self.table)
+      do: [:row :: Tuple |
+        {key, created, _, _} := row
+        created <= cutoff ifTrue: [Erlang ets delete: self.table with: key]
+      ]
+    nil
+
+  /// The table key for `state`: its SHA-256 digest, a raw binary (a
+  /// String nested in a row would not compare equal to one passed to
+  /// `ets:take/2`). Any non-String state, such as nil, answers a key that
+  /// matches nothing.
+  internal keyOf: state :: Object -> Binary =>
+    (state isKindOf: String) ifFalse: [^Erlang crypto hash: #sha256 with: ""]
+    Erlang crypto hash: #sha256 with: state
+
+  /// The SHA-256 digest of `binding`. Raises when it is nil, empty or not
+  /// a String.
+  internal digestOf: binding :: String -> Binary =>
+    ((binding isKindOf: String) and: [
+      binding isEmpty not
+    ]) ifFalse: [
+      self error: "SessionStore: a non-empty user-agent binding is required"
+    ]
+    Erlang crypto hash: #sha256 with: binding

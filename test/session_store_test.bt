@@ -1,0 +1,256 @@
+// Copyright 2026 oauth authors
+// SPDX-License-Identifier: Apache-2.0
+
+TestCase subclass: SessionStoreTest
+  field: session = nil
+  field: binding = nil
+
+  setUp =>
+    server := FakeServer issuer: "https://gitlab.com"
+    reg := (ClientRegistration forClient: "app" redirect: "http://127.0.0.1:50278/callback") unwrap
+    self.session := OAuthSession newSessionFor: server client: reg
+    self.binding := Secrets generate
+    self
+
+  /// A store whose clock reads the `clock` actor and whose TTL is 1000 ms.
+  storeWith: clock =>
+    SessionStore spawnWith: #{#ttl => 1000, #now => [clock time]}
+
+  /// A fresh session from the same setUp recipe, with another state.
+  otherSession =>
+    server := FakeServer issuer: "https://gitlab.com"
+    reg := (ClientRegistration forClient: "app" redirect: "http://127.0.0.1:50278/callback") unwrap
+    OAuthSession newSessionFor: server client: reg
+
+  /// `term` as `~p` prints it, flattened to a String.
+  render: term =>
+    Erlang unicode characters_to_binary: (Erlang io_lib format: "~p" with: #(term))
+
+  // === create:boundTo: ===
+  testCreateStoresSession =>
+    store := SessionStore spawn
+    self assert: (store create: self.session boundTo: self.binding) isNil
+    self assert: store size equals: 1
+
+  testCreateStampsCreatedAt =>
+    clock := FakeClock spawnWith: #{#time => 5000}
+    store := self storeWith: clock
+    store create: self.session boundTo: self.binding
+    got := (store consume: self.session state boundTo: self.binding) unwrap
+    self assert: got createdAt equals: 5000
+    self assert: got state equals: self.session state
+    self assert: got codeVerifier equals: self.session codeVerifier
+
+  testCreateWithSystemClockStampsNow =>
+    store := SessionStore spawn
+    before := Erlang erlang system_time: #millisecond
+    store create: self.session boundTo: self.binding
+    got := (store consume: self.session state boundTo: self.binding) unwrap
+    self assert: got createdAt >= before
+
+  testCreateWithNilBindingRaises =>
+    store := SessionStore spawn
+    @expect type
+    self should: [store create: self.session boundTo: nil] raise: #user_error
+    self assert: store size equals: 0
+
+  testCreateWithEmptyBindingRaises =>
+    store := SessionStore spawn
+    self should: [store create: self.session boundTo: ""] raise: #user_error
+    self assert: store size equals: 0
+
+  testCreateWithoutStateRaises =>
+    store := SessionStore spawn
+    self should: [
+      store create: (self.session withState: "") boundTo: self.binding
+    ] raise: #user_error
+
+  testCreateWithStateAsBindingRaises =>
+    store := SessionStore spawn
+    self should: [
+      store create: self.session boundTo: self.session state
+    ] raise: #user_error
+    self assert: store size equals: 0
+
+  testCreateDuplicateStateRaises =>
+    store := SessionStore spawn
+    store create: self.session boundTo: self.binding
+    self should: [
+      store create: self.session boundTo: Secrets generate
+    ] raise: #user_error
+    // The original binding still holds.
+    self assert: (store consume: self.session state boundTo: self.binding) isOk
+
+  testNoCreateWithoutBinding =>
+    self deny: (SessionStore canUnderstand: #create:)
+    self deny: (SessionStore canUnderstand: #consume:)
+
+  testSpawnRejectsBadTtl =>
+    self should: [
+      SessionStore spawnWith: #{#ttl => 0}
+    ] raise: #instantiation_error
+    @expect type
+    self should: [
+      SessionStore spawnWith: #{#ttl => nil}
+    ] raise: #instantiation_error
+
+  testSpawnRejectsBadClock =>
+    @expect type
+    self should: [
+      SessionStore spawnWith: #{#now => 42}
+    ] raise: #instantiation_error
+
+  testDefaultTtlIsTenMinutes =>
+    self assert: SessionStore defaultTtl equals: 600000
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := SessionStore spawnWith: #{#now => [clock time]}
+    store create: self.session boundTo: self.binding
+    clock time: 599999
+    self assert: (store consume: self.session state boundTo: self.binding) isOk
+    late := self otherSession
+    store create: late boundTo: self.binding
+    clock time: 599999 + 600000
+    self assert: (store consume: late state boundTo: self.binding) error code equals: "expired_session"
+
+  // === consume:boundTo: ===
+  testConsumeAnswersSessionOnce =>
+    store := SessionStore spawn
+    store create: self.session boundTo: self.binding
+    first := store consume: self.session state boundTo: self.binding
+    self assert: first isOk
+    self assert: first unwrap nonce equals: self.session nonce
+    self assert: store size equals: 0
+    second := store consume: self.session state boundTo: self.binding
+    self assert: second isError
+    self assert: second error code equals: "reused_state"
+
+  testConsumeUnknownStateIsReused =>
+    store := SessionStore spawn
+    out := store consume: Secrets generate boundTo: self.binding
+    self assert: out error code equals: "reused_state"
+
+  testConsumeWithNilBindingRaises =>
+    store := SessionStore spawn
+    store create: self.session boundTo: self.binding
+    @expect type
+    self should: [
+      store consume: self.session state boundTo: nil
+    ] raise: #user_error
+    self should: [
+      store consume: self.session state boundTo: ""
+    ] raise: #user_error
+    // A raising consume does not burn the session.
+    self assert: (store consume: self.session state boundTo: self.binding) isOk
+
+  testConsumeMismatchFailsAndBurns =>
+    store := SessionStore spawn
+    store create: self.session boundTo: self.binding
+    probe := store consume: self.session state boundTo: Secrets generate
+    self assert: probe error code equals: "session_mismatch"
+    self assert: store size equals: 0
+    // The rightful owner cannot complete either: the probe burned it.
+    retry := store consume: self.session state boundTo: self.binding
+    self assert: retry error code equals: "reused_state"
+
+  testConsumeMismatchOfDifferentLength =>
+    store := SessionStore spawn
+    store create: self.session boundTo: self.binding
+    probe := store consume: self.session state boundTo: "x"
+    self assert: probe error code equals: "session_mismatch"
+
+  testConsumeExpiredMismatchReportsMismatch =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock
+    store create: self.session boundTo: self.binding
+    clock time: 1500
+    // The wrong binding never learns that the session expired.
+    out := store consume: self.session state boundTo: Secrets generate
+    self assert: out error code equals: "session_mismatch"
+
+  testConsumeExpiredSession =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock
+    store create: self.session boundTo: self.binding
+    clock time: 1000
+    out := store consume: self.session state boundTo: self.binding
+    self assert: out error code equals: "expired_session"
+    // Expiry burns the session too.
+    again := store consume: self.session state boundTo: self.binding
+    self assert: again error code equals: "reused_state"
+
+  testConsumeJustBeforeTtl =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock
+    store create: self.session boundTo: self.binding
+    clock time: 999
+    self assert: (store consume: self.session state boundTo: self.binding) isOk
+
+  testConsumeOnlyTakesItsOwnSession =>
+    store := SessionStore spawn
+    other := self otherSession
+    otherBinding := Secrets generate
+    store create: self.session boundTo: self.binding
+    store create: other boundTo: otherBinding
+    self assert: (store consume: self.session state boundTo: otherBinding) error code equals: "session_mismatch"
+    got := (store consume: other state boundTo: otherBinding) unwrap
+    self assert: got state equals: other state
+
+  // === sweep ===
+  testSweepDropsAbandonedSessions =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock
+    store create: self.session boundTo: self.binding
+    clock time: 900
+    late := self otherSession
+    store create: late boundTo: self.binding
+    self assert: store size equals: 2
+    clock time: 2000
+    fresh := self otherSession
+    store create: fresh boundTo: self.binding
+    // The first session is two TTLs old: swept. `late` is expired but
+    // within the grace, so it is kept and reported as expired.
+    self assert: store size equals: 2
+    out := store consume: self.session state boundTo: self.binding
+    self assert: out error code equals: "reused_state"
+    self assert: (store consume: late state boundTo: self.binding) error code equals: "expired_session"
+    self assert: (store consume: fresh state boundTo: self.binding) isOk
+
+  testSweepRunsOnConsume =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock
+    store create: self.session boundTo: self.binding
+    clock time: 5000
+    store consume: Secrets generate boundTo: self.binding
+    self assert: store size equals: 0
+
+  // === redaction ===
+  testStatusRedactsSessionsAndBindings =>
+    store := SessionStore spawn
+    s := self.session
+    store create: s boundTo: self.binding
+    status := Erlang sys get_status: store pid
+    text := self render: status
+    self assert: (text includesSubstring: "#Ref<")
+    self deny: (text includesSubstring: s state)
+    self deny: (text includesSubstring: s nonce)
+    self deny: (text includesSubstring: s codeVerifier)
+    self deny: (text includesSubstring: self.binding)
+
+  testStateRedactsSessionsAndBindings =>
+    store := SessionStore spawn
+    s := self.session
+    store create: s boundTo: self.binding
+    st := Erlang sys get_state: store pid
+    text := self render: st
+    self deny: (text includesSubstring: s state)
+    self deny: (text includesSubstring: s codeVerifier)
+    self deny: (text includesSubstring: self.binding)
+
+  testTableIsPrivate =>
+    store := SessionStore spawn
+    store create: self.session boundTo: self.binding
+    table := store fieldAt: #table
+    self assert: (Erlang ets info: table with: #protection) equals: #private
+    self assert: (Erlang ets info: table with: #size) equals: 1
+    // FFI wraps ets's badarg as a type_error.
+    self should: [Erlang ets tab2list: table] raise: #type_error
