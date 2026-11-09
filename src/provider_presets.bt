@@ -11,8 +11,8 @@
 /// - `#authorizeParams` — extra authorization-request parameters;
 /// - `#revocationEndpoint` — used when discovery does not name one;
 /// - `#tokenInfoEndpoint` — the provider's (non-standard) token-info URL;
-/// - `#revocationPath`, `#tokenInfoPath` — the same endpoints relative to
-///   the issuer, for a provider discovered at another issuer (self-hosted
+/// - `#revocationPath`, `#tokenInfoPath` — the same endpoints as paths
+///   (starting with `/`) under the issuer, for a provider discovered at another issuer (self-hosted
 ///   GitLab). The absolute endpoints above apply only at `#issuer`; see
 ///   `OAuthServer`;
 /// - `#tokenInfoAuth` — how token info takes the token: `#bearer` (an
@@ -20,7 +20,9 @@
 /// - `#tokenInfoFields` — where the normalized token-info fields
 ///   (`#subject`, `#scopes`, `#expiresIn`) live in the provider's answer;
 /// - `#documentOverrides` — members merged over the discovery document,
-///   for metadata the provider gets wrong.
+///   for metadata the provider gets wrong. They apply at any issuer, so
+///   they must not name endpoint URLs: a URL here would follow the preset
+///   to a self-hosted issuer.
 ///
 /// Pass a preset to `OAuthServer fromPreset:` or `fromDiscovery:preset:`.
 ///

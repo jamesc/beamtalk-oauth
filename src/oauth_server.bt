@@ -52,7 +52,9 @@ typed Value subclass: OAuthServer
   /// `#token_endpoint_auth_methods_supported`, ...
   field: metadata :: Dictionary = #{}
   /// The preset the server was discovered with (`#{}` for none). See
-  /// `ProviderPresets`.
+  /// `ProviderPresets`. Never read endpoints from it: use
+  /// `revocationEndpoint` / `tokenInfoEndpoint`, which apply the issuer
+  /// check, and treat nil as "not available".
   field: preset :: Dictionary = #{}
 
   /// Discover the provider at `issuer`, with no preset.
@@ -133,14 +135,16 @@ typed Value subclass: OAuthServer
 
   /// A preset endpoint for the discovered `issuer`: the preset's absolute
   /// URL (`key`) when `issuer` is the preset's own `#issuer`; else the
-  /// preset's relative path (`pathKey`) appended to `issuer`; else nil.
+  /// preset's path (`pathKey`, which must start with `/`) appended to
+  /// `issuer`; else nil.
   class endpoint: key :: Symbol path: pathKey :: Symbol issuer: issuer :: String preset: preset :: Dictionary -> String | Nil =>
     presetIssuer := preset at: #issuer ifAbsent: [nil]
     ((presetIssuer isKindOf: String) and: [
       (self trimSlash: presetIssuer) =:= (self trimSlash: issuer)
     ]) ifTrue: [^preset at: key ifAbsent: [nil]]
     path := preset at: pathKey ifAbsent: [nil]
-    path isNil ifTrue: [^nil]
+    // Only an absolute path: "oauth/x" or "@evil.test/x" would change the host.
+    ((path isKindOf: String) and: [path startsWith: "/"]) ifFalse: [^nil]
     "{self trimSlash: issuer}{path}"
 
   /// `url` without one trailing `/`.

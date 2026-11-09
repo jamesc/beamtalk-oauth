@@ -114,10 +114,32 @@ TestCase subclass: OAuthServerTest
         })
     self assert: server tokenInfoEndpoint equals: "https://example.test/tokeninfo"
 
-  testEndpointsCanBeOverriddenExplicitly =>
-    server := self assertOk: (self discover: ProviderPresets gitlab)
-    pinned := server withTokenInfoEndpoint: "https://gitlab.com/oauth/token/info"
-    self assert: pinned tokenInfoEndpoint equals: "https://gitlab.com/oauth/token/info"
+  testLookalikePresetIssuerDoesNotMatch =>
+    server := self
+      assertOk: (self
+        discover: #{
+          #issuer => "{self provider issuer}/sub",
+          #tokenInfoEndpoint => "https://example.test/tokeninfo"
+        })
+    self assert: server tokenInfoEndpoint equals: nil
+
+  testMatchingIssuerPrefersAbsoluteEndpoint =>
+    server := self
+      assertOk: (self
+        discover: #{
+          #issuer => self provider issuer,
+          #tokenInfoEndpoint => "https://example.test/tokeninfo",
+          #tokenInfoPath => "/oauth/token/info"
+        })
+    self assert: server tokenInfoEndpoint equals: "https://example.test/tokeninfo"
+
+  testPathWithoutLeadingSlashIsIgnored =>
+    server := self
+      assertOk: (self discover: #{
+        #issuer => "https://example.test",
+        #tokenInfoPath => "@evil.test/info"
+      })
+    self assert: server tokenInfoEndpoint equals: nil
 
   testNonHttpsIssuerIsInsecure =>
     // No allowUnsafeHttp: refused before any request is made.
