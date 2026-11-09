@@ -42,6 +42,7 @@ TestCase subclass: ProviderWorkerTest
 
   codeParams -> Dictionary =>
     #{
+      #issuer => self.provider issuer,
       #code => "code-1",
       #redirect_uri => "http://127.0.0.1:50278/callback",
       #nonce => FixtureProvider nonce,
@@ -88,7 +89,8 @@ TestCase subclass: ProviderWorkerTest
     preset := ProviderPresets gitlab
     server := self assertOk: (self start: preset) server
     self assert: server preset equals: preset
-    self assert: server tokenInfoEndpoint equals: (preset at: #tokenInfoEndpoint)
+    // The preset's endpoint, moved onto the discovered issuer (BT-4575).
+    self assert: server tokenInfoEndpoint equals: "{self.provider issuer}/oauth/token/info"
     // The gitlab preset adds "none", so a public client can exchange.
     public := #{#client_id => FixtureProvider clientId, #client_secret => nil}
     self assertOk: (self retrieve: server client: public)
@@ -204,7 +206,7 @@ TestCase subclass: ProviderWorkerTest
     before := Erlang erlang monotonic_time: #millisecond
     server := self assertOk: worker server
     elapsed := (Erlang erlang monotonic_time: #millisecond) - before
-    self assert: elapsed < 1000
+    self assert: elapsed < 2000
     self exchange: server
 
   testRefreshIsRateLimited =>

@@ -39,6 +39,7 @@ TestCase subclass: NativeLayerTest
 
   codeParams -> Dictionary =>
     #{
+      #issuer => self.provider issuer,
       #code => "code-1",
       #redirect_uri => "http://127.0.0.1:50278/callback",
       #nonce => FixtureProvider nonce,

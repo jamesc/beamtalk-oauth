@@ -46,6 +46,7 @@ TestCase subclass: OAuthServerTest
   testPresetSuppliesMissingRevocationAndTokenInfo =>
     self provider discoveryOverrides: #{"revocation_endpoint" => nil}
     preset := #{
+      #issuer => self provider issuer,
       #revocationEndpoint => "https://example.test/revoke",
       #tokenInfoEndpoint => "https://example.test/tokeninfo"
     }
@@ -67,7 +68,78 @@ TestCase subclass: OAuthServerTest
     overridden := self assertOk: (self discover: ProviderPresets gitlab)
     methods2 := overridden metadata at: #token_endpoint_auth_methods_supported
     self assert: (methods2 includes: "none")
-    self assert: overridden tokenInfoEndpoint equals: "https://gitlab.com/oauth/token/info"
+    // The fixture is not gitlab.com: endpoints follow the discovered issuer.
+    issuer := self provider issuer
+    self assert: overridden tokenInfoEndpoint equals: "{issuer}/oauth/token/info"
+    self assert: overridden revocationEndpoint equals: "{issuer}/revoke"
+
+  testMismatchedIssuerIgnoresPresetEndpoints =>
+    self provider discoveryOverrides: #{"revocation_endpoint" => nil}
+    server := self
+      assertOk: (self
+        discover: #{
+          #issuer => "https://example.test",
+          #revocationEndpoint => "https://example.test/revoke",
+          #tokenInfoEndpoint => "https://example.test/tokeninfo"
+        })
+    self assert: server revocationEndpoint equals: nil
+    self assert: server tokenInfoEndpoint equals: nil
+
+  testPresetWithoutIssuerSuppliesNoEndpoints =>
+    self provider discoveryOverrides: #{"revocation_endpoint" => nil}
+    server := self
+      assertOk: (self
+        discover: #{
+          #revocationEndpoint => "https://example.test/revoke",
+          #tokenInfoEndpoint => "https://example.test/tokeninfo"
+        })
+    self assert: server revocationEndpoint equals: nil
+    self assert: server tokenInfoEndpoint equals: nil
+
+  testMismatchedGitlabIssuerDerivesEndpoints =>
+    self provider discoveryOverrides: #{"revocation_endpoint" => nil}
+    server := self assertOk: (self discover: ProviderPresets gitlab)
+    issuer := self provider issuer
+    self assert: server revocationEndpoint equals: "{issuer}/oauth/revoke"
+    self assert: server tokenInfoEndpoint equals: "{issuer}/oauth/token/info"
+    self deny: (server revocationEndpoint includesSubstring: "gitlab.com")
+    self deny: (server tokenInfoEndpoint includesSubstring: "gitlab.com")
+
+  testPresetIssuerMatchIgnoresTrailingSlash =>
+    server := self
+      assertOk: (self
+        discover: #{
+          #issuer => "{self provider issuer}/",
+          #tokenInfoEndpoint => "https://example.test/tokeninfo"
+        })
+    self assert: server tokenInfoEndpoint equals: "https://example.test/tokeninfo"
+
+  testLookalikePresetIssuerDoesNotMatch =>
+    server := self
+      assertOk: (self
+        discover: #{
+          #issuer => "{self provider issuer}/sub",
+          #tokenInfoEndpoint => "https://example.test/tokeninfo"
+        })
+    self assert: server tokenInfoEndpoint equals: nil
+
+  testMatchingIssuerPrefersAbsoluteEndpoint =>
+    server := self
+      assertOk: (self
+        discover: #{
+          #issuer => self provider issuer,
+          #tokenInfoEndpoint => "https://example.test/tokeninfo",
+          #tokenInfoPath => "/oauth/token/info"
+        })
+    self assert: server tokenInfoEndpoint equals: "https://example.test/tokeninfo"
+
+  testPathWithoutLeadingSlashIsIgnored =>
+    server := self
+      assertOk: (self discover: #{
+        #issuer => "https://example.test",
+        #tokenInfoPath => "@evil.test/info"
+      })
+    self assert: server tokenInfoEndpoint equals: nil
 
   testNonHttpsIssuerIsInsecure =>
     // No allowUnsafeHttp: refused before any request is made.
