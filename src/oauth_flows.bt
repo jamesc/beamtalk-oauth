@@ -411,8 +411,10 @@ Object subclass: OAuthFlows
   ///
   /// Call it after `rx expectState:` and after storing the session with
   /// `rx binding`, as in the class comment. It blocks the calling process,
-  /// like `awaitCallback:`, for up to `timeoutMs` (`0..LoopbackReceiver
-  /// maxTimeout`) overall, however many times it re-arms.
+  /// like `awaitCallback:`. `timeoutMs` (`0..LoopbackReceiver
+  /// maxTimeout`) bounds the waiting for callbacks overall, however many
+  /// times it re-arms; a token request already under way is bounded by
+  /// the HTTP client's own timeout, and may finish after it.
   ///
   /// When the exchange answers the provider's `invalid_grant`, the code
   /// was not one the provider issued for this flow, typically a forged
@@ -426,15 +428,26 @@ Object subclass: OAuthFlows
   /// callback, any `handleCallback:store:boundTo:` failure, any other
   /// exchange error, and a receiver timeout end the login at once with
   /// their own error. When the cap or the overall timeout is reached
-  /// after an `invalid_grant`, that `invalid_grant` is answered; a wait
-  /// that runs out of time answers `callback_timeout`. A session that
-  /// cannot be put back (`expired_session`, `session_store_full`) or a
-  /// receiver that cannot be re-armed answers that error.
+  /// after an `invalid_grant`, the last `invalid_grant` is answered, also
+  /// when the wait after a re-arm runs out of time: that says more than
+  /// `callback_timeout`, which only a wait with no re-arm before it
+  /// answers. A session that cannot be put back (`expired_session`,
+  /// `session_store_full`) or a receiver that cannot be re-armed answers
+  /// that error.
   ///
-  /// The residual limit: a local process that reads `state` can still
-  /// delay the login until the cap or the timeout, or end it with a
-  /// forged `error=` callback, and a real redirect that lands before the
-  /// re-arm answers 404 and is lost. It cannot hijack the login: PKCE and
+  /// The helper cannot tell a forged code from a real one the provider
+  /// refuses, for instance a redirect URI the provider rejects at the
+  /// token endpoint with `invalid_grant`. Such a login waits out the
+  /// timeout for a redirect that never comes, then answers that
+  /// `invalid_grant`.
+  ///
+  /// The residual limit: this defeats a forged callback that carries a
+  /// junk code, nothing more. A local process that reads `state` can
+  /// still delay the login until the cap or the timeout (a tight loop of
+  /// junk callbacks spends every re-arm in moments), or end it with a
+  /// forged callback that fails before the exchange: an `error=`, a
+  /// wrong `iss`, or no `code`. A real redirect that lands while a junk
+  /// callback holds the slot answers 404 and is lost. It cannot hijack the login: PKCE and
   /// the session binding stop a forged code. `maxRearms` (`>= 0`; 0 never
   /// re-arms) outside that range answers `config`.
   class completeLoopbackLogin: rx :: LoopbackReceiver server: server :: OAuthServer client: reg :: ClientRegistration store: store :: SessionStore timeout: timeoutMs :: Integer maxRearms: maxRearms :: Integer -> Result(TokenSet, OAuthError) =>
@@ -462,12 +475,21 @@ Object subclass: OAuthFlows
       ]
     deadline := self monotonicMs + timeoutMs
     rearms := 0
+    // The `invalid_grant` behind the last re-arm, answered if the wait
+    // after it times out.
+    refused := nil
     [true]
       whileTrue: [
         remaining := deadline - self monotonicMs
         remaining < 0 ifTrue: [remaining := 0]
         query := rx awaitCallback: remaining keepListening: true
-        query isError ifTrue: [^Result error: query error]
+        query isError
+          ifTrue: [
+            (refused notNil and: [
+              query error code =:= "callback_timeout"
+            ]) ifTrue: [^Result error: refused]
+            ^Result error: query error
+          ]
         cb := self
           handleCallback: query value
           store: store
@@ -480,10 +502,13 @@ Object subclass: OAuthFlows
           store: store
         (toks isOk or: [toks error code =/= "invalid_grant"]) ifTrue: [^toks]
         (rearms < maxRearms and: [self monotonicMs < deadline]) ifFalse: [^toks]
-        restored := store restore: cb value session boundTo: rx binding
-        restored isError ifTrue: [^Result error: restored error]
+        // Re-arm first: a receiver that cannot be re-armed must not leave
+        // a live session behind.
         rearmed := rx rearm
         rearmed isError ifTrue: [^Result error: rearmed error]
+        restored := store restore: cb value session boundTo: rx binding
+        restored isError ifTrue: [^Result error: restored error]
+        refused := toks error
         rearms := rearms + 1
       ]
     // Not reached: every way out of the loop returns.

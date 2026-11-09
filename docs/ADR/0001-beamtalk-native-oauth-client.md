@@ -445,11 +445,16 @@ last error is answered. The waiter stays the receiver's owner between
 the callback and the re-arm, so the BT-4570 guarantee holds: if it
 exits, the listener stops.
 
-Residual limit: a local attacker can still delay the login until the
-cap or the timeout, or end it with a forged `error=` callback (which
-looks the same as the provider's and is never retried), and a real
-redirect that lands while a junk callback holds the slot answers 404
-and is lost. None of these hijack the login.
+Residual limit: this defeats a forged callback that carries a junk
+code, nothing more. A local attacker can still delay the login until
+the cap or the timeout (a tight loop of junk callbacks spends every
+re-arm in moments), or end it with a forged callback that fails before
+the exchange: an `error=` (which looks the same as the provider's), a
+wrong `iss`, or no `code`. A real redirect that lands while a junk
+callback holds the slot answers 404 and is lost. And a real code the
+provider refuses with `invalid_grant` (a redirect URI it rejects, say)
+now waits out the timeout before answering. None of these hijack the
+login; whether to re-arm on more of them is BT-4613.
 
 Considered and not chosen: keeping the URL out of argv (handing it to
 the browser another way). It is platform-specific, and the URL still

@@ -227,7 +227,16 @@ typed Actor subclass: SessionStore
   /// For `OAuthFlows completeLoopbackLogin:...`, which re-arms a native
   /// login after a forged callback burned its session (BT-4572). Pass
   /// the binding the session was created with: the store keeps only its
-  /// digest, so it cannot check that.
+  /// digest, so it cannot check that. That grants a caller nothing that
+  /// `create:boundTo:` does not: either one stores any session with an
+  /// unused state under any binding, and a restored session never
+  /// expires later than a newly created one would.
+  ///
+  /// The original stamp is rebuilt from `createdAt` (Unix ms) and the
+  /// current time offset, which is exact under the BEAM's default
+  /// `no_time_warp` mode. Under `multi_time_warp`, a wall-clock step back
+  /// between consume and restore moves the expiry later by that step, at
+  /// most to a full TTL from now.
   ///
   /// Answers the session, or, storing nothing:
   ///

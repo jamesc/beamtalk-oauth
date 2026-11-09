@@ -394,9 +394,48 @@ TestCase subclass: E2eNativeLoginTest
       client: reg
       timeout: 500
     elapsed := (Erlang erlang monotonic_time: #millisecond) - started
-    self assert: got error code equals: "callback_timeout"
+    // The refused code says more than a timeout.
+    self assert: got error code equals: "invalid_grant"
     self assert: (self.provider hits: "/token") equals: 1
+    self assert: elapsed >= 500
     self assert: elapsed < 2000
+    self deny: self.rx isListening
+
+  testTimeoutWithoutACallbackAnswersCallbackTimeout =>
+    server := self discovered
+    {reg, _, _} := self authorizeOnly: server
+    got := self
+      complete: server
+      client: reg
+      timeout: 100
+    self assert: got error code equals: "callback_timeout"
+    self deny: self.rx isListening
+
+  testForgedIssuerIsNotRetried =>
+    // The documented limit: a forged callback that fails before the
+    // exchange ends the login.
+    server := self discovered
+    {reg, sess, _} := self authorizeOnly: server
+    HTTPClient get: "{self junkFor: sess}&iss=https%3A%2F%2Fevil.example"
+    got := self
+      complete: server
+      client: reg
+      timeout: 5000
+    self assert: got error code equals: "issuer_mismatch"
+    self assert: (self.provider hits: "/token") equals: 0
+    self deny: self.rx isListening
+
+  testNegativeMaxRearmsAnswersConfig =>
+    server := self discovered
+    {reg, _, _} := self authorizeOnly: server
+    got := OAuthFlows
+      completeLoopbackLogin: self.rx
+      server: server
+      client: reg
+      store: self.store
+      timeout: 1000
+      maxRearms: -1
+    self assert: got error code equals: "config"
     self deny: self.rx isListening
 
   testBadArgumentsAnswerConfig =>
