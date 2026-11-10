@@ -637,7 +637,8 @@ http_client(Config) ->
 %% each load's outcome to `Observer' (this process). Only the oidcc
 %% worker's loads carry it: the `request_opts' kept in the state, which
 %% servers built here use, do not.
-observed(#{request_opts := #{http_adapter := {Adapter, Config}} = RequestOpts} = LoadOpts, Observer) ->
+observed(LoadOpts, Observer) ->
+    #{request_opts := #{http_adapter := {Adapter, Config}} = RequestOpts} = LoadOpts,
     LoadOpts#{
         request_opts := RequestOpts#{http_adapter := {Adapter, Config#{load_observer => Observer}}}
     }.

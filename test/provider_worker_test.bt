@@ -438,10 +438,11 @@ TestCase subclass: ProviderWorkerTest
     // The provider goes down: both loads fail.
     self.provider failNext: discovery times: 1000
     self.provider failNext: "/jwks" times: 1000
-    #(1, 2, 3, 4, 5, 6) do: [:i |
-      self assert: self.worker refresh equals: nil
-      Erlang timer sleep: 60
-    ]
+    #(1, 2, 3, 4, 5, 6)
+      do: [:i |
+        self assert: self.worker refresh equals: nil
+        Erlang timer sleep: 60
+      ]
     // The first refresh's two loads, then the two chains' retries, their
     // shared backoff doubling from 50 ms: the configuration at 50 and
     // 250 ms, the JWKS at 100 (and maybe 500) ms. A chain per refresh
