@@ -73,9 +73,10 @@
 /// forged callback. `state` is visible to local processes (the browser's
 /// argv, its history), so one can send a callback with the real state
 /// before the provider's redirect. One that no provider would send (no
-/// `code` or `error`, or an `iss` naming another issuer) is filtered
-/// early: the helper sets `rx expectIssuer: server issuer`, and the
-/// receiver refuses it without taking its one-shot slot. A well-formed
+/// `code` or `error`, an `iss` naming another issuer, or no `iss` from a
+/// provider that advertises RFC 9207) is filtered early: the helper sets
+/// `rx expectIssuer:required:` from `server`, and the receiver refuses it
+/// without taking its one-shot slot. A well-formed
 /// `/callback?code=junk&state=...` gets through; the forged code is never
 /// accepted, but it takes the slot and burns the session. When the
 /// provider answers `invalid_grant`, the helper re-arms: it puts the same
@@ -207,7 +208,8 @@ Object subclass: OAuthFlows
   /// A well-formed callback that no provider would send is refused before
   /// the session is touched, so it costs the login nothing (BT-4613):
   ///
-  /// - one with neither a non-empty `code` nor an `error` answers `parse`;
+  /// - one with neither a non-empty `code` nor an `error` answers
+  ///   `parse`;
   /// - one whose `iss` (RFC 9207) differs from the issuer of the session
   ///   it names answers `issuer_mismatch`, a provider `error` callback
   ///   included. The session is looked up with `SessionStore
@@ -258,9 +260,10 @@ Object subclass: OAuthFlows
     state := parsed at: "state" ifAbsent: [""]
     // A callback no provider would send leaves the session alone, so a
     // local process that reads `state` cannot end the login with one.
-    ((parsed at: "error" ifAbsent: [
-      nil
-    ]) isNil and: [
+    // An `error` that is present but malformed (empty included) is
+    // answered below, after the session is consumed, as before.
+    // `LoopbackGate` is stricter and refuses an empty one.
+    ((parsed includesKey: "error") not and: [
       (parsed at: "code" ifAbsent: [""]) isEmpty
     ]) ifTrue: [^Result error: (OAuthError parse: "callback has no code")]
     (self
@@ -463,12 +466,16 @@ Object subclass: OAuthFlows
   /// before this answers, either way.
   ///
   /// Call it after `rx expectState:` and after storing the session with
-  /// `rx binding`, as in the class comment. It sets `rx expectIssuer:
-  /// server issuer` first, so a callback whose `iss` names another
-  /// issuer, or one with neither `code` nor `error`, is refused by the
-  /// receiver and never reaches the exchange or the re-arm count. A
-  /// receiver already expecting another issuer answers `config`. It blocks the calling process,
-  /// like `awaitCallback:`. `timeoutMs` (`0..LoopbackReceiver
+  /// `rx binding`, as in the class comment. It sets `rx
+  /// expectIssuer:required:` first, with `server issuer` and, as
+  /// `required`, whether `server metadata` advertises
+  /// `authorization_response_iss_parameter_supported`. So a callback whose
+  /// `iss` names another issuer (or lacks `iss`, from such a provider), or
+  /// one with neither `code` nor `error`, is refused by the receiver and
+  /// never reaches the exchange or the re-arm count. A
+  /// receiver already expecting another issuer answers `config`.
+  ///
+  /// It blocks the calling process, like `awaitCallback:`. `timeoutMs` (`0..LoopbackReceiver
   /// maxTimeout`) bounds the waiting for callbacks overall, however many
   /// times it re-arms; a token request already under way is bounded by
   /// the HTTP client's own timeout, and may finish after it.
@@ -503,8 +510,10 @@ Object subclass: OAuthFlows
   /// well-formed junk codes spends every re-arm in moments), or end it
   /// with a forged `error=` callback, which looks the same as the
   /// provider's and is never retried (a user who clicks Deny must fail
-  /// fast). A real redirect that lands while a junk callback holds the
-  /// slot answers 404 and is lost. It cannot hijack the login: PKCE and
+  /// fast), or with a junk code the token endpoint refuses with an error
+  /// other than `invalid_grant` (one too large for it, say). A real
+  /// redirect that lands while a junk callback holds the slot answers 404
+  /// and is lost. It cannot hijack the login: PKCE and
   /// the session binding stop a forged code. `maxRearms` (`>= 0`; 0 never
   /// re-arms) outside that range answers `config`.
   class completeLoopbackLogin: rx :: LoopbackReceiver server: server :: OAuthServer client: reg :: ClientRegistration store: store :: SessionStore timeout: timeoutMs :: Integer maxRearms: maxRearms :: Integer -> Result(TokenSet, OAuthError) =>
@@ -533,7 +542,15 @@ Object subclass: OAuthFlows
     deadline := self monotonicMs + timeoutMs
     // Filter early: a callback naming another issuer never takes the
     // slot. A stopped receiver is reported by the wait below.
-    expected := Result tryDo: [rx expectIssuer: server issuer]
+    // A provider that advertises RFC 9207 always sends `iss`, and the
+    // exchange would refuse a callback without it after the session is
+    // consumed: the receiver refuses that one too.
+    issRequired := (server metadata at: #authorization_response_iss_parameter_supported ifAbsent: [
+      false
+    ]) =:= true
+    expected := Result tryDo: [
+      rx expectIssuer: server issuer required: issRequired
+    ]
     (expected isError and: [rx isListening])
       ifTrue: [
         ^Result error: (OAuthError config: "completeLoopbackLogin: {expected error message}")

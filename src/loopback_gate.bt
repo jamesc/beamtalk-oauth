@@ -25,9 +25,14 @@
 ///   recorded the same way;
 /// - it carries a non-empty `code` or `error`: a provider never sends a
 ///   callback with neither (BT-4613);
+///   A `code` must be RFC 6749 VSCHARs (printable ASCII) and an `error`
+///   must match `OAuthFlows errorCodePattern`;
 /// - its `iss`, when present and an issuer is expected (`expectIssuer:`),
-///   is that issuer. A missing `iss` is accepted, as RFC 9207 allows, and
-///   `OAuthFlows handleCallback:store:boundTo:` keeps its own check;
+///   is that issuer. A missing `iss` is accepted, as RFC 9207 allows,
+///   unless the issuer was set with `required: true` (the provider
+///   advertises `authorization_response_iss_parameter_supported`, so it
+///   always sends `iss`). `OAuthFlows handleCallback:store:boundTo:` and
+///   the code exchange keep their own checks;
 /// - none of `code`, `state`, `error`, `error_description`, `error_uri`
 ///   or `iss` appears more than once in the raw query (RFC 6749 §3.1).
 ///   `queryParams` keeps only the last value, so a duplicate could
@@ -86,6 +91,9 @@ typed Server subclass: LoopbackGate
   /// The issuer a callback `iss` must name, when it has one; nil until
   /// `expectIssuer:`, and any `iss` is accepted before then.
   state: issuer :: String | Nil = nil
+  /// Whether a callback must carry `iss` (set by
+  /// `expectIssuer:required:`); never cleared once set.
+  state: issuerRequired :: Boolean = false
   /// How many `GET /callback` requests for this listener were refused for
   /// a missing, wrong or repeated parameter, or a callback no provider
   /// would send (no `code` or `error`, a wrong `iss`): reported on a timeout, so a
@@ -190,16 +198,24 @@ typed Server subclass: LoopbackGate
     self.stateDigest := Erlang crypto hash: #sha256 with: expected
     nil
 
+  /// As `expectIssuer:required:` with `required` false: a callback
+  /// without `iss` is still accepted.
+  expectIssuer: expected :: String -> Nil =>
+    self expectIssuer: expected required: false
+
   /// Accept only callbacks whose `iss`, when present, is `expected`
-  /// (RFC 9207); a callback without `iss` is still accepted. Raises, and
-  /// changes nothing, when `expected` is nil, empty or not a String, or
-  /// another issuer is already expected; expecting the same issuer again
-  /// is a no-op.
+  /// (RFC 9207); when `required` is true, also refuse a callback without
+  /// `iss`, as a provider that advertises
+  /// `authorization_response_iss_parameter_supported` never sends one.
+  /// Raises, and changes nothing, when `expected` is nil, empty or not a
+  /// String, or another issuer is already expected; expecting the same
+  /// issuer again is fine, and can make `iss` required but never optional
+  /// again.
   ///
   /// A callback recorded before this call and not yet handed to a waiter
-  /// is checked again: one that names another issuer is dropped and
+  /// is checked again: one that fails the new check is dropped and
   /// counted as refused, so the slot is free for the real redirect.
-  expectIssuer: expected :: String -> Nil =>
+  expectIssuer: expected :: String required: required :: Boolean -> Nil =>
     ((expected isKindOf: String) and: [
       expected isEmpty not
     ]) ifFalse: [
@@ -210,6 +226,7 @@ typed Server subclass: LoopbackGate
         self error: "LoopbackGate: another issuer is already expected; start a new LoopbackReceiver for another flow"
       ]
     self.issuer := expected
+    required =:= true ifTrue: [self.issuerRequired := true]
     (self.query notNil and: [
       self.delivered not and: [(self isPlausible: self.query) not]
     ])
@@ -237,8 +254,8 @@ typed Server subclass: LoopbackGate
     #ok
 
   /// How many callbacks were refused for a missing, wrong or repeated
-  /// parameter, or for carrying neither `code` nor `error` or a wrong
-  /// `iss`.
+  /// parameter, or for carrying neither `code` nor `error`, a malformed
+  /// one, or a wrong or (when required) missing `iss`.
   refusedCount -> Integer => self.refused
 
   /// Whether `candidate` is the expected state, in constant time. False
@@ -249,14 +266,23 @@ typed Server subclass: LoopbackGate
     Erlang crypto hash_equals: self.stateDigest with: (Erlang crypto hash: #sha256 with: candidate)
 
   /// Whether `params` has the shape of a provider's callback: a non-empty
-  /// `code` or `error`, and an `iss`, when present and an issuer is
-  /// expected, equal to it.
+  /// `code` of printable ASCII (RFC 6749 VSCHAR) or a non-empty `error`
+  /// matching `OAuthFlows errorCodePattern`; and an `iss`, when an issuer
+  /// is expected, equal to it, or absent unless it is required.
   internal isPlausible: params :: Dictionary -> Boolean =>
-    hasCode := self isFilled: (params at: "code" ifAbsent: [nil])
-    hasError := self isFilled: (params at: "error" ifAbsent: [nil])
+    code := params at: "code" ifAbsent: [nil]
+    error := params at: "error" ifAbsent: [nil]
+    hasCode := self isFilled: code
+    hasError := self isFilled: error
     (hasCode or: [hasError]) ifFalse: [^false]
+    (hasCode and: [(code matchesRegex: "^[ -~]+$") not]) ifTrue: [^false]
+    (hasError and: [
+      (error matchesRegex: OAuthFlows errorCodePattern) not
+    ]) ifTrue: [^false]
+    self.issuer isNil ifTrue: [^true]
     iss := params at: "iss" ifAbsent: [nil]
-    (iss isNil or: [self.issuer isNil]) or: [iss =:= self.issuer]
+    iss isNil ifTrue: [^self.issuerRequired not]
+    iss =:= self.issuer
 
   /// Whether `value` is a non-empty String.
   internal isFilled: value :: Object -> Boolean =>

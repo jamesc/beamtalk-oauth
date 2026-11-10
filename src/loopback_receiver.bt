@@ -47,7 +47,9 @@
 ///
 /// `expectIssuer:` (normally `server issuer`) adds an RFC 9207 check: a
 /// callback whose `iss` is present and names another issuer is refused
-/// like a wrong state. A callback without `iss` is still accepted, and
+/// like a wrong state. A callback without `iss` is still accepted, unless
+/// `expectIssuer:required:` made it required (for a provider that
+/// advertises `authorization_response_iss_parameter_supported`), and
 /// `OAuthFlows handleCallback:store:boundTo:` keeps its own `iss` check.
 /// `OAuthFlows completeLoopbackLogin:...` sets it; call it yourself, before
 /// opening the authorize URL, when composing the steps by hand. A
@@ -78,7 +80,8 @@
 /// the login, by spending the re-arms with a flood of well-formed junk
 /// codes or by waiting out the timeout, or end it, with a forged `error=`
 /// callback (never retried, since it looks the same as
-/// the provider's own). A real redirect that lands while a junk callback
+/// the provider's own) or a junk code the token endpoint refuses with an
+/// error other than `invalid_grant`. A real redirect that lands while a junk callback
 /// holds the slot, before the re-arm, answers 404 and is lost. None of
 /// these can hijack the login. Web pages and blind port scans cannot use
 /// up the slot at all.
@@ -228,7 +231,15 @@ typed Value subclass: LoopbackReceiver
   /// or empty, when another issuer is already expected (the same one again
   /// is fine), or when the receiver is stopped.
   expectIssuer: expected :: String -> LoopbackReceiver =>
-    self.gate expectIssuer: expected
+    self expectIssuer: expected required: false
+
+  /// As `expectIssuer:`, but when `required` is true a callback without
+  /// `iss` is refused too: pass true when the provider advertises
+  /// `authorization_response_iss_parameter_supported` (RFC 9207 §3), as
+  /// it then always sends `iss` and the code exchange refuses a callback
+  /// without one. Once required, `iss` stays required.
+  expectIssuer: expected :: String required: required :: Boolean -> LoopbackReceiver =>
+    self.gate expectIssuer: expected required: required
     self
 
   /// Wait up to `timeoutMs` for the callback and answer its raw query

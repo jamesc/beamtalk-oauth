@@ -393,7 +393,8 @@ Value subclass: LoopbackReceiver
   expectIssuer: issuer :: String -> LoopbackReceiver => ...
     // RFC 9207: once set (completeLoopbackLogin: sets server issuer), a
     // callback whose iss is present and differs is refused like a wrong
-    // state; a missing iss is still accepted (BT-4613).
+    // state; a missing iss is still accepted unless
+    // expectIssuer:required: true (BT-4613).
   awaitCallback: timeoutMs :: Integer -> Result(Dictionary, OAuthError) => ...
     // the raw query, for handleCallback:store:boundTo:. Waits in the
     // caller's process for a message from the handler, NOT a sync actor
@@ -460,9 +461,14 @@ slot or the session, so it costs the login nothing:
 - `LoopbackGate` refuses a state-matching `/callback` that carries
   neither `code` nor `error`, and, once `LoopbackReceiver expectIssuer:`
   is set, one whose `iss` is present and names another issuer (RFC 9207;
-  a missing `iss` is still accepted). Both are refused exactly like a
+  a missing `iss` is still accepted, unless `expectIssuer:required:`
+  made it required). A `code` outside RFC 6749 VSCHAR and an `error`
+  outside its charset are refused too. All are refused exactly like a
   state mismatch: 404, counted in `refused`, slot left free.
-  `completeLoopbackLogin:` sets the issuer from `server issuer`; a
+  `completeLoopbackLogin:` sets the issuer from `server issuer`, and
+  requires `iss` when the provider advertises
+  `authorization_response_iss_parameter_supported` (the exchange would
+  refuse a callback without it, after the session is consumed); a
   callback recorded before that, not yet handed out, is checked again.
 - `handleCallback:store:boundTo:` makes the same shape and `iss` checks
   before it consumes the session (the `iss` one against the session's
@@ -478,7 +484,8 @@ Residual limit: a local attacker that reads `state` can still delay
 the login until the cap or the timeout with a flood of well-formed
 junk codes (a tight loop spends every re-arm in moments), or end it
 with a forged `error=` callback (which looks the same as the
-provider's). A real redirect that lands while a junk callback holds
+provider's), or with a junk code the token endpoint refuses with an
+error other than `invalid_grant` (one too large for it, say). A real redirect that lands while a junk callback holds
 the slot answers 404 and is lost. And a real code the provider refuses
 with `invalid_grant` (a redirect URI it rejects, say) now waits out the
 timeout before answering. None of these hijack the login.

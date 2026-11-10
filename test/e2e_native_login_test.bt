@@ -472,6 +472,28 @@ TestCase subclass: E2eNativeLoginTest
     self assert: toks subject equals: "user-1"
     self assert: (self.provider hits: "/token") equals: 1
 
+  testForgedCodeWithoutIssFromAnRfc9207ProviderIsFiltered =>
+    // A provider that advertises RFC 9207 always sends iss, and the
+    // exchange would refuse a callback without one after the session is
+    // consumed: the receiver refuses it up front instead.
+    self.provider discoveryOverrides: #{
+      "authorization_response_iss_parameter_supported" => true
+    }
+    server := self discovered
+    {reg, sess, location} := self authorizeOnly: server
+    this := self
+    [
+      this deliver: (this junkFor: sess) tries: 1
+      this deliver: location tries: 200
+    ] fork
+    toks := (self
+      complete: server
+      client: reg
+      timeout: 10000
+      maxRearms: 0) unwrap
+    self assert: toks subject equals: "user-1"
+    self assert: (self.provider hits: "/token") equals: 1
+
   testCompleteWithAReceiverExpectingAnotherIssuerAnswersConfig =>
     server := self discovered
     {reg, _, _} := self authorizeOnly: server
@@ -482,6 +504,8 @@ TestCase subclass: E2eNativeLoginTest
       timeout: 1000
     self assert: got error code equals: "config"
     self deny: self.rx isListening
+    // Nothing was consumed: the session is still stored.
+    self assert: self.store size equals: 1
 
   testNegativeMaxRearmsAnswersConfig =>
     server := self discovered

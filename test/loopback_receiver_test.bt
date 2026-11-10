@@ -550,6 +550,33 @@ TestCase subclass: LoopbackReceiverTest
     self should: [self.rx expectIssuer: ""] raise: #user_error
     self assert: (self callback: "code=x&iss=https%3A%2F%2Fother.test") unwrap status equals: 404
 
+  testRequiredIssuerRefusesACallbackWithoutIss =>
+    self.rx expectIssuer: "https://idp.test" required: true
+    self assert: (self callback: "code=junk") unwrap status equals: 404
+    self assert: (self callback: "error=access_denied") unwrap status equals: 404
+    self assert: (self callback: "code=real&iss=https%3A%2F%2Fidp.test") unwrap status equals: 200
+    self assert: ((self.rx awaitCallback: 5000) unwrap at: "code") equals: "real"
+
+  testRequiredIssuerNeverBecomesOptionalAgain =>
+    self.rx expectIssuer: "https://idp.test" required: true
+    self.rx expectIssuer: "https://idp.test"
+    self assert: (self callback: "code=junk") unwrap status equals: 404
+
+  testRequiringTheIssuerDropsARecordedCallbackWithoutIss =>
+    self assert: (self callback: "code=junk") unwrap status equals: 200
+    self.rx expectIssuer: "https://idp.test" required: true
+    self assert: (self callback: "code=real&iss=https%3A%2F%2Fidp.test") unwrap status equals: 200
+    self assert: ((self.rx awaitCallback: 5000) unwrap at: "code") equals: "real"
+
+  testMalformedCodeOrErrorIsRefused =>
+    // RFC 6749: a code is printable ASCII, an error code excludes `"`
+    // and `\`; no provider sends anything else.
+    #("code=a%0Ab", "code=%C3%A9", "error=bad%22code", "error=a%5Cb") do: [:q |
+      self assert: (self callback: q) unwrap status equals: 404
+    ]
+    self callback: "code=real"
+    self assert: ((self.rx awaitCallback: 5000) unwrap at: "code") equals: "real"
+
   testRearmKeepsTheExpectedIssuer =>
     self.rx expectIssuer: "https://idp.test"
     self callback: "code=junk"
