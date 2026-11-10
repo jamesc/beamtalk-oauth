@@ -287,7 +287,8 @@ typed Server subclass: LoopbackGate
 
   /// Whether `value` is a non-empty String.
   internal isFilled: value :: Object -> Boolean =>
-    (value isKindOf: String) and: [value isEmpty not]
+    (value isKindOf: String) ifFalse: [^false]
+    value isEmpty not
 
   /// Whether one of `singleParams` appears more than once in the raw
   /// query `raw`. Names are split and decoded exactly as `QueryParser`

@@ -372,11 +372,12 @@ Object subclass: TokenRevocation
   class errorFor: resp :: HTTPResponse doing: what :: String secrets: secrets :: List(String) -> OAuthError =>
     status := resp status
     body := self jsonOf: resp
-    ((body isKindOf: Dictionary) and: [
-      (body at: "error" ifAbsent: [nil]) isKindOf: String
-    ])
+    (body isKindOf: Dictionary)
       ifTrue: [
-        ^OAuthError fromOidcc: {#http_error, status, OAuthError scrub: body secrets: secrets}
+        ((body at: "error" ifAbsent: [nil]) isKindOf: String)
+          ifTrue: [
+            ^OAuthError fromOidcc: {#http_error, status, OAuthError scrub: body secrets: secrets}
+          ]
       ]
     OAuthError
       new: #{
