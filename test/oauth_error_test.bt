@@ -163,6 +163,21 @@ TestCase subclass: OAuthErrorTest
     e := OAuthError fromOidcc: {#bad, self bin: "glpat-abcdefghij1234567890"}
     self deny: ((Json generate: e) includesSubstring: "glpat")
 
+  testScrubRemovesSecretsInStringValues =>
+    // A body from Json parse: holds Strings (as TokenRevocation's errors
+    // do), not raw binaries.
+    json := Json
+      generate: #{
+        "error" => "invalid_request",
+        "token" => "rt-1",
+        "error_description" => "bad token rt-1"
+      }
+    body := (Json parse: json) unwrap
+    self assert: ((body at: "token") isKindOf: String)
+    scrubbed := OAuthError scrub: body secrets: #("rt-1")
+    self deny: (scrubbed printString includesSubstring: "rt-1")
+    self assert: (scrubbed at: "error") equals: "invalid_request"
+
   testScrubRemovesSecretsInEveryShape =>
     secret := "my secret/x"
     body := #{

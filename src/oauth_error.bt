@@ -232,6 +232,7 @@ typed Value subclass: OAuthError
   /// ignored; with none, `term` is answered unchanged.
   class scrub: term :: Object secrets: secrets :: List(String) -> Dynamic =>
     (secrets anySatisfy: [:secret | secret isEmpty not]) ifFalse: [^term]
+    // A String is a Binary, so this covers Json parse: members too.
     (term isKindOf: Binary)
       ifTrue: [
         text := self textOf: term
