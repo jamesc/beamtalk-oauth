@@ -284,8 +284,19 @@ handle_call(_Request, _From, State) ->
 %% after this worker answered `undefined'. They are newer than the cache, so
 %% later callers get them without a fetch (until the next read of the oidcc
 %% worker, whose own retry loads them too).
-handle_cast({beamtalk_oauth_direct_jwks, Jwks}, #{cache := {Config, _Old}} = State) ->
-    {noreply, State#{cache := {Config, Jwks}, reply := undefined, kid_reload_failed := false}};
+%% Taken only when they name `Kid' and the cache does not, so a slow direct
+%% load never replaces newer keys a read brought in meanwhile.
+handle_cast({beamtalk_oauth_direct_jwks, Kid, Jwks}, #{cache := {Config, Cached}} = State) ->
+    case
+        beamtalk_oauth_oidcc:has_kid(Jwks, Kid) andalso
+            not beamtalk_oauth_oidcc:has_kid(Cached, Kid)
+    of
+        true ->
+            {noreply,
+                State#{cache := {Config, Jwks}, reply := undefined, kid_reload_failed := false}};
+        false ->
+            {noreply, State}
+    end;
 handle_cast(_Msg, State) ->
     {noreply, State}.
 

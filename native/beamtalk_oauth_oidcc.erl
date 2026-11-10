@@ -409,7 +409,7 @@ worker_jwks(Worker, Kid, Current, {JwksUri, Interval}, Load) ->
         undefined ->
             case Load() of
                 {ok, {Jwks, _Expiry}} ->
-                    gen_server:cast(Worker, {beamtalk_oauth_direct_jwks, Jwks}),
+                    gen_server:cast(Worker, {beamtalk_oauth_direct_jwks, Kid, Jwks}),
                     {ok, Jwks};
                 {error, Reason} ->
                     {error, Reason}
@@ -507,23 +507,36 @@ claim_reload(Table, JwksUri, Interval) ->
 %% A `discover/2' load: its keys are the newest for `JwksUri', and the next
 %% unknown kid may reload at once (as a fresh discovery would have).
 keep_discovered_jwks(JwksUri, Jwks, ExpiryMs) ->
-    Table = jwks_table(),
-    keep_jwks(Table, JwksUri, Jwks, ExpiryMs),
-    true = ets:delete(Table, {reloaded_at, JwksUri}),
-    ok.
+    with_jwks_table(fun(Table) ->
+        keep_jwks(Table, JwksUri, Jwks, ExpiryMs),
+        ets:delete(Table, {reloaded_at, JwksUri})
+    end).
 
 -doc """
 Drop the keys and reload time kept for the `jwks_uri` of `Config` (a
-provider configuration): a `ProviderWorker`'s first load is newer. The
-next unknown `kid` of a server whose worker has stopped then reloads at
-once.
+provider configuration). A `ProviderWorker` calls it on its first load,
+which is newer than anything kept. Like a new discovery, it lets the next
+unknown `kid` of any server without a live worker for that `jwks_uri`
+reload at once: a one-time reset per worker start, never an ongoing way
+around the interval.
 """.
 -spec forget_jwks(oidcc_provider_configuration:t()) -> ok.
 forget_jwks(#oidcc_provider_configuration{jwks_uri = JwksUri}) ->
-    Table = jwks_table(),
-    true = ets:delete(Table, {keys, JwksUri}),
-    true = ets:delete(Table, {reloaded_at, JwksUri}),
-    ok.
+    with_jwks_table(fun(Table) ->
+        ets:delete(Table, {keys, JwksUri}),
+        ets:delete(Table, {reloaded_at, JwksUri})
+    end).
+
+%% Run `Fun' on the JWKS table. The table only caches: should it vanish
+%% under the call (its owner killed by a code purge), the update is
+%% dropped rather than failing the caller.
+with_jwks_table(Fun) ->
+    try
+        _ = Fun(jwks_table()),
+        ok
+    catch
+        error:badarg -> ok
+    end.
 
 %% The node-wide JWKS table, created on first use. It is public (the keys
 %% are public) and owned by a process of its own, so it outlives callers.
