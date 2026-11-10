@@ -39,6 +39,12 @@
 /// it had been swept.) Apps should show the user one generic failure and
 /// log the specific code.
 ///
+/// `peek:boundTo:` runs the same checks without removing anything. It is
+/// for `OAuthFlows handleCallback:store:boundTo:`, which compares a
+/// callback `iss` with the session's issuer before it consumes the
+/// session, so a forged callback naming another issuer leaves the
+/// session usable (BT-4613).
+///
 /// ## Expiry and the sweep
 ///
 /// A session is expired once `ttl` has passed since `create:boundTo:`.
@@ -290,6 +296,28 @@ typed Actor subclass: SessionStore
     stamp := self clock
     self tickAt: stamp
     rows := Erlang ets take: self.table with: (self keyOf: state)
+    rows isEmpty ifTrue: [^Result error: OAuthError reusedState]
+    {_, created, sess, stored} := rows first
+    (self isStale: created at: stamp) ifTrue: [
+      ^Result error: OAuthError reusedState
+    ]
+    (Erlang crypto hash_equals: stored with: digest) ifFalse: [
+      ^Result error: OAuthError sessionMismatch
+    ]
+    stamp >= (created + self.ttl) ifTrue: [
+      ^Result error: OAuthError expiredSession
+    ]
+    Result ok: sess
+
+  /// The session stored under `state`, if `binding` matches, left in the
+  /// store. Answers the same errors as `consume:boundTo:`, in the same
+  /// order (`reused_state`, `session_mismatch`, `expired_session`), but
+  /// never removes or sweeps anything. Raises when `binding` is nil or
+  /// empty.
+  peek: state :: String boundTo: binding :: String -> Result(OAuthSession, OAuthError) =>
+    digest := self digestOf: binding
+    stamp := self clock
+    rows := Erlang ets lookup: self.table with: (self keyOf: state)
     rows isEmpty ifTrue: [^Result error: OAuthError reusedState]
     {_, created, sess, stored} := rows first
     (self isStale: created at: stamp) ifTrue: [

@@ -83,10 +83,13 @@ Things to know:
   local process that reads `state` (from the browser's argv or history)
   can send a junk code first. The provider answers `invalid_grant`, and
   the helper puts the session back and listens again on the same port,
-  up to 3 times within the timeout. Such a process can still delay the
-  login, or end it with a callback that fails before the exchange (an
-  `error=`, a wrong `iss`), but cannot hijack it.
-- `handleCallback:` consumes the session, so a callback works once.
+  up to 3 times within the timeout. A callback no provider would send
+  (a wrong `iss`, no `code`) is refused without using a re-arm. Such a
+  process can still delay the login with a flood of junk codes, or end
+  it with a forged `error=`, but cannot hijack it.
+- `handleCallback:` consumes the session, so a callback works once. A
+  callback with no `code` or `error`, or a wrong `iss`, is refused
+  before that and leaves the session usable.
   `exchangeCode:` then spends the single-use ticket in the `Callback`.
 - `refresh:` answers a merged `TokenSet`: the old refresh token and ID
   token carry forward when the response omits them. Store the answer.

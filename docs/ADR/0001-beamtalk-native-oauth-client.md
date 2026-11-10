@@ -249,7 +249,9 @@ Object subclass: OAuthFlows
   class handleCallback: query :: Dictionary store: store boundTo: binding :: String -> Result(Callback, OAuthError) => ...
     // parses code/state/error/error_description/iss, rejects missing or
     // duplicate params, consumes the session with the user-agent binding
-    // (see "Login CSRF" below)
+    // (see "Login CSRF" below). A callback with no code and no error, or
+    // whose iss differs from the session's issuer, is refused before the
+    // session is consumed (BT-4613)
   class exchangeCode: server client: reg callback: cb store: store -> Result(TokenSet, OAuthError) => ...
     // oidcc_token:retrieve; asserts the session's issuer and redirect URI
     // match server and reg; nonce and ID token checked by oidcc
@@ -386,6 +388,13 @@ Value subclass: LoopbackReceiver
     // (browser argv, history), so one that reads it can still take the
     // slot with a junk code; it cannot get that code accepted, and the
     // flow re-arms (BT-4572, "Forged loopback callbacks: re-arm").
+    // A matching-state callback with neither code nor error is refused
+    // the same way (BT-4613).
+  expectIssuer: issuer :: String -> LoopbackReceiver => ...
+    // RFC 9207: once set (completeLoopbackLogin: sets server issuer), a
+    // callback whose iss is present and differs is refused like a wrong
+    // state; a missing iss is still accepted unless
+    // expectIssuer:required: true (BT-4613).
   awaitCallback: timeoutMs :: Integer -> Result(Dictionary, OAuthError) => ...
     // the raw query, for handleCallback:store:boundTo:. Waits in the
     // caller's process for a message from the handler, NOT a sync actor
@@ -398,7 +407,7 @@ Value subclass: LoopbackReceiver
   rearm -> Result(LoopbackReceiver, OAuthError) => ...
     // keepListening: true leaves the listener up after a callback, still
     // owned by the waiter (its exit stops the listener, BT-4570); rearm
-    // clears the slot, keeping port and expected state (BT-4572)
+    // clears the slot, keeping port, expected state and issuer (BT-4572)
   stop -> Symbol => ...             // idempotent; #ok, like Actor>>stop
 ```
 
@@ -445,16 +454,41 @@ last error is answered. The waiter stays the receiver's owner between
 the callback and the re-arm, so the BT-4570 guarantee holds: if it
 exits, the listener stops.
 
-Residual limit: this defeats a forged callback that carries a junk
-code, nothing more. A local attacker can still delay the login until
-the cap or the timeout (a tight loop of junk callbacks spends every
-re-arm in moments), or end it with a forged callback that fails before
-the exchange: an `error=` (which looks the same as the provider's), a
-wrong `iss`, or no `code`. A real redirect that lands while a junk
-callback holds the slot answers 404 and is lost. And a real code the
-provider refuses with `invalid_grant` (a redirect URI it rejects, say)
-now waits out the timeout before answering. None of these hijack the
-login; whether to re-arm on more of them is BT-4613.
+Decision (BT-4613, 2026-11-10): **filter early**. A callback that a
+real provider would never send is dropped before it takes the receiver
+slot or the session, so it costs the login nothing:
+
+- `LoopbackGate` refuses a state-matching `/callback` that carries
+  neither `code` nor `error`, and, once `LoopbackReceiver expectIssuer:`
+  is set, one whose `iss` is present and names another issuer (RFC 9207;
+  a missing `iss` is still accepted, unless `expectIssuer:required:`
+  made it required). A `code` outside RFC 6749 VSCHAR and an `error`
+  outside its charset are refused too. All are refused exactly like a
+  state mismatch: 404, counted in `refused`, slot left free.
+  `completeLoopbackLogin:` sets the issuer from `server issuer`, and
+  requires `iss` when the provider advertises
+  `authorization_response_iss_parameter_supported` (the exchange would
+  refuse a callback without it, after the session is consumed); a
+  callback recorded before that, not yet handed out, is checked again.
+- `handleCallback:store:boundTo:` makes the same shape and `iss` checks
+  before it consumes the session (the `iss` one against the session's
+  issuer, looked up with the non-consuming `SessionStore
+  peek:boundTo:`), answering `parse` or `issuer_mismatch` as before but
+  leaving the session usable.
+
+So only refused code exchanges (`invalid_grant`) count toward the
+re-arm cap. Not adopted: re-arming on `error=` (a user who clicks Deny
+must fail fast), and queuing candidate callbacks in `LoopbackGate`.
+
+Residual limit: a local attacker that reads `state` can still delay
+the login until the cap or the timeout with a flood of well-formed
+junk codes (a tight loop spends every re-arm in moments), or end it
+with a forged `error=` callback (which looks the same as the
+provider's), or with a junk code the token endpoint refuses with an
+error other than `invalid_grant` (one too large for it, say). A real redirect that lands while a junk callback holds
+the slot answers 404 and is lost. And a real code the provider refuses
+with `invalid_grant` (a redirect URI it rejects, say) now waits out the
+timeout before answering. None of these hijack the login.
 
 Considered and not chosen: keeping the URL out of argv (handing it to
 the browser another way). It is platform-specific, and the URL still

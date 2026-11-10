@@ -223,6 +223,32 @@ TestCase subclass: SessionStoreTest
     clock time: 999
     self assert: (store consume: self.session state boundTo: self.binding) isOk
 
+  // === peek:boundTo: ===
+  testPeekAnswersSessionAndKeepsIt =>
+    store := SessionStore spawn
+    store create: self.session boundTo: self.binding
+    got := (store peek: self.session state boundTo: self.binding) unwrap
+    self assert: got issuer equals: "https://gitlab.com"
+    self assert: store size equals: 1
+    self assert: (store consume: self.session state boundTo: self.binding) isOk
+
+  testPeekFailuresBurnNothing =>
+    clock := FakeClock spawnWith: #{#time => 0}
+    store := self storeWith: clock
+    store create: self.session boundTo: self.binding
+    self assert: (store peek: Secrets generate boundTo: self.binding) error code equals: "reused_state"
+    self assert: (store peek: self.session state boundTo: Secrets generate) error code equals: "session_mismatch"
+    self assert: store size equals: 1
+    clock time: 1000
+    self assert: (store peek: self.session state boundTo: self.binding) error code equals: "expired_session"
+    self assert: store size equals: 1
+
+  testPeekWithEmptyBindingRaises =>
+    store := SessionStore spawn
+    store create: self.session boundTo: self.binding
+    self should: [store peek: self.session state boundTo: ""] raise: #user_error
+    self assert: store size equals: 1
+
   testConsumeOnlyTakesItsOwnSession =>
     store := SessionStore spawn
     other := self otherSession

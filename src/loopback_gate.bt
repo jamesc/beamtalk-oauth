@@ -23,15 +23,29 @@
 ///   the slot and the real redirect would get a 404. A provider error
 ///   callback (`error=...&state=...`) carries the state too, so it is
 ///   recorded the same way;
+/// - it carries a non-empty `code` or `error`: a provider never sends a
+///   callback with neither (BT-4613);
+///   A `code` must be RFC 6749 VSCHARs (printable ASCII) and an `error`
+///   must match `OAuthFlows errorCodePattern`;
+/// - its `iss`, when present and an issuer is expected (`expectIssuer:`),
+///   is that issuer. A missing `iss` is accepted, as RFC 9207 allows,
+///   unless the issuer was set with `required: true` (the provider
+///   advertises `authorization_response_iss_parameter_supported`, so it
+///   always sends `iss`). `OAuthFlows handleCallback:store:boundTo:` and
+///   the code exchange keep their own checks;
 /// - none of `code`, `state`, `error`, `error_description`, `error_uri`
 ///   or `iss` appears more than once in the raw query (RFC 6749 §3.1).
 ///   `queryParams` keeps only the last value, so a duplicate could
 ///   otherwise smuggle a second value past the state check.
 ///
 /// A rejected callback answers 404 and leaves the slot open for the real
-/// one. A recorded callback holds the slot until `rearm` clears it, which
-/// `OAuthFlows completeLoopbackLogin:...` does when the provider refuses
-/// its code (BT-4572).
+/// one; every refusal takes the same path and counts in `refusedCount`,
+/// so a state mismatch cannot be told from the others from outside. A
+/// local process that reads `state` therefore cannot take the slot with a
+/// callback no provider would send (a wrong `iss`, no `code`), only with a
+/// well-formed junk code. A recorded callback holds the slot until
+/// `rearm` clears it, which `OAuthFlows completeLoopbackLogin:...` does
+/// when the provider refuses its code (BT-4572).
 ///
 /// The gate also holds at most one waiter, a `{Pid, Reference}` pair
 /// registered by `awaitFrom:tag:`. When both the query and the waiter are
@@ -74,8 +88,15 @@ typed Server subclass: LoopbackGate
   /// SHA-256 digest of the flow's expected `state`; nil until
   /// `expectState:`, and nothing is recorded before then.
   state: stateDigest :: Binary | Nil = nil
+  /// The issuer a callback `iss` must name, when it has one; nil until
+  /// `expectIssuer:`, and any `iss` is accepted before then.
+  state: issuer :: String | Nil = nil
+  /// Whether a callback must carry `iss` (set by
+  /// `expectIssuer:required:`); never cleared once set.
+  state: issuerRequired :: Boolean = false
   /// How many `GET /callback` requests for this listener were refused for
-  /// a missing, wrong or repeated parameter: reported on a timeout, so a
+  /// a missing, wrong or repeated parameter, or a callback no provider
+  /// would send (no `code` or `error`, a wrong `iss`): reported on a timeout, so a
   /// flow armed with the wrong state can be told from a user who never
   /// signed in.
   state: refused :: Integer = 0
@@ -127,8 +148,8 @@ typed Server subclass: LoopbackGate
     self.starter isNil ifFalse: [self watchOwner: self.starter asWaiter: false]
     nil
 
-  /// Record the first `GET /callback` that passes the host, state and
-  /// duplicate-parameter checks, and answer the static close-this-tab
+  /// Record the first `GET /callback` that passes the host, state,
+  /// shape, issuer and duplicate-parameter checks, and answer the static close-this-tab
   /// page; answer 404 to anything else, including a second callback.
   ///
   /// `raw` is the request's undecoded query string (nil when it has
@@ -144,9 +165,12 @@ typed Server subclass: LoopbackGate
     params := QueryParser parse: raw
     ok := params notNil
       and: [
-        (self hasDuplicateParams: raw) not and: [
-          self matchesState: (params at: "state" ifAbsent: [nil])
-        ]
+        (self hasDuplicateParams: raw) not
+          and: [
+            (self matchesState: (params at: "state" ifAbsent: [
+              nil
+            ])) and: [self isPlausible: params]
+          ]
       ]
     ok
       ifFalse: [
@@ -174,9 +198,47 @@ typed Server subclass: LoopbackGate
     self.stateDigest := Erlang crypto hash: #sha256 with: expected
     nil
 
+  /// As `expectIssuer:required:` with `required` false: a callback
+  /// without `iss` is still accepted.
+  expectIssuer: expected :: String -> Nil =>
+    self expectIssuer: expected required: false
+
+  /// Accept only callbacks whose `iss`, when present, is `expected`
+  /// (RFC 9207); when `required` is true, also refuse a callback without
+  /// `iss`, as a provider that advertises
+  /// `authorization_response_iss_parameter_supported` never sends one.
+  /// Raises, and changes nothing, when `expected` is nil, empty or not a
+  /// String, or another issuer is already expected; expecting the same
+  /// issuer again is fine, and can make `iss` required but never optional
+  /// again.
+  ///
+  /// A callback recorded before this call and not yet handed to a waiter
+  /// is checked again: one that fails the new check is dropped and
+  /// counted as refused, so the slot is free for the real redirect.
+  expectIssuer: expected :: String required: required :: Boolean -> Nil =>
+    ((expected isKindOf: String) and: [
+      expected isEmpty not
+    ]) ifFalse: [
+      self error: "LoopbackGate: the expected issuer must be a non-empty String"
+    ]
+    (self.issuer notNil and: [self.issuer =/= expected])
+      ifTrue: [
+        self error: "LoopbackGate: another issuer is already expected; start a new LoopbackReceiver for another flow"
+      ]
+    self.issuer := expected
+    required =:= true ifTrue: [self.issuerRequired := true]
+    (self.query notNil and: [
+      self.delivered not and: [(self isPlausible: self.query) not]
+    ])
+      ifTrue: [
+        self.query := nil
+        self.refused := self.refused + 1
+      ]
+    nil
+
   /// Forget the recorded callback, so the next one that passes the checks
   /// is recorded, and keep everything else: the listener and its port,
-  /// the expected state, the owner and the refused count. Answers `#ok`;
+  /// the expected state and issuer, the owner and the refused count. Answers `#ok`;
   /// `#closed` when the gate has shut down; `#noState` when no state is
   /// expected; `#busy` while a waiter is registered and has not yet
   /// been sent a callback (there is nothing to re-arm).
@@ -192,7 +254,8 @@ typed Server subclass: LoopbackGate
     #ok
 
   /// How many callbacks were refused for a missing, wrong or repeated
-  /// parameter.
+  /// parameter, or for carrying neither `code` nor `error`, a malformed
+  /// one, or a wrong or (when required) missing `iss`.
   refusedCount -> Integer => self.refused
 
   /// Whether `candidate` is the expected state, in constant time. False
@@ -201,6 +264,30 @@ typed Server subclass: LoopbackGate
     self.stateDigest isNil ifTrue: [^false]
     (candidate isKindOf: String) ifFalse: [^false]
     Erlang crypto hash_equals: self.stateDigest with: (Erlang crypto hash: #sha256 with: candidate)
+
+  /// Whether `params` has the shape of a provider's callback: a non-empty
+  /// `code` of printable ASCII (RFC 6749 VSCHAR) or a non-empty `error`
+  /// matching `OAuthFlows errorCodePattern`; and an `iss`, when an issuer
+  /// is expected, equal to it, or absent unless it is required.
+  internal isPlausible: params :: Dictionary -> Boolean =>
+    code := params at: "code" ifAbsent: [nil]
+    error := params at: "error" ifAbsent: [nil]
+    hasCode := self isFilled: code
+    hasError := self isFilled: error
+    (hasCode or: [hasError]) ifFalse: [^false]
+    // `\z`, not `$`, which also matches before a trailing newline.
+    (hasCode and: [(code matchesRegex: "^[ -~]+\\z") not]) ifTrue: [^false]
+    (hasError and: [
+      (error matchesRegex: OAuthFlows errorCodePattern) not
+    ]) ifTrue: [^false]
+    self.issuer isNil ifTrue: [^true]
+    iss := params at: "iss" ifAbsent: [nil]
+    iss isNil ifTrue: [^self.issuerRequired not]
+    iss =:= self.issuer
+
+  /// Whether `value` is a non-empty String.
+  internal isFilled: value :: Object -> Boolean =>
+    (value isKindOf: String) and: [value isEmpty not]
 
   /// Whether one of `singleParams` appears more than once in the raw
   /// query `raw`. Names are split and decoded exactly as `QueryParser`
