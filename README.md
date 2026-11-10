@@ -23,16 +23,15 @@ design is in [ADR 0001](docs/ADR/0001-beamtalk-native-oauth-client.md).
 
 ## Install
 
-Add the dependency to your `beamtalk.toml`:
+Add it from the registry with `beamtalk deps add oauth`, or put the
+dependency in your `beamtalk.toml`:
 
 ```toml
 [dependencies]
 oauth = "0.1.0"
 ```
 
-Until 0.1.0 is published to the registry, add it from the repository:
-`beamtalk deps add oauth --git https://github.com/jamesc/beamtalk-oauth`.
-Either way it pulls in `http` and the native `oidcc` dependency.
+It pulls in `http` and the native `oidcc` dependency.
 
 ## Native app quick start
 
