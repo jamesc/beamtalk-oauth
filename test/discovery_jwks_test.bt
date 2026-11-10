@@ -1,0 +1,105 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+// Unknown-kid JWKS reloads for `fromDiscovery:` servers (BT-4578): the
+// reloaded keys are kept for the provider's jwks_uri, and reloads are
+// limited to one per #minJwksReloadInterval. Each test has its own
+// FixtureProvider, so its own jwks_uri, and a fresh discovery resets what
+// is kept for it. No test hits the network or httpc (HttpcGuard).
+
+TestCase subclass: DiscoveryJwksTest
+  field: provider = nil
+
+  setUp =>
+    HttpcGuard install
+    self.provider := FixtureProvider start
+    self.provider keyId: "key-1"
+    self
+
+  tearDown =>
+    self.provider stop
+    self assert: HttpcGuard calls equals: 0
+    nil
+
+  discover: opts :: Dictionary -> OAuthServer =>
+    all := #{#allowUnsafeHttp => true}
+    opts keysAndValuesDo: [:k :v | all := all at: k put: v]
+    (OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: #{}
+      options: all) unwrap
+
+  retrieve: server :: OAuthServer -> Result =>
+    Erlang beamtalk_oauth_oidcc
+      retrieve_token: server context
+      with: #{
+        #client_id => FixtureProvider clientId,
+        #client_secret => FixtureProvider clientSecret
+      }
+      with: #{
+        #issuer => self.provider issuer,
+        #code => "code-1",
+        #redirect_uri => "http://127.0.0.1:50278/callback",
+        #nonce => FixtureProvider nonce,
+        #pkce_verifier => Secrets generate
+      }
+
+  jwksHits -> Integer => self.provider hits: "/jwks"
+
+  testRotatedKeyIsKept =>
+    server := self discover: #{}
+    self assertOk: (self retrieve: server)
+    self.provider rotateKeyTo: "key-2"
+    self assertOk: (self retrieve: server)
+    self assert: self jwksHits equals: 2
+    // The server still holds key-1 only; the kept keys answer its next
+    // unknown kid without a fetch.
+    self assertOk: (self retrieve: server)
+    self assert: self jwksHits equals: 2
+
+  testUnknownKidReloadIsRateLimited =>
+    server := self discover: #{}
+    self.provider rotateKeyTo: "key-2"
+    self assertOk: (self retrieve: server)
+    self.provider rotateKeyTo: "key-3"
+    // Within the interval (30 s by default): no fetch, so validation fails.
+    self assert: (self retrieve: server) isError
+    self assert: (self retrieve: server) isError
+    self assert: self jwksHits equals: 2
+
+  testUnknownKidReloadsAgainAfterInterval =>
+    server := self discover: #{#minJwksReloadInterval => 200}
+    self.provider rotateKeyTo: "key-2"
+    self assertOk: (self retrieve: server)
+    self.provider rotateKeyTo: "key-3"
+    Erlang timer sleep: 250
+    self assertOk: (self retrieve: server)
+    self assert: self jwksHits equals: 3
+
+  testFailedReloadIsRateLimited =>
+    server := self discover: #{}
+    self.provider rotateKeyTo: "key-2"
+    self.provider failNext: "/jwks" times: 1
+    self assert: (self retrieve: server) isError
+    // The failed reload counts: no retry within the interval.
+    self assert: (self retrieve: server) isError
+    self assert: self jwksHits equals: 2
+
+  testRediscoveryResetsTheInterval =>
+    server := self discover: #{}
+    self.provider rotateKeyTo: "key-2"
+    self assertOk: (self retrieve: server)
+    self.provider rotateKeyTo: "key-3"
+    // A fresh discovery loads (and keeps) key-3 itself.
+    fresh := self discover: #{}
+    self assertOk: (self retrieve: fresh)
+    self assertOk: (self retrieve: server)
+    self assert: self jwksHits equals: 3
+
+  testBadIntervalRaises =>
+    #(-1, "soon")
+      do: [:value |
+        self should: [
+          self discover: #{#minJwksReloadInterval => value}
+        ] raise: #signal
+      ]
