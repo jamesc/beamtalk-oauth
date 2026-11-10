@@ -50,7 +50,9 @@ userinfo `_claim_sources` endpoint that is not HTTPS),
     discover/2,
     load_opts/1,
     mark_discovery/3,
+    is_discovery_url/1,
     provider_info/4,
+    with_jwks_budget/2,
     client_context/3,
     call_opts/1,
     has_kid/2,
@@ -83,6 +85,14 @@ userinfo `_claim_sources` endpoint that is not HTTPS),
 %% How long token validation waits for a `ProviderWorker`'s JWKS reload
 %% before going on with the keys it has.
 -define(WORKER_JWKS_TIMEOUT, 3000).
+
+%% The time an operation's unknown-kid JWKS refresh may take, counted from
+%% `call_opts/1': the wait for a `ProviderWorker' and any direct load end
+%% within it, leaving headroom under the 5 s Beamtalk actor-call timeout.
+-define(JWKS_BUDGET, 4500).
+
+%% oidcc's request timeout when `request_opts' names none.
+-define(OIDCC_REQUEST_TIMEOUT, 60000).
 
 %% The least time between two unknown-kid JWKS reloads for one `jwks_uri`
 %% of a `discover/2` provider, unless `min_jwks_reload_interval` is given.
@@ -265,6 +275,8 @@ mark_discovery(get, Url, Body) when is_binary(Body) ->
 mark_discovery(_Method, _Url, Body) ->
     Body.
 
+-doc "Whether `Url`'s path ends in `/.well-known/openid-configuration`.".
+-spec is_discovery_url(iodata()) -> boolean().
 is_discovery_url(Url) ->
     case uri_string:parse(iolist_to_binary(Url)) of
         #{path := Path} when is_binary(Path) ->
@@ -373,44 +385,89 @@ if the worker has gone, it reloads directly as a `discover/2` provider
 does, at the worker's interval; if the worker is busy
 past 3 s, it goes on with the keys it has, and validation fails rather
 than overrunning the caller's 5 s actor-call budget.
+
+The whole refresh, the wait for the worker and any direct load, ends
+within 4.5 s of this call (the operation's start, so the budget includes
+the token request before validation), below that 5 s budget: a direct
+load times out at what is left of it, or at the request timeout if that
+is sooner, and once nothing is left no load starts (nor any reload is
+asked of the worker, or claimed for the interval) and validation goes on
+with the keys it has, failing for the unknown `kid`.
 """.
 -spec call_opts(provider()) -> map().
 call_opts({beamtalk_oauth_provider, #{config := Config, request_opts := RequestOpts} = Ctx}) ->
     JwksUri = Config#oidcc_provider_configuration.jwks_uri,
-    %% `{ok, {Jwks, ExpiryMs}}' (expiry from the response's cache headers).
+    Deadline = erlang:monotonic_time(millisecond) + maps:get(jwks_budget, Ctx, ?JWKS_BUDGET),
+    %% `{ok, {Jwks, ExpiryMs}}' (expiry from the response's cache headers),
+    %% or `spent' when the budget has run out.
     Load = fun() ->
-        oidcc_provider_configuration:load_jwks(JwksUri, #{request_opts => RequestOpts})
+        case time_left(Deadline) of
+            0 ->
+                spent;
+            Left ->
+                Timeout = min(Left, maps:get(timeout, RequestOpts, ?OIDCC_REQUEST_TIMEOUT)),
+                oidcc_provider_configuration:load_jwks(JwksUri, #{
+                    request_opts => RequestOpts#{timeout => Timeout}
+                })
+        end
     end,
     Interval = maps:get(jwks_reload_interval, Ctx, ?MIN_JWKS_RELOAD_INTERVAL),
     Refresh =
         case Ctx of
             #{provider_worker := Worker} ->
-                fun(Jwks, Kid) -> worker_jwks(Worker, Kid, Jwks, {JwksUri, Interval}, Load) end;
+                fun(Jwks, Kid) ->
+                    worker_jwks(Worker, Kid, Jwks, {JwksUri, Interval, Deadline}, Load)
+                end;
             _ ->
-                fun(Jwks, Kid) -> limited_jwks(JwksUri, Interval, Kid, Jwks, Load) end
+                fun(Jwks, Kid) -> limited_jwks(JwksUri, Interval, Kid, Jwks, Deadline, Load) end
         end,
     #{request_opts => RequestOpts, refresh_jwks => Refresh}.
+
+-doc """
+`Provider` with its unknown-kid refresh budget (see `call_opts/1`) set to
+`Ms` instead of 4.5 s. For tests, which use small budgets rather than
+multi-second waits.
+""".
+-spec with_jwks_budget(provider(), non_neg_integer()) -> provider().
+with_jwks_budget({beamtalk_oauth_provider, Ctx}, Ms) when is_integer(Ms), Ms >= 0 ->
+    {beamtalk_oauth_provider, Ctx#{jwks_budget => Ms}}.
+
+%% Milliseconds left before `Deadline', at least 0.
+time_left(Deadline) ->
+    max(0, Deadline - erlang:monotonic_time(millisecond)).
 
 %% Ask the `ProviderWorker' to reload its JWKS for `Kid' and answer its
 %% keys. The oidcc worker behind it skips the reload when it already has
 %% that key. A worker that has no keys yet, or whose reload failed, answers
 %% `undefined': the keys are then loaded directly and handed back to the
 %% worker, so later callers get them without a fetch. One that has stopped
-%% leaves a rate-limited direct load (`limited_jwks/5', at the worker's
-%% interval); one that does not answer within ?WORKER_JWKS_TIMEOUT (busy
-%% with a slow load) leaves validation with the keys it already has.
+%% leaves a rate-limited direct load (`limited_jwks/6', at the worker's
+%% interval); one that does not answer within ?WORKER_JWKS_TIMEOUT, or what
+%% is left of the budget (busy with a slow load), leaves validation with
+%% the keys it already has, as does a budget spent before a direct load.
 %%
 %% oidcc drops an unknown-kid refresh that is queued while a load runs
 %% (`drop_queued_unknown_kid_refreshes/0'): the load that just ran is taken
 %% to cover it. If that load started before the provider rotated, the new
 %% key is missed once; the fallback above loads it directly.
-worker_jwks(Worker, Kid, Current, {JwksUri, Interval}, Load) ->
-    try gen_server:call(Worker, {beamtalk_oauth_unknown_kid, Kid}, ?WORKER_JWKS_TIMEOUT) of
+worker_jwks(Worker, Kid, Current, {JwksUri, Interval, Deadline}, Load) ->
+    case time_left(Deadline) of
+        %% Spent (say by a slow token request): no call, which would start a
+        %% reload, and use up the worker's interval, for no one.
+        0 -> {ok, Current};
+        Left -> ask_worker(Worker, Kid, Current, {JwksUri, Interval, Deadline}, Load, Left)
+    end.
+
+ask_worker(Worker, Kid, Current, {JwksUri, Interval, Deadline}, Load, Left) ->
+    Wait = min(?WORKER_JWKS_TIMEOUT, Left),
+    try gen_server:call(Worker, {beamtalk_oauth_unknown_kid, Kid}, Wait) of
         undefined ->
             case Load() of
                 {ok, {Jwks, _Expiry}} ->
                     gen_server:cast(Worker, {beamtalk_oauth_direct_jwks, Kid, Jwks}),
                     {ok, Jwks};
+                spent ->
+                    {ok, Current};
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -422,7 +479,7 @@ worker_jwks(Worker, Kid, Current, {JwksUri, Interval}, Load) ->
         exit:{timeout, _} ->
             {ok, Current};
         exit:_ ->
-            limited_jwks(JwksUri, Interval, Kid, Current, Load)
+            limited_jwks(JwksUri, Interval, Kid, Current, Deadline, Load)
     end.
 
 %% The keys for an unknown `Kid' of a provider with no worker: the keys
@@ -430,14 +487,19 @@ worker_jwks(Worker, Kid, Current, {JwksUri, Interval}, Load) ->
 %% caller, or a newer discovery, loaded it); else a load, kept, when none
 %% was made for `JwksUri' in the last `Interval' ms; else the kept keys
 %% (`Current' when none are kept, or they expired), without a fetch.
+%% Once `Deadline' (the budget) has passed no load starts, and none is
+%% claimed: the kept keys are answered then too.
 %%
 %% Should the table vanish under a call (its owner killed by a code purge),
 %% the keys are loaded without the limit, once.
-limited_jwks(JwksUri, Interval, Kid, Current, Load) ->
+limited_jwks(JwksUri, Interval, Kid, Current, Deadline, Load) ->
     try
         Table = jwks_table(),
         Kept = kept_jwks(Table, JwksUri, Current),
-        case has_kid(Kept, Kid) orelse not claim_reload(Table, JwksUri, Interval) of
+        case
+            has_kid(Kept, Kid) orelse time_left(Deadline) =:= 0 orelse
+                not claim_reload(Table, JwksUri, Interval)
+        of
             true ->
                 {ok, Kept};
             false ->
@@ -445,6 +507,8 @@ limited_jwks(JwksUri, Interval, Kid, Current, Load) ->
                     {ok, {Jwks, Expiry}} ->
                         keep_jwks(Table, JwksUri, Jwks, Expiry),
                         {ok, Jwks};
+                    spent ->
+                        {ok, Kept};
                     {error, Reason} ->
                         {error, Reason}
                 end
@@ -453,6 +517,7 @@ limited_jwks(JwksUri, Interval, Kid, Current, Load) ->
         error:badarg ->
             case Load() of
                 {ok, {Loaded, _}} -> {ok, Loaded};
+                spent -> {ok, Current};
                 {error, Why} -> {error, Why}
             end
     end.

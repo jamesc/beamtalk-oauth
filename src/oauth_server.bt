@@ -40,6 +40,8 @@
 /// kept, node-wide, for every server discovered from that provider, so a
 /// rotated key is fetched once, not once per token. Within the interval a
 /// token naming a key the kept keys lack fails validation without a fetch.
+/// The reload times out within 4.5 s of the start of the call that
+/// validates (or sooner, at `#timeout`), under the 5 s actor-call timeout.
 ///
 /// ## Examples
 /// ```beamtalk

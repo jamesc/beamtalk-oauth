@@ -36,6 +36,20 @@
 /// 60 s), and after an unknown-key reload. Reloads asked for by `refresh`
 /// are rate-limited to one per `#backoffMin`.
 ///
+/// While the provider is down, `refresh` does not add reloads: once a
+/// load of the configuration or the JWKS has failed, `oidcc` keeps
+/// retrying it with backoff, and `refresh` leaves that part alone until a
+/// load of it succeeds. Then `refresh` reloads it again. It also leaves
+/// alone a part whose load is still running. Unknown-key reloads skip the
+/// worker the same way while its JWKS load is running or failed, and load
+/// the keys directly instead.
+///
+/// The unknown-key reload has a 4.5 s budget, under the 5 s actor-call
+/// timeout, counted from the start of the call that validates (so a slow
+/// token request uses part of it). The wait for the worker and any direct
+/// load share it; once it is spent no load starts, and the token fails
+/// validation.
+///
 /// The worker holds no secrets; `sys:get_status` shows only its issuer and
 /// the `oidcc` worker's pid.
 ///

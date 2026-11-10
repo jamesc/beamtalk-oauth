@@ -43,6 +43,14 @@ A `200` answer to a `GET` of a discovery document is handed to
 leaves out `revocation_endpoint_auth_methods_supported` (so the marker
 survives `oidcc` applying the RFC 8414 default).
 
+With `load_observer => Pid` in the config, `Pid` is sent
+`{beamtalk_oauth_load, configuration | jwks, started}` before each
+request and `{beamtalk_oauth_load, configuration | jwks, ok | failed}`
+after it: `configuration` for a discovery document, else `jwks`, and `ok`
+for a `200` or `201` whose body is a JSON object. `ProviderWorker` sets
+it on its `oidcc` worker's loads only, to learn which of them is running
+or failed (and so has an `oidcc` backoff retry pending).
+
 Every URL must be HTTPS (`{error, {http_client, insecure_url}}`
 otherwise), whatever `oidcc` accepted: `oidcc` itself takes a plain-HTTP
 `jwks_uri`, and an `oidcc_provider_configuration_worker` fetches it
@@ -110,11 +118,44 @@ request(Method, Request, HttpOptions, _RequestOptions, #{client := Client} = Con
     %% value that is not iodata, a response of an unexpected shape) must
     %% not escape with the request in its stacktrace or arguments, where
     %% oidcc's telemetry span would re-emit it. It becomes a fixed reason.
-    try
-        do_request(Method, Request, HttpOptions, Client, Config)
+    observe(Request, started, Config),
+    Answer =
+        try
+            do_request(Method, Request, HttpOptions, Client, Config)
+        catch
+            Class:_Reason -> {error, {http_client, {raised, Class}}}
+        end,
+    observe(Request, outcome(Answer), Config),
+    Answer.
+
+%% Tell the config's `load_observer', if any, about the request:
+%% `{beamtalk_oauth_load, configuration | jwks, started | ok | failed}',
+%% by whether the URL is a discovery document.
+observe(Request, Event, #{load_observer := Observer}) when is_pid(Observer) ->
+    Kind =
+        try beamtalk_oauth_oidcc:is_discovery_url(element(1, Request)) of
+            true -> configuration;
+            false -> jwks
+        catch
+            _:_ -> jwks
+        end,
+    Observer ! {beamtalk_oauth_load, Kind, Event},
+    ok;
+observe(_Request, _Event, _Config) ->
+    ok.
+
+%% `ok' for an answer `oidcc' can load from: a 200 or 201 (the statuses it
+%% takes as success) whose body is a JSON object. Anything else (an error
+%% status, a maintenance page served as a 200) fails the load.
+outcome({ok, {{_, Status, _}, _Headers, Body}}) when Status =:= 200; Status =:= 201 ->
+    try json:decode(Body) of
+        Doc when is_map(Doc) -> ok;
+        _ -> failed
     catch
-        Class:_Reason -> {error, {http_client, {raised, Class}}}
-    end.
+        _:_ -> failed
+    end;
+outcome(_Answer) ->
+    failed.
 
 do_request(Method, Request, HttpOptions, Client, Config) ->
     maybe
