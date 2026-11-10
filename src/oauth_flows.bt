@@ -71,12 +71,17 @@
 /// The helper is `rx awaitCallback:`, `handleCallback:store:boundTo:`
 /// and `exchangeCode:client:callback:store:` in a loop that survives a
 /// forged callback. `state` is visible to local processes (the browser's
-/// argv, its history), so one can send `/callback?code=junk&state=...`
-/// before the provider's redirect. The forged code is never accepted, but
-/// it takes the receiver's one-shot slot and burns the session. When the
+/// argv, its history), so one can send a callback with the real state
+/// before the provider's redirect. One that no provider would send (no
+/// `code` or `error`, or an `iss` naming another issuer) is filtered
+/// early: the helper sets `rx expectIssuer: server issuer`, and the
+/// receiver refuses it without taking its one-shot slot. A well-formed
+/// `/callback?code=junk&state=...` gets through; the forged code is never
+/// accepted, but it takes the slot and burns the session. When the
 /// provider answers `invalid_grant`, the helper re-arms: it puts the same
 /// session back (`SessionStore restore:boundTo:`) and listens again on
-/// the same port for the same state (`LoopbackReceiver rearm`). See
+/// the same port for the same state (`LoopbackReceiver rearm`). Only
+/// those refused exchanges count toward the re-arm cap. See
 /// `completeLoopbackLogin:server:client:store:timeout:maxRearms:` for the
 /// limits.
 Object subclass: OAuthFlows
@@ -194,13 +199,25 @@ Object subclass: OAuthFlows
   /// Dictionary, but its gate has already refused repeated parameters in
   /// the raw query.)
   ///
-  /// Every failure burns the session the callback names: any text `state`
-  /// value found in the query, even a malformed one, is consumed from
-  /// `store` with `binding` before the error is answered, so a probed or
-  /// broken callback cannot be retried.
+  /// A malformed query burns the session the callback names: any text
+  /// `state` value found in a query with a non-text or repeated parameter
+  /// is consumed from `store` with `binding` before the error is
+  /// answered, so a probed or broken callback cannot be retried.
   ///
-  /// - A missing or empty `code` or `state`, a parameter that is not text,
-  ///   or any parameter given twice (RFC 6749 §3.1) answers `parse`.
+  /// A well-formed callback that no provider would send is refused before
+  /// the session is touched, so it costs the login nothing (BT-4613):
+  ///
+  /// - one with neither a non-empty `code` nor an `error` answers `parse`;
+  /// - one whose `iss` (RFC 9207) differs from the issuer of the session
+  ///   it names answers `issuer_mismatch`, a provider `error` callback
+  ///   included. The session is looked up with `SessionStore
+  ///   peek:boundTo:`, which removes nothing; when that lookup fails the
+  ///   callback goes on to `consume:boundTo:`, which answers the error.
+  ///
+  /// Then:
+  ///
+  /// - A missing or empty `state`, a parameter that is not text, or any
+  ///   parameter given twice (RFC 6749 §3.1) answers `parse`.
   /// - A provider `error` answers an `OAuthError` with its
   ///   `error_description`. A registered authorization-error code
   ///   (`access_denied`, `login_required`, ...; see `providerErrorCodes`)
@@ -211,7 +228,8 @@ Object subclass: OAuthFlows
   /// - Otherwise the session is consumed from `store` with `binding`
   ///   (`SessionStore consume:boundTo:`: `session_mismatch`,
   ///   `reused_state`, `expired_session`), and an `iss` parameter
-  ///   (RFC 9207) must equal the session's issuer (`issuer_mismatch`).
+  ///   (RFC 9207) must still equal the session's issuer
+  ///   (`issuer_mismatch`).
   /// - A store already holding its cap of callback tickets answers
   ///   `session_store_full` (`SessionStore hasTicketRoom`) before the
   ///   session is consumed, so the login can be retried; normally this is
@@ -238,6 +256,18 @@ Object subclass: OAuthFlows
         ^Result error: parsed
       ]
     state := parsed at: "state" ifAbsent: [""]
+    // A callback no provider would send leaves the session alone, so a
+    // local process that reads `state` cannot end the login with one.
+    ((parsed at: "error" ifAbsent: [
+      nil
+    ]) isNil and: [
+      (parsed at: "code" ifAbsent: [""]) isEmpty
+    ]) ifTrue: [^Result error: (OAuthError parse: "callback has no code")]
+    (self
+      issuerMismatchOf: parsed
+      state: state
+      store: store
+      boundTo: binding) ifNotNil: [:err | ^Result error: err]
     // A full ticket table would refuse the ticket after the session is
     // burned: refuse first, and leave the session for a retry.
     (state isEmpty not and: [
@@ -262,10 +292,8 @@ Object subclass: OAuthFlows
             ""
           ]))
       ]
+    // Not empty: checked above.
     code := parsed at: "code" ifAbsent: [""]
-    code isEmpty ifTrue: [
-      ^Result error: (OAuthError parse: "callback has no code")
-    ]
     burned isNil ifTrue: [
       ^Result error: (OAuthError parse: "callback has no state")
     ]
@@ -285,6 +313,19 @@ Object subclass: OAuthFlows
         iss: iss
         session: sess
         ticket: ticket)
+
+  /// The `issuer_mismatch` error when `parsed` carries an `iss` and the
+  /// session stored under `state` with `binding` has another issuer; nil
+  /// otherwise, including when no such session is found (consuming it
+  /// answers that error). Removes nothing from `store`.
+  class issuerMismatchOf: parsed :: Dictionary state: state :: String store: store :: SessionStore boundTo: binding :: String -> OAuthError | Nil =>
+    iss := parsed at: "iss" ifAbsent: [nil]
+    (iss isNil or: [state isEmpty]) ifTrue: [^nil]
+    found := store peek: state boundTo: binding
+    found isError ifTrue: [^nil]
+    expected := found value issuer
+    iss =:= expected ifTrue: [^nil]
+    OAuthError code: "issuer_mismatch" description: "callback iss {self echo: iss} is not the session's issuer {expected}"
 
   /// Consume, ignoring the outcome, every session named by a text `state`
   /// value in `query`, however malformed the rest of it is.
@@ -422,7 +463,11 @@ Object subclass: OAuthFlows
   /// before this answers, either way.
   ///
   /// Call it after `rx expectState:` and after storing the session with
-  /// `rx binding`, as in the class comment. It blocks the calling process,
+  /// `rx binding`, as in the class comment. It sets `rx expectIssuer:
+  /// server issuer` first, so a callback whose `iss` names another
+  /// issuer, or one with neither `code` nor `error`, is refused by the
+  /// receiver and never reaches the exchange or the re-arm count. A
+  /// receiver already expecting another issuer answers `config`. It blocks the calling process,
   /// like `awaitCallback:`. `timeoutMs` (`0..LoopbackReceiver
   /// maxTimeout`) bounds the waiting for callbacks overall, however many
   /// times it re-arms; a token request already under way is bounded by
@@ -453,13 +498,13 @@ Object subclass: OAuthFlows
   /// timeout for a redirect that never comes, then answers that
   /// `invalid_grant`.
   ///
-  /// The residual limit: this defeats a forged callback that carries a
-  /// junk code, nothing more. A local process that reads `state` can
-  /// still delay the login until the cap or the timeout (a tight loop of
-  /// junk callbacks spends every re-arm in moments), or end it with a
-  /// forged callback that fails before the exchange: an `error=`, a
-  /// wrong `iss`, or no `code`. A real redirect that lands while a junk
-  /// callback holds the slot answers 404 and is lost. It cannot hijack the login: PKCE and
+  /// The residual limit: a local process that reads `state` can still
+  /// delay the login until the cap or the timeout (a tight loop of
+  /// well-formed junk codes spends every re-arm in moments), or end it
+  /// with a forged `error=` callback, which looks the same as the
+  /// provider's and is never retried (a user who clicks Deny must fail
+  /// fast). A real redirect that lands while a junk callback holds the
+  /// slot answers 404 and is lost. It cannot hijack the login: PKCE and
   /// the session binding stop a forged code. `maxRearms` (`>= 0`; 0 never
   /// re-arms) outside that range answers `config`.
   class completeLoopbackLogin: rx :: LoopbackReceiver server: server :: OAuthServer client: reg :: ClientRegistration store: store :: SessionStore timeout: timeoutMs :: Integer maxRearms: maxRearms :: Integer -> Result(TokenSet, OAuthError) =>
@@ -486,6 +531,13 @@ Object subclass: OAuthFlows
         ^Result error: (OAuthError config: "completeLoopbackLogin: maxRearms must be an Integer >= 0")
       ]
     deadline := self monotonicMs + timeoutMs
+    // Filter early: a callback naming another issuer never takes the
+    // slot. A stopped receiver is reported by the wait below.
+    expected := Result tryDo: [rx expectIssuer: server issuer]
+    (expected isError and: [rx isListening])
+      ifTrue: [
+        ^Result error: (OAuthError config: "completeLoopbackLogin: {expected error message}")
+      ]
     rearms := 0
     // The `invalid_grant` behind the last re-arm, answered if the wait
     // after it times out.

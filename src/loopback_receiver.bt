@@ -8,7 +8,9 @@
 /// The first `GET /callback` carrying the flow's `state` is recorded and
 /// answered with a static "you can close this tab" page that echoes no
 /// provider data. Any other path or method, any callback with a missing,
-/// wrong or repeated `state` (or a repeated `code` or `error`), and any
+/// wrong or repeated `state` (or a repeated `code` or `error`), any
+/// callback with neither `code` nor `error`, any callback whose `iss`
+/// names another issuer than the one given to `expectIssuer:`, and any
 /// later callback answers 404 without touching the recorded query.
 /// Browsers fetch `/favicon.ico` right after the redirect, and any web
 /// page or local process can fire a junk `/callback` at the port, so a
@@ -41,7 +43,18 @@
 /// session's state) shows up as such rather than as a user who never
 /// signed in.
 ///
-/// This check only keeps junk from using up the one-shot slot.
+/// ## The expected issuer
+///
+/// `expectIssuer:` (normally `server issuer`) adds an RFC 9207 check: a
+/// callback whose `iss` is present and names another issuer is refused
+/// like a wrong state. A callback without `iss` is still accepted, and
+/// `OAuthFlows handleCallback:store:boundTo:` keeps its own `iss` check.
+/// `OAuthFlows completeLoopbackLogin:...` sets it; call it yourself, before
+/// opening the authorize URL, when composing the steps by hand. A
+/// callback recorded before the issuer was known, and not yet handed out,
+/// is checked again when it is set.
+///
+/// These checks only keep junk from using up the one-shot slot.
 /// `OAuthFlows handleCallback:store:boundTo:` still checks the state
 /// against the `SessionStore`, and that is what stops a forged code.
 ///
@@ -51,6 +64,8 @@
 /// reads it can still send a matching junk callback (`code=junk`) first
 /// and take the slot. It cannot get the forged code accepted (PKCE and
 /// the session store stop that); the provider answers `invalid_grant`.
+/// It cannot take the slot with a callback no provider would send (a
+/// wrong `iss`, no `code`; BT-4613), only with a well-formed junk code.
 /// So the receiver can be re-armed (BT-4572): `rearm` clears the slot and
 /// keeps the same port and expected state, and
 /// `awaitCallback:keepListening:` leaves the listener up after a callback
@@ -60,8 +75,9 @@
 /// timeout; prefer it to composing the steps by hand.
 ///
 /// Residual limit: a local attacker that reads `state` can still delay
-/// the login, by spending the re-arms or the timeout, or end it, with a
-/// forged `error=` callback (never retried, since it looks the same as
+/// the login, by spending the re-arms with a flood of well-formed junk
+/// codes or by waiting out the timeout, or end it, with a forged `error=`
+/// callback (never retried, since it looks the same as
 /// the provider's own). A real redirect that lands while a junk callback
 /// holds the slot, before the re-arm, answers 404 and is lost. None of
 /// these can hijack the login. Web pages and blind port scans cannot use
@@ -160,7 +176,7 @@ typed Value subclass: LoopbackReceiver
       ifOk: [:rx | Result ok: rx]
       ifError: [:e |
         [gate close] on: Error do: [:ignored | nil]
-        Result error: (OAuthError transport: "loopback listener failed to start: {e messageText}")
+        Result error: (OAuthError transport: "loopback listener failed to start: {e message}")
       ]
 
   /// The server's request handler: a block, so it runs in the connection
@@ -204,6 +220,17 @@ typed Value subclass: LoopbackReceiver
     self.gate expectState: expected
     self
 
+  /// Refuse a callback whose `iss` is present and is not `expected`,
+  /// normally `server issuer` (RFC 9207); a callback without `iss` is
+  /// still accepted. Call it before opening the authorize URL, next to
+  /// `expectState:`; a callback already recorded and not yet handed out
+  /// is checked again. Answers the receiver. Raises when `expected` is nil
+  /// or empty, when another issuer is already expected (the same one again
+  /// is fine), or when the receiver is stopped.
+  expectIssuer: expected :: String -> LoopbackReceiver =>
+    self.gate expectIssuer: expected
+    self
+
   /// Wait up to `timeoutMs` for the callback and answer its raw query
   /// (`code`, `state`, or `error` and `error_description`), for
   /// `OAuthFlows handleCallback:store:boundTo:`. A callback that arrived
@@ -216,7 +243,7 @@ typed Value subclass: LoopbackReceiver
   ///
   /// - `callback_timeout`: nothing arrived in time; its `detail` is the
   ///   number of callbacks refused for a missing, wrong or repeated
-  ///   parameter, also given in the description when it is not 0;
+  ///   parameter (or no `code` or `error`, or a wrong `iss`), also given in the description when it is not 0;
   /// - `config`: a timeout outside `0..maxTimeout`; `expectState:` was
   ///   never called; the receiver was stopped (by `stop`, its owner
   ///   exiting or its lifetime passing), before or during the wait;
@@ -288,8 +315,8 @@ typed Value subclass: LoopbackReceiver
 
   /// Clear the one-shot slot after a callback from
   /// `awaitCallback:keepListening:`, so the next callback carrying the
-  /// expected state is recorded. The port, the expected state, the
-  /// binding and the owner (the process that waited) stay as they were.
+  /// expected state is recorded. The port, the expected state and issuer,
+  /// the binding and the owner (the process that waited) stay as they were.
   /// Answers the receiver, or a `config` error when the receiver is
   /// stopped (then it is stopped for good), when no state is expected,
   /// or while a wait is still pending.

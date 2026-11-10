@@ -253,9 +253,9 @@ TestCase subclass: OAuthFlowsTest
       store: self.store
       boundTo: self.binding
     self assert: (self codeOf: noCode) equals: "parse"
-    // The session named by the failed callback is burned.
-    self assert: self.store size equals: 0
-    sess := self newSession
+    // No provider sends a callback with neither code nor error: the
+    // session it names is left alone (BT-4613).
+    self assert: self.store size equals: 1
     noState := OAuthFlows
       handleCallback: "code=a"
       store: self.store
@@ -266,6 +266,8 @@ TestCase subclass: OAuthFlowsTest
       store: self.store
       boundTo: self.binding
     self assert: (self codeOf: emptyCode) equals: "parse"
+    self assert: self.store size equals: 1
+    // A non-text parameter is malformed, and burns the session it names.
     flag := OAuthFlows
       handleCallback: "code&state={sess state}"
       store: self.store
@@ -324,6 +326,35 @@ TestCase subclass: OAuthFlowsTest
       store: self.store
       boundTo: self.binding
     self assert: (self codeOf: got) equals: "issuer_mismatch"
+    // The forged callback left the session usable (BT-4613).
+    self assert: self.store size equals: 1
+    cb := (OAuthFlows
+      handleCallback: #(#("code", "a"), #("state", sess state), #("iss", sess issuer))
+      store: self.store
+      boundTo: self.binding) unwrap
+    self assert: cb session state equals: sess state
+    self assert: self.store size equals: 0
+
+  testProviderErrorWithWrongIssIsIssuerMismatchAndKeepsSession =>
+    sess := self newSession
+    raw := "error=access_denied&state={sess state}&iss=https%3A%2F%2Fattacker.test"
+    got := OAuthFlows
+      handleCallback: raw
+      store: self.store
+      boundTo: self.binding
+    self assert: (self codeOf: got) equals: "issuer_mismatch"
+    self assert: self.store size equals: 1
+
+  testWrongIssWithWrongBindingIsSessionMismatch =>
+    // The issuer lookup is bound too: with the wrong binding the callback
+    // goes on to consume, which answers (and burns) as before.
+    sess := self newSession
+    query := #(#("code", "a"), #("state", sess state), #("iss", "https://attacker.test"))
+    got := OAuthFlows
+      handleCallback: query
+      store: self.store
+      boundTo: Secrets generate
+    self assert: (self codeOf: got) equals: "session_mismatch"
     self assert: self.store size equals: 0
 
   // ===== Code exchange =====

@@ -296,6 +296,16 @@ TestCase subclass: E2eNativeLoginTest
       store: self.store
       timeout: ms
 
+  // The completion helper against `server`, with `maxRearms` re-arms.
+  complete: server :: OAuthServer client: reg :: ClientRegistration timeout: ms :: Integer maxRearms: n :: Integer -> Result =>
+    OAuthFlows
+      completeLoopbackLogin: self.rx
+      server: server
+      client: reg
+      store: self.store
+      timeout: ms
+      maxRearms: n
+
   testForgedCodeFirstStillLogsIn =>
     server := self discovered
     {reg, sess, location} := self authorizeOnly: server
@@ -411,18 +421,66 @@ TestCase subclass: E2eNativeLoginTest
     self assert: got error code equals: "callback_timeout"
     self deny: self.rx isListening
 
-  testForgedIssuerIsNotRetried =>
-    // The documented limit: a forged callback that fails before the
-    // exchange ends the login.
+  // ===== Filtering forged callbacks early (BT-4613) =====
+  testForgedIssuerFirstStillLogsInWithoutARearm =>
     server := self discovered
-    {reg, sess, _} := self authorizeOnly: server
-    HTTPClient get: "{self junkFor: sess}&iss=https%3A%2F%2Fevil.example"
+    {reg, sess, location} := self authorizeOnly: server
+    forged := "{self junkFor: sess}&iss=https%3A%2F%2Fevil.example"
+    this := self
+    [
+      this deliver: forged tries: 1
+      this deliver: location tries: 200
+    ] fork
+    toks := (self
+      complete: server
+      client: reg
+      timeout: 10000) unwrap
+    self assert: toks subject equals: "user-1"
+    // Filtered, so never exchanged: no re-arm was used.
+    self assert: (self.provider hits: "/token") equals: 1
+    self deny: self.rx isListening
+
+  testForgedIssuerRecordedBeforeTheHelperIsDropped =>
+    // The forged callback lands before the helper sets the issuer, so the
+    // receiver recorded it; setting the issuer drops it again.
+    server := self discovered
+    {reg, sess, location} := self authorizeOnly: server
+    forged := (HTTPClient get: "{self junkFor: sess}&iss=https%3A%2F%2Fevil.example") unwrap
+    self assert: forged status equals: 200
+    this := self
+    [this deliver: location tries: 200] fork
+    toks := (self
+      complete: server
+      client: reg
+      timeout: 10000
+      maxRearms: 0) unwrap
+    self assert: toks subject equals: "user-1"
+    self assert: (self.provider hits: "/token") equals: 1
+
+  testStateOnlyCallbackFirstStillLogsIn =>
+    server := self discovered
+    {reg, sess, location} := self authorizeOnly: server
+    stateOnly := "{self.rx redirectUri}?state={sess state urlEncoded}"
+    self assert: (HTTPClient get: stateOnly) unwrap status equals: 404
+    this := self
+    [this deliver: location tries: 200] fork
+    toks := (self
+      complete: server
+      client: reg
+      timeout: 10000
+      maxRearms: 0) unwrap
+    self assert: toks subject equals: "user-1"
+    self assert: (self.provider hits: "/token") equals: 1
+
+  testCompleteWithAReceiverExpectingAnotherIssuerAnswersConfig =>
+    server := self discovered
+    {reg, _, _} := self authorizeOnly: server
+    self.rx expectIssuer: "https://other.example"
     got := self
       complete: server
       client: reg
-      timeout: 5000
-    self assert: got error code equals: "issuer_mismatch"
-    self assert: (self.provider hits: "/token") equals: 0
+      timeout: 1000
+    self assert: got error code equals: "config"
     self deny: self.rx isListening
 
   testNegativeMaxRearmsAnswersConfig =>
