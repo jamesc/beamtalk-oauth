@@ -186,6 +186,7 @@ instead.
 | `missing_id_token` | the token response had no ID token |
 | `no_userinfo_endpoint` | the provider has no userinfo endpoint |
 | `callback_timeout` | no matching callback reached the `LoopbackReceiver` in time |
+| `session_store_full` | the `SessionStore` already holds `#maxSessions` sessions or callback tickets; retry later |
 
 ## Supported and not
 
