@@ -419,9 +419,23 @@ TestCase subclass: ProviderWorkerTest
     self assert: (self.provider hits: "/.well-known/openid-configuration") equals: 2
 
   testRefreshDuringOutageAddsNoRetryChain =>
-    // BT-4618: each failed oidcc load starts its own backoff retry chain,
-    // so refresh leaves a part whose last load failed to the chain
-    // already retrying it.
+    self refreshDuringOutage: [:path | self.provider failNext: path times: 1000]
+
+  testRefreshDuringMaintenancePageAddsNoRetryChain =>
+    // A 200 that is not a JSON document fails the oidcc load all the same.
+    self
+      refreshDuringOutage: [:path |
+        self.provider
+          respond: path
+          status: 200
+          body: "<html>down for maintenance</html>"
+          contentType: "text/html"
+      ]
+
+  // BT-4618: each failed oidcc load starts its own backoff retry chain, so
+  // refresh leaves a part whose last load failed to the chain already
+  // retrying it. `breakPath` makes the provider fail loads of a path.
+  refreshDuringOutage: breakPath :: Block =>
     discovery := "/.well-known/openid-configuration"
     self.worker := (ProviderWorker
       issuer: self.provider issuer
@@ -436,8 +450,8 @@ TestCase subclass: ProviderWorkerTest
     loads := [(self.provider hits: discovery) + (self.provider hits: "/jwks")]
     base := loads value
     // The provider goes down: both loads fail.
-    self.provider failNext: discovery times: 1000
-    self.provider failNext: "/jwks" times: 1000
+    breakPath value: discovery
+    breakPath value: "/jwks"
     #(1, 2, 3, 4, 5, 6)
       do: [:i |
         self assert: self.worker refresh equals: nil
@@ -452,12 +466,51 @@ TestCase subclass: ProviderWorkerTest
     self assert: outage <= 7
     // The provider recovers; each chain's next retry (within 400 ms)
     // succeeds, and refresh reloads both again.
-    self.provider failNext: discovery times: 0
-    self.provider failNext: "/jwks" times: 0
-    Erlang timer sleep: 500
+    self.provider reset
+    Erlang timer sleep: 900
     before := loads value
     self.worker refresh
     self assert: loads value equals: before + 2
+
+  testRefreshDuringRunningLoadAddsNoReload =>
+    // A provider that hangs: a reload cast while a load runs would queue
+    // behind it, fail with it, and start a second retry chain.
+    srv := HTTPServer
+      start: 0
+      handler: [:req |
+        Erlang timer sleep: 600
+        HTTPResponse new: #{#status => 503}
+      ]
+    self.worker := (ProviderWorker
+      issuer: "http://127.0.0.1:{srv port}"
+      preset: #{}
+      options: #{
+        #allowUnsafeHttp => true,
+        #backoffMin => 60000,
+        #backoffMax => 60000
+      }) unwrap
+    inner := self.worker oidccWorker
+    // The first load is under way.
+    Erlang timer sleep: 100
+    worker := self.worker
+    [worker refresh] fork
+    Erlang timer sleep: 100
+    // Only the refresh's read waits; no reload was cast.
+    self assert: (self queuedAt: inner) equals: 1
+    Erlang timer sleep: 700
+    srv stop
+
+  testSpentBudgetAsksNoWorkerReload =>
+    self.provider keyId: "key-1"
+    worker := self start: #{}
+    server := self assertOk: worker server
+    self.provider rotateKeyTo: "key-2"
+    result := self retrieveWith: (self budgeted: server ms: 0) client: self confidential
+    self assert: result isError
+    self assert: (self.provider hits: "/jwks") equals: 1
+    // No reload used up the worker's interval: the next exchange reloads.
+    self exchange: server
+    self assert: (self.provider hits: "/jwks") equals: 2
 
   testSlowWorkerReloadIsBoundedByBudget =>
     self.provider keyId: "key-1"

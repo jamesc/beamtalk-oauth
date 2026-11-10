@@ -387,11 +387,12 @@ past 3 s, it goes on with the keys it has, and validation fails rather
 than overrunning the caller's 5 s actor-call budget.
 
 The whole refresh, the wait for the worker and any direct load, ends
-within 4.5 s of this call (the operation's start), below that 5 s
-budget: a direct load times out at what is left of it, or at the request
-timeout if that is sooner, and once nothing is left no load starts and
-validation goes on with the keys it has (and fails for the unknown
-`kid`).
+within 4.5 s of this call (the operation's start, so the budget includes
+the token request before validation), below that 5 s budget: a direct
+load times out at what is left of it, or at the request timeout if that
+is sooner, and once nothing is left no load starts (nor any reload is
+asked of the worker, or claimed for the interval) and validation goes on
+with the keys it has, failing for the unknown `kid`.
 """.
 -spec call_opts(provider()) -> map().
 call_opts({beamtalk_oauth_provider, #{config := Config, request_opts := RequestOpts} = Ctx}) ->
@@ -450,7 +451,15 @@ time_left(Deadline) ->
 %% to cover it. If that load started before the provider rotated, the new
 %% key is missed once; the fallback above loads it directly.
 worker_jwks(Worker, Kid, Current, {JwksUri, Interval, Deadline}, Load) ->
-    Wait = min(?WORKER_JWKS_TIMEOUT, time_left(Deadline)),
+    case time_left(Deadline) of
+        %% Spent (say by a slow token request): no call, which would start a
+        %% reload, and use up the worker's interval, for no one.
+        0 -> {ok, Current};
+        Left -> ask_worker(Worker, Kid, Current, {JwksUri, Interval, Deadline}, Load, Left)
+    end.
+
+ask_worker(Worker, Kid, Current, {JwksUri, Interval, Deadline}, Load, Left) ->
+    Wait = min(?WORKER_JWKS_TIMEOUT, Left),
     try gen_server:call(Worker, {beamtalk_oauth_unknown_kid, Kid}, Wait) of
         undefined ->
             case Load() of
