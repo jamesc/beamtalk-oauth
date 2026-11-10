@@ -269,6 +269,31 @@ TestCase subclass: ProviderWorkerTest
     self.provider failNext: "/jwks" times: 1
     self exchange: server
     self assert: (self.provider hits: "/jwks") equals: 3
+    // The directly loaded keys went back to the worker: a fresh server
+    // validates key-2 without another fetch.
+    self exchange: (self assertOk: worker server)
+    self exchange: server
+    self assert: (self.provider hits: "/jwks") equals: 3
+
+  testAfterFailedReloadOnlyDirectLoads =>
+    // After a reload that failed, the worker casts no further oidcc reload
+    // (each would start its own oidcc backoff retry chain): the next
+    // unknown kid, past the interval, is one direct load.
+    self.provider keyId: "key-1"
+    worker := self startWith: #{
+      #backoffMin => 60000,
+      #backoffMax => 60000,
+      #minJwksReloadInterval => 200
+    }
+    server := self assertOk: worker server
+    self.provider rotateKeyTo: "key-2"
+    // Both the worker's reload and the direct load fail.
+    self.provider failNext: "/jwks" times: 2
+    self assert: (self retrieve: server client: self confidential) isError
+    self assert: (self.provider hits: "/jwks") equals: 3
+    Erlang timer sleep: 250
+    self exchange: server
+    self assert: (self.provider hits: "/jwks") equals: 4
 
   testRotationAfterWorkerStopsStillValidates =>
     self.provider keyId: "key-1"

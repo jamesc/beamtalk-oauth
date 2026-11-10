@@ -54,6 +54,7 @@ userinfo `_claim_sources` endpoint that is not HTTPS),
     client_context/3,
     call_opts/1,
     has_kid/2,
+    forget_jwks/1,
     check_https/2,
     check_claim_sources/2,
     authorize_url/3,
@@ -170,8 +171,8 @@ discover(Issuer0, Opts) when is_map(Opts) ->
             oidcc_provider_configuration:load_configuration(Issuer, LoadOpts),
         ok ?= check_endpoints(Config, Unsafe),
         JwksUri = Config#oidcc_provider_configuration.jwks_uri,
-        {ok, {Jwks, _JwksExpiry}} ?= oidcc_provider_configuration:load_jwks(JwksUri, LoadOpts),
-        ok = keep_discovered_jwks(JwksUri, Jwks),
+        {ok, {Jwks, JwksExpiry}} ?= oidcc_provider_configuration:load_jwks(JwksUri, LoadOpts),
+        ok = keep_discovered_jwks(JwksUri, Jwks, JwksExpiry),
         Interval = maps:get(min_jwks_reload_interval, Opts, ?MIN_JWKS_RELOAD_INTERVAL),
         {ok, provider_info(Config, Jwks, RequestOpts, #{jwks_reload_interval => Interval})}
     end.
@@ -355,8 +356,9 @@ The options every `oidcc` call for `Provider` starts from: the adapter in
 unknown `kid`.
 
 A provider from `discover/2` keeps the newest keys for its `jwks_uri` in
-a node-wide table (which `discover/2` also fills). An unknown `kid` that
-the kept keys name is validated with them, without a fetch. Otherwise the
+a node-wide table (which `discover/2` also fills), until they expire by
+the JWKS response's cache headers. An unknown `kid` that the kept keys
+name is validated with them, without a fetch. Otherwise the
 JWKS is reloaded through the adapter, and kept, at most once per
 `min_jwks_reload_interval` (default 30 s) for that `jwks_uri`, node-wide;
 within the interval the kept keys are used without a fetch, so a token
@@ -366,81 +368,107 @@ reload counts toward the interval. A new discovery restarts it.
 A provider from a `ProviderWorker` asks the worker to reload instead
 (rate-limited there, by `#minJwksReloadInterval`), so the worker keeps
 the new keys for every later caller. If the worker has no keys yet, or
-its reload failed, it reloads directly; if the worker has gone, it
-reloads directly as a `discover/2` provider does; if the worker is busy
+its reload failed, it reloads directly and hands the keys to the worker;
+if the worker has gone, it reloads directly as a `discover/2` provider
+does, at the worker's interval; if the worker is busy
 past 3 s, it goes on with the keys it has, and validation fails rather
 than overrunning the caller's 5 s actor-call budget.
 """.
 -spec call_opts(provider()) -> map().
 call_opts({beamtalk_oauth_provider, #{config := Config, request_opts := RequestOpts} = Ctx}) ->
     JwksUri = Config#oidcc_provider_configuration.jwks_uri,
-    Direct = fun() ->
-        case
-            oidcc_provider_configuration:load_jwks(JwksUri, #{request_opts => RequestOpts})
-        of
-            {ok, {Jwks, _Expiry}} -> {ok, Jwks};
-            {error, Reason} -> {error, Reason}
-        end
+    %% `{ok, {Jwks, ExpiryMs}}' (expiry from the response's cache headers).
+    Load = fun() ->
+        oidcc_provider_configuration:load_jwks(JwksUri, #{request_opts => RequestOpts})
     end,
+    Interval = maps:get(jwks_reload_interval, Ctx, ?MIN_JWKS_RELOAD_INTERVAL),
     Refresh =
         case Ctx of
             #{provider_worker := Worker} ->
-                fun(Jwks, Kid) -> worker_jwks(Worker, Kid, Jwks, JwksUri, Direct) end;
+                fun(Jwks, Kid) -> worker_jwks(Worker, Kid, Jwks, {JwksUri, Interval}, Load) end;
             _ ->
-                Interval = maps:get(jwks_reload_interval, Ctx, ?MIN_JWKS_RELOAD_INTERVAL),
-                fun(Jwks, Kid) -> limited_jwks(JwksUri, Interval, Kid, Jwks, Direct) end
+                fun(Jwks, Kid) -> limited_jwks(JwksUri, Interval, Kid, Jwks, Load) end
         end,
     #{request_opts => RequestOpts, refresh_jwks => Refresh}.
 
 %% Ask the `ProviderWorker' to reload its JWKS for `Kid' and answer its
 %% keys. The oidcc worker behind it skips the reload when it already has
 %% that key. A worker that has no keys yet, or whose reload failed, answers
-%% `undefined' and the keys are loaded `Direct'ly; one that has stopped
-%% leaves a rate-limited direct load (`limited_jwks/5'); one that does not
-%% answer within ?WORKER_JWKS_TIMEOUT (busy with a slow load) leaves
-%% validation with the keys it already has.
+%% `undefined': the keys are then loaded directly and handed back to the
+%% worker, so later callers get them without a fetch. One that has stopped
+%% leaves a rate-limited direct load (`limited_jwks/5', at the worker's
+%% interval); one that does not answer within ?WORKER_JWKS_TIMEOUT (busy
+%% with a slow load) leaves validation with the keys it already has.
 %%
 %% oidcc drops an unknown-kid refresh that is queued while a load runs
 %% (`drop_queued_unknown_kid_refreshes/0'): the load that just ran is taken
 %% to cover it. If that load started before the provider rotated, the new
-%% key is missed once; the next token naming it after the worker's reload
-%% interval triggers another reload.
-worker_jwks(Worker, Kid, Current, JwksUri, Direct) ->
+%% key is missed once; the fallback above loads it directly.
+worker_jwks(Worker, Kid, Current, {JwksUri, Interval}, Load) ->
     try gen_server:call(Worker, {beamtalk_oauth_unknown_kid, Kid}, ?WORKER_JWKS_TIMEOUT) of
-        undefined -> Direct();
-        busy -> {ok, Current};
-        Jwks -> {ok, Jwks}
+        undefined ->
+            case Load() of
+                {ok, {Jwks, _Expiry}} ->
+                    gen_server:cast(Worker, {beamtalk_oauth_direct_jwks, Jwks}),
+                    {ok, Jwks};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        busy ->
+            {ok, Current};
+        Jwks ->
+            {ok, Jwks}
     catch
         exit:{timeout, _} ->
             {ok, Current};
         exit:_ ->
-            limited_jwks(JwksUri, ?MIN_JWKS_RELOAD_INTERVAL, Kid, Current, Direct)
+            limited_jwks(JwksUri, Interval, Kid, Current, Load)
     end.
 
 %% The keys for an unknown `Kid' of a provider with no worker: the keys
-%% kept for `JwksUri' when they name `Kid' (another caller, or a newer
-%% discovery, loaded it); else a `Direct' load, kept, when none was made
-%% for `JwksUri' in the last `Interval' ms; else the kept keys (`Current'
-%% when none are kept), without a fetch.
-limited_jwks(JwksUri, Interval, Kid, Current, Direct) ->
-    Table = jwks_table(),
-    Kept =
-        case ets:lookup(Table, {keys, JwksUri}) of
-            [{_, Keys}] -> Keys;
-            [] -> Current
-        end,
-    case has_kid(Kept, Kid) orelse not claim_reload(Table, JwksUri, Interval) of
-        true ->
-            {ok, Kept};
-        false ->
-            case Direct() of
-                {ok, Jwks} ->
-                    true = ets:insert(Table, {{keys, JwksUri}, Jwks}),
-                    {ok, Jwks};
-                Error ->
-                    Error
+%% kept for `JwksUri', while unexpired, when they name `Kid' (another
+%% caller, or a newer discovery, loaded it); else a load, kept, when none
+%% was made for `JwksUri' in the last `Interval' ms; else the kept keys
+%% (`Current' when none are kept, or they expired), without a fetch.
+%%
+%% Should the table vanish under a call (its owner killed by a code purge),
+%% the keys are loaded without the limit, once.
+limited_jwks(JwksUri, Interval, Kid, Current, Load) ->
+    try
+        Table = jwks_table(),
+        Kept = kept_jwks(Table, JwksUri, Current),
+        case has_kid(Kept, Kid) orelse not claim_reload(Table, JwksUri, Interval) of
+            true ->
+                {ok, Kept};
+            false ->
+                case Load() of
+                    {ok, {Jwks, Expiry}} ->
+                        keep_jwks(Table, JwksUri, Jwks, Expiry),
+                        {ok, Jwks};
+                    {error, Reason} ->
+                        {error, Reason}
+                end
+        end
+    catch
+        error:badarg ->
+            case Load() of
+                {ok, {Loaded, _}} -> {ok, Loaded};
+                {error, Why} -> {error, Why}
             end
     end.
+
+%% The keys kept for `JwksUri' until they expire, else `Current'.
+kept_jwks(Table, JwksUri, Current) ->
+    Now = erlang:monotonic_time(millisecond),
+    case ets:lookup(Table, {keys, JwksUri}) of
+        [{_, Jwks, ExpiresAt}] when Now < ExpiresAt -> Jwks;
+        _ -> Current
+    end.
+
+keep_jwks(Table, JwksUri, Jwks, ExpiryMs) ->
+    ExpiresAt = erlang:monotonic_time(millisecond) + ExpiryMs,
+    true = ets:insert(Table, {{keys, JwksUri}, Jwks, ExpiresAt}),
+    ok.
 
 -doc """
 Whether a key in `Jwks` (a key or a key set) is named `Kid`. A key with no
@@ -478,9 +506,22 @@ claim_reload(Table, JwksUri, Interval) ->
 
 %% A `discover/2' load: its keys are the newest for `JwksUri', and the next
 %% unknown kid may reload at once (as a fresh discovery would have).
-keep_discovered_jwks(JwksUri, Jwks) ->
+keep_discovered_jwks(JwksUri, Jwks, ExpiryMs) ->
     Table = jwks_table(),
-    true = ets:insert(Table, {{keys, JwksUri}, Jwks}),
+    keep_jwks(Table, JwksUri, Jwks, ExpiryMs),
+    true = ets:delete(Table, {reloaded_at, JwksUri}),
+    ok.
+
+-doc """
+Drop the keys and reload time kept for the `jwks_uri` of `Config` (a
+provider configuration): a `ProviderWorker`'s first load is newer. The
+next unknown `kid` of a server whose worker has stopped then reloads at
+once.
+""".
+-spec forget_jwks(oidcc_provider_configuration:t()) -> ok.
+forget_jwks(#oidcc_provider_configuration{jwks_uri = JwksUri}) ->
+    Table = jwks_table(),
+    true = ets:delete(Table, {keys, JwksUri}),
     true = ets:delete(Table, {reloaded_at, JwksUri}),
     ok.
 
