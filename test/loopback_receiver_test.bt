@@ -497,3 +497,77 @@ TestCase subclass: LoopbackReceiverTest
     gate := LoopbackGate spawnWith: #{#starter => starter}
     100 timesRepeat: [gate isAlive ifTrue: [Timer sleep: 20]]
     self deny: gate isAlive
+
+  // ===== Re-arming (BT-4572) =====
+  testKeepListeningLeavesTheListenerUp =>
+    self callback: "code=junk"
+    query := (self.rx awaitCallback: 5000 keepListening: true) unwrap
+    self assert: (query at: "code") equals: "junk"
+    self assert: self.rx isListening
+    // The slot is still taken until rearm.
+    self assert: (self callback: "code=real") unwrap status equals: 404
+
+  testRearmRecordsTheNextCallbackOnTheSamePort =>
+    port := self.rx port
+    self callback: "code=junk"
+    (self.rx awaitCallback: 5000 keepListening: true) unwrap
+    self assert: (self.rx rearm) isOk
+    self assert: self.rx port equals: port
+    // The expected state is kept: a wrong one is still refused.
+    self assert: (self browse: "/callback?code=x&state=wrong") unwrap status equals: 404
+    self assert: (self callback: "code=real") unwrap status equals: 200
+    query := (self.rx awaitCallback: 5000) unwrap
+    self assert: (query at: "code") equals: "real"
+    self deny: self.rx isListening
+
+  testKeepListeningStillStopsOnTimeout =>
+    self assert: (self.rx awaitCallback: 50 keepListening: true) error code equals: "callback_timeout"
+    self deny: self.rx isListening
+
+  testRearmAfterStopAnswersConfigError =>
+    self.rx stop
+    self assert: self.rx rearm error code equals: "config"
+
+  testRearmWithoutExpectedStateAnswersConfigError =>
+    other := LoopbackReceiver start unwrap
+    self assert: other rearm error code equals: "config"
+    self assert: other isListening
+    other stop
+
+  testRearmWhileAWaitIsPendingAnswersConfigError =>
+    rx := self.rx
+    [rx awaitCallback: 2000] fork
+    Timer sleep: 100
+    self assert: rx rearm error code equals: "config"
+    self assert: rx isListening
+
+  testListenerClosesWhenOwnerEndsAfterAKeptCallback =>
+    // The waiter stays the owner after a wait that keeps the listener up:
+    // when it ends without stopping it, the listener goes with it.
+    rx := self.rx
+    self callback: "code=junk"
+    [(rx awaitCallback: 5000 keepListening: true) unwrap] fork
+    self assert: (self awaitClosed: rx)
+
+  testAKeptCallbackIsNotHandedToAnotherProcess =>
+    self callback: "code=junk"
+    (self.rx awaitCallback: 5000 keepListening: true) unwrap
+    rx := self.rx
+    table := Ets new: #bt4572Other type: #set
+    [table at: #got put: (rx awaitCallback: 1000)] fork
+    100 timesRepeat: [(table at: #got) isNil ifTrue: [Timer sleep: 20]]
+    self assert: (table at: #got) error code equals: "config"
+    // The first waiter still owns it and can re-arm.
+    self assert: rx isListening
+    self assert: rx rearm isOk
+    table delete
+
+  testAKeptCallbackIsNotAnsweredTwiceToItsOwner =>
+    self callback: "code=junk"
+    (self.rx awaitCallback: 5000 keepListening: true) unwrap
+    self assert: (self.rx awaitCallback: 100 keepListening: true) error code equals: "config"
+    // Still up and still re-armable: the refusal changes nothing.
+    self assert: self.rx isListening
+    self assert: self.rx rearm isOk
+    self assert: (self callback: "code=real") unwrap status equals: 200
+    self assert: ((self.rx awaitCallback: 5000) unwrap at: "code") equals: "real"

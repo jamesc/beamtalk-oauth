@@ -31,6 +31,10 @@
 /// bearer header or an `access_token` form parameter. `redirect:to:`
 /// answers a 302 with a `Location`.
 ///
+/// `/token` answers a 400 `invalid_grant` to an `authorization_code`
+/// grant for any code but `code-1`, the one `/authorize` issues, as a
+/// real provider answers a forged code.
+///
 /// `/authorize` stands in for the user signing in: it answers a 302 to
 /// the request's `redirect_uri` with `code` (`code-1`), the request's
 /// `state` and `iss` (the issuer), and makes the request's `nonce` the
@@ -231,7 +235,7 @@ Actor subclass: FixtureProvider
       "/.well-known/openid-configuration" -> self json: self discoveryDocument status: 200;
       "/authorize" -> self authorizeFor: req;
       "/jwks" -> self jwksResponse;
-      "/token" -> self json: self tokenResponse status: 200;
+      "/token" -> self tokenFor: req;
       "/userinfo" -> self userinfoFor: req;
       "/revoke" -> HTTPResponse new: #{#status => 200, #body => ""};
       "/tokeninfo" -> self tokenInfoFor: req;
@@ -269,6 +273,24 @@ Actor subclass: FixtureProvider
         #headers => #(#("location", "{redirect}{sep}{query}")),
         #body => ""
       }
+
+  /// The token answer: `tokenResponse`, or a 400 `invalid_grant`, as a
+  /// real provider answers a code it never issued, for an
+  /// `authorization_code` grant whose `code` is not `code-1`.
+  tokenFor: req :: HTTPRequest -> HTTPResponse =>
+    form := (self recordOf: req) at: #form
+    ((form at: "grant_type" ifAbsent: [
+      ""
+    ]) =:= "authorization_code" and: [
+      (form at: "code" ifAbsent: [""]) =/= "code-1"
+    ])
+      ifTrue: [
+        ^self json: #{
+          "error" => "invalid_grant",
+          "error_description" => "unknown code"
+        } status: 400
+      ]
+    self json: self tokenResponse status: 200
 
   /// The discovery document, overrides applied.
   discoveryDocument -> Dictionary =>

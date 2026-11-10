@@ -60,9 +60,7 @@ sess := OAuthSession newSessionFor: server client: reg
 rx expectState: sess state                // before the URL is opened
 url := (OAuthFlows authorizeUrl: server client: reg scopes: #("openid") session: sess) unwrap
 Transcript showCr: url                    // or open the system browser
-query := (rx awaitCallback: 300000) unwrap
-cb := (OAuthFlows handleCallback: query store: store boundTo: rx binding) unwrap
-toks := (OAuthFlows exchangeCode: server client: reg callback: cb store: store) unwrap
+toks := (OAuthFlows completeLoopbackLogin: rx server: server client: reg store: store timeout: 300000) unwrap
 toks subject                              // validated by oidcc
 (OAuthFlows userInfo: server client: reg tokenSet: toks) unwrap
 toks := (OAuthFlows refresh: server client: reg tokenSet: toks) unwrap
@@ -75,11 +73,19 @@ Things to know:
 - `rx expectState:` must come before the browser gets the URL. The
   receiver records only a `GET /callback` carrying that state, so the
   browser's `/favicon.ico` request or a junk request from a web page
-  cannot use up its one slot. It stops listening once `awaitCallback:`
-  answers; call `rx stop` yourself if the flow is abandoned earlier
+  cannot use up its one slot. `completeLoopbackLogin:` stops it before
+  answering; call `rx stop` yourself if the flow is abandoned earlier
   (`examples/native_login.bt` uses `ensure:`).
-- `awaitCallback:` blocks the calling process while the user signs in.
-  Call it from a plain or forked process, not inside an actor method.
+- `completeLoopbackLogin:` blocks the calling process while the user
+  signs in. Call it from a plain or forked process, not inside an actor
+  method. It is `rx awaitCallback:`, `OAuthFlows handleCallback:` and
+  `exchangeCode:` in one call, and it survives a forged callback: a
+  local process that reads `state` (from the browser's argv or history)
+  can send a junk code first. The provider answers `invalid_grant`, and
+  the helper puts the session back and listens again on the same port,
+  up to 3 times within the timeout. Such a process can still delay the
+  login, or end it with a callback that fails before the exchange (an
+  `error=`, a wrong `iss`), but cannot hijack it.
 - `handleCallback:` consumes the session, so a callback works once.
   `exchangeCode:` then spends the single-use ticket in the `Callback`.
 - `refresh:` answers a merged `TokenSet`: the old refresh token and ID

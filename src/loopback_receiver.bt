@@ -45,13 +45,27 @@
 /// `OAuthFlows handleCallback:store:boundTo:` still checks the state
 /// against the `SessionStore`, and that is what stops a forged code.
 ///
-/// Known limit: `state` is not a secret from the local machine. The
+/// `state` is not a secret from the local machine, though. The
 /// authorize URL carrying it can show up in the argv of the process that
 /// opens the browser and in browser history, so a local process that
-/// reads it can still send a matching junk callback first and use up the
-/// slot. It cannot get a forged code accepted (PKCE and the session store
-/// stop that), but the login fails and must be retried with a new
-/// receiver. Web pages and blind port scans no longer can.
+/// reads it can still send a matching junk callback (`code=junk`) first
+/// and take the slot. It cannot get the forged code accepted (PKCE and
+/// the session store stop that); the provider answers `invalid_grant`.
+/// So the receiver can be re-armed (BT-4572): `rearm` clears the slot and
+/// keeps the same port and expected state, and
+/// `awaitCallback:keepListening:` leaves the listener up after a callback
+/// so there is something to re-arm. `OAuthFlows completeLoopbackLogin:...`
+/// does both, and puts the session back, when the exchange answers
+/// `invalid_grant`, up to a cap (3 by default) within its overall
+/// timeout; prefer it to composing the steps by hand.
+///
+/// Residual limit: a local attacker that reads `state` can still delay
+/// the login, by spending the re-arms or the timeout, or end it, with a
+/// forged `error=` callback (never retried, since it looks the same as
+/// the provider's own). A real redirect that lands while a junk callback
+/// holds the slot, before the re-arm, answers 404 and is lost. None of
+/// these can hijack the login. Web pages and blind port scans cannot use
+/// up the slot at all.
 ///
 /// The receiver owns the per-flow `binding` (`Secrets generate`), so a
 /// native app passes `rx binding` to the session store and never makes
@@ -64,7 +78,9 @@
 /// its `LoopbackGate` handler, which holds the one-shot state.
 ///
 /// The listener stops once `awaitCallback:` answers, either way; `stop`
-/// stops it early and is idempotent.
+/// stops it early and is idempotent. `awaitCallback:keepListening:` with
+/// `true` leaves it up after a callback, for `rearm`; the caller then
+/// stops it.
 ///
 /// ## Lifetime
 ///
@@ -75,6 +91,9 @@
 /// another process (or the REPL evaluation that started it has ended).
 /// Once `awaitCallback:` begins, the waiting process is the owner, and
 /// the listener stops if it exits for any reason before the wait answers.
+/// It stays the owner after a wait that keeps the listener up, so a
+/// process that crashes, or ends, between a callback and `rearm` still
+/// takes the listener with it.
 ///
 /// A receiver that nobody awaits stops after `defaultLifetime` (10
 /// minutes), or the lifetime given to `startWithLifetime:`. The wait
@@ -200,11 +219,20 @@ typed Value subclass: LoopbackReceiver
   ///   parameter, also given in the description when it is not 0;
   /// - `config`: a timeout outside `0..maxTimeout`; `expectState:` was
   ///   never called; the receiver was stopped (by `stop`, its owner
-  ///   exiting or its lifetime passing), before or during the wait; or
-  ///   another process is already waiting on it. Only in the stopped
-  ///   case is the listener gone: otherwise it stays up, and any other
-  ///   wait carries on.
+  ///   exiting or its lifetime passing), before or during the wait;
+  ///   another process is already waiting on it; or it already answered
+  ///   a callback with the listener kept up and has not been re-armed.
+  ///   Only in the stopped case is the listener gone: otherwise it stays
+  ///   up, and any other wait carries on.
   awaitCallback: timeoutMs :: Integer -> Result(Dictionary, OAuthError) =>
+    self awaitCallback: timeoutMs keepListening: false
+
+  /// As `awaitCallback:`, but when `keep` is true and a callback arrives
+  /// the listener stays up, still owned by the calling process, so that
+  /// `rearm` can wait for another callback on the same port. The caller
+  /// must `stop` it when done. Every error still stops the listener as
+  /// `awaitCallback:` does.
+  awaitCallback: timeoutMs :: Integer keepListening: keep :: Boolean -> Result(Dictionary, OAuthError) =>
     ((timeoutMs < 0) or: [timeoutMs > self class maxTimeout])
       ifTrue: [
         ^Result error: (OAuthError config: "awaitCallback: timeout must be between 0 and {self class maxTimeout} ms")
@@ -224,11 +252,16 @@ typed Value subclass: LoopbackReceiver
       ifTrue: [
         ^Result error: (OAuthError config: "another process is already waiting on this LoopbackReceiver")
       ]
+    registered value =:= #held
+      ifTrue: [
+        ^Result error: (OAuthError config: "this LoopbackReceiver already answered its callback; rearm it before waiting again")
+      ]
     gatePid := self.gate pid
     outcome := self class
       await: tag
       from: gatePid
       timeout: timeoutMs
+    (keep and: [outcome isOk]) ifTrue: [^Result ok: outcome value]
     refused := 0
     (outcome isError and: [
       outcome error =:= #timeout
@@ -252,6 +285,35 @@ typed Value subclass: LoopbackReceiver
           ]
           ifFalse: [Result error: (OAuthError callbackTimeoutRefusing: refused)]
       ]
+
+  /// Clear the one-shot slot after a callback from
+  /// `awaitCallback:keepListening:`, so the next callback carrying the
+  /// expected state is recorded. The port, the expected state, the
+  /// binding and the owner (the process that waited) stay as they were.
+  /// Answers the receiver, or a `config` error when the receiver is
+  /// stopped (then it is stopped for good), when no state is expected,
+  /// or while a wait is still pending.
+  ///
+  /// Use it only after the code from that callback was refused (the
+  /// provider's `invalid_grant`), together with putting the session back
+  /// (`SessionStore restore:boundTo:`); `OAuthFlows
+  /// completeLoopbackLogin:...` does both.
+  rearm -> Result(LoopbackReceiver, OAuthError) =>
+    answer := Result tryDo: [self.gate rearm]
+    (answer isError or: [answer value =:= #closed])
+      ifTrue: [
+        self stop
+        ^Result error: (OAuthError config: "LoopbackReceiver is stopped")
+      ]
+    answer value =:= #noState
+      ifTrue: [
+        ^Result error: (OAuthError config: "call expectState: on the LoopbackReceiver before re-arming it")
+      ]
+    answer value =:= #busy
+      ifTrue: [
+        ^Result error: (OAuthError config: "a wait on this LoopbackReceiver is still pending")
+      ]
+    Result ok: self
 
   /// Stop the listener, then its handler. Idempotent: answers `#ok` every
   /// time, like `Actor>>stop`, and never raises, so the handler is stopped
