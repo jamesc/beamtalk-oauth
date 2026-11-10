@@ -366,8 +366,9 @@ Actor subclass: FixtureProvider
 
   /// The JWKS: the public half of the key.
   jwksResponse -> HTTPResponse =>
-    {_, jwk} := Erlang jose_jwk to_binary: (Erlang jose_jwk to_public: self.key)
-    public := (Json parse: jwk asStringUnchecked) unwrap
+    // to_map, not Json parse:, so the checker sees a Dictionary rather
+    // than a JsonValue union.
+    {_, public} := Erlang jose_jwk to_map: (Erlang jose_jwk to_public: self.key)
     self.keyId isNil ifFalse: [public := public at: "kid" put: self.keyId]
     self json: #{"keys" => #(public)} status: 200
 
