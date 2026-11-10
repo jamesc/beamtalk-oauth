@@ -69,7 +69,10 @@ Config (the `spawnWith:` map, Symbol keys arriving as atoms):
   `OAuthServer fromDiscovery:preset:options:`, plus `backoffMin`,
   `backoffMax` (ms) and `backoffType` for failed loads (default
   `random_exponential`, 1 s to 30 s), `cacheTtl` (ms, default 60 s) and
-  `minJwksReloadInterval` (ms, default 30 s). oidcc's `stop` backoff is refused:
+  `minJwksReloadInterval` (ms, default 30 s), and `deadline` (ms, a
+  positive Integer, default 4500), the deadline of each operation on a
+  server built here (`beamtalk_oauth_oidcc:call_opts/1`; the worker's own
+  loads do not use it). oidcc's `stop` backoff is refused:
   the worker keeps retrying instead of exiting. `allowUnsafeHttp` also
   needs the test-only application flag (see
   `beamtalk_oauth_oidcc:unsafe_http_enabled/0`).
@@ -125,7 +128,8 @@ refuses non-HTTPS URLs; `oidcc` alone would fetch a plain-HTTP `jwks_uri`.
     backoffMax,
     backoffType,
     cacheTtl,
-    minJwksReloadInterval
+    minJwksReloadInterval,
+    deadline
 ]).
 
 %% No `stop`: the oidcc worker would exit on one failed refresh, and the
@@ -207,7 +211,8 @@ init(Config) ->
                         jwks_load => ok,
                         load_stale => 3 * request_timeout(Options),
                         kid_reload_interval =>
-                            maps:get(minJwksReloadInterval, Options, ?MIN_JWKS_RELOAD_INTERVAL)
+                            maps:get(minJwksReloadInterval, Options, ?MIN_JWKS_RELOAD_INTERVAL),
+                        source => maps:with([deadline], Options)
                     }};
                 {error, Reason} ->
                     {stop, Reason}
@@ -450,13 +455,14 @@ build(
         preset := Preset,
         unsafe := Unsafe,
         request_opts := RequestOpts,
-        kid_reload_interval := Interval
+        kid_reload_interval := Interval,
+        source := Source
     },
     Self
 ) ->
     case beamtalk_oauth_oidcc:check_endpoints(Config, Unsafe) of
         ok ->
-            Info = beamtalk_oauth_oidcc:provider_info(Config, Jwks, RequestOpts, #{
+            Info = beamtalk_oauth_oidcc:provider_info(Config, Jwks, RequestOpts, Source#{
                 provider_worker => Self,
                 jwks_reload_interval => Interval
             }),
@@ -679,7 +685,7 @@ check_intervals(Opts) ->
     ],
     case Bad of
         [] ->
-            {ok, Opts};
+            check_deadline(Opts);
         [K | _] ->
             {error,
                 {config,
@@ -689,6 +695,12 @@ check_intervals(Opts) ->
     end.
 
 is_non_neg_integer(N) -> is_integer(N) andalso N >= 0.
+
+%% `deadline', when given, must be a positive Integer.
+check_deadline(#{deadline := Ms}) when not is_integer(Ms); Ms =< 0 ->
+    {error, {config, <<"ProviderWorker #deadline must be an Integer > 0">>}};
+check_deadline(Opts) ->
+    {ok, Opts}.
 
 unknown_options_text(Unknown) ->
     Names = lists:join(<<", ">>, [atom_to_binary(K) || K <- Unknown, is_atom(K)]),

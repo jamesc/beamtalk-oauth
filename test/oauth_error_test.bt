@@ -70,6 +70,14 @@ TestCase subclass: OAuthErrorTest
     self assert: e description equals: "Could not open connection (econnrefused)"
     self assert: (OAuthError fromOidcc: {#http_client, #streaming_request_body}) description equals: "streaming_request_body"
 
+  testDeadlineExceededIsTransport =>
+    #(#deadline_exceeded, {#error, #deadline_exceeded})
+      do: [:reason |
+        e := OAuthError fromOidcc: reason
+        self assert: e code equals: "transport"
+        self assert: (e description includesSubstring: "deadline exceeded")
+      ]
+
   testInsecureEndpointNamesField =>
     e := OAuthError fromOidcc: {#insecure_endpoint, #token_endpoint, self bin: "http://a.test/token"}
     self assert: e code equals: "insecure_endpoint"

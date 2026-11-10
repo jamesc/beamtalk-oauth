@@ -32,7 +32,7 @@ TestCase subclass: DiscoveryJwksTest
   retrieve: server :: OAuthServer -> Result => self retrieveWith: server context
 
   // An exchange through a provider context (say one with a small
-  // unknown-kid budget, `with_jwks_budget/2`).
+  // deadline, `with_deadline/2`).
   retrieveWith: context -> Result =>
     Erlang beamtalk_oauth_oidcc
       retrieve_token: context
@@ -100,27 +100,43 @@ TestCase subclass: DiscoveryJwksTest
     self assertOk: (self retrieve: server)
     self assert: self jwksHits equals: 3
 
-  // ===== the 4.5 s budget (BT-4618) =====
-  testSlowReloadIsBoundedByBudget =>
-    server := self discover: #{}
+  // ===== the operation deadline (BT-4618, BT-4639) =====
+  // The error a shim answer maps to.
+  errorOf: result :: Result -> OAuthError => OAuthError fromOidcc: result error
+
+  testSlowReloadIsBoundedByDeadline =>
+    server := self discover: #{#deadline => 300}
     self.provider rotateKeyTo: "key-2"
     self.provider slow: "/jwks" by: 1500
-    context := Erlang beamtalk_oauth_oidcc with_jwks_budget: server context with: 300
     before := Erlang erlang monotonic_time: #millisecond
-    result := self retrieveWith: context
+    result := self retrieve: server
     elapsed := (Erlang erlang monotonic_time: #millisecond) - before
-    // The reload times out at what is left of the budget, well before the
-    // slow answer: validation fails instead of overrunning the call.
+    // The reload times out at what is left of the deadline, well before
+    // the slow answer, and says so.
     self assert: result isError
+    self assert: (self errorOf: result) code equals: "transport"
+    self assert: ((self errorOf: result) description includesSubstring: "deadline exceeded")
     self assert: elapsed < 1200
 
-  testSpentBudgetStartsNoReload =>
+  testSpentDeadlineStartsNoRequest =>
+    server := self discover: #{}
+    context := Erlang beamtalk_oauth_oidcc with_deadline: server context with: 0
+    result := self retrieveWith: context
+    self assert: ((self errorOf: result) description includesSubstring: "deadline exceeded")
+    self assert: (self.provider hits: "/token") equals: 0
+
+  testSpentDeadlineClaimsNoReload =>
     server := self discover: #{}
     self.provider rotateKeyTo: "key-2"
-    context := Erlang beamtalk_oauth_oidcc with_jwks_budget: server context with: 0
-    self assert: (self retrieveWith: context) isError
+    // The unknown-kid refresh of an operation whose deadline is already
+    // spent (as by a slow token request): no load, and none claimed.
+    context := Erlang beamtalk_oauth_oidcc with_deadline: server context with: 1
+    opts := Erlang beamtalk_oauth_oidcc call_opts: context
+    Erlang timer sleep: 20
+    refreshed := (opts at: #refresh_jwks) value: nil value: "key-2"
+    self assert: refreshed equals: {#error, #deadline_exceeded}
     self assert: self jwksHits equals: 1
-    // No reload was claimed for the interval: one with time left loads.
+    // The interval was not used up: an exchange with time left reloads.
     self assertOk: (self retrieve: server)
     self assert: self jwksHits equals: 2
 

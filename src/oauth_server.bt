@@ -40,8 +40,28 @@
 /// kept, node-wide, for every server discovered from that provider, so a
 /// rotated key is fetched once, not once per token. Within the interval a
 /// token naming a key the kept keys lack fails validation without a fetch.
-/// The reload times out within 4.5 s of the start of the call that
-/// validates (or sooner, at `#timeout`), under the 5 s actor-call timeout.
+///
+/// ## Deadlines
+/// Each operation on the server (`exchangeCode:`, `refresh:`, `userInfo:`,
+/// and `authorizeUrl:` when it pushes the request with PAR) has one
+/// deadline, `#deadline` ms from its start (default 4500), so it answers
+/// before the 5 s actor-call timeout of the actor that calls it. Every
+/// request it makes draws from that deadline: the token request, the
+/// unknown-key JWKS reload, userinfo, distributed-claim fetches and PAR.
+/// Each request times out at what is left of it, or at `#timeout` (per
+/// request) if that is sooner, and once it is spent no request starts.
+/// The operation then answers a `transport` error that says the deadline
+/// was exceeded; a key rotation during a slow exchange reports that too,
+/// not a missing key. Discovery itself and `TokenRevocation`
+/// (`OAuthFlows revoke:` and `tokenInfo:`) are not bounded by it.
+///
+/// The deadline caps `#timeout`, and it applies whoever calls, not only
+/// an actor. A script or plain process talking to a token endpoint that
+/// takes longer than 4.5 s can raise `#deadline`. A value of 5000 or more
+/// gives up the guarantee for callers inside an actor call. A refresh cut
+/// off by the deadline may already have been accepted by the provider:
+/// with rotating refresh tokens, the old one is then spent and the user
+/// must sign in again.
 ///
 /// ## Examples
 /// ```beamtalk
@@ -95,7 +115,10 @@ typed Value subclass: OAuthServer
   /// As `fromDiscovery:preset:`, with transport options:
   ///
   /// - `#maxBodyBytes` — the response cap (default 1 MiB);
-  /// - `#timeout` — per-request timeout in milliseconds;
+  /// - `#timeout` — per-request timeout in milliseconds, capped by what
+  ///   is left of `#deadline`;
+  /// - `#deadline` — each operation's deadline in milliseconds, an
+  ///   Integer > 0 (default 4500; see the class comment);
   /// - `#minJwksReloadInterval` — the least time (ms, an Integer >= 0)
   ///   between two JWKS reloads for tokens that name an unknown key
   ///   (default 30000; see the class comment);
@@ -105,14 +128,23 @@ typed Value subclass: OAuthServer
   ///   (`FixtureProvider start` sets it); without it the answer is
   ///   `unsafe_http_disabled`. Never set either for a real provider.
   ///
-  /// An unknown option, or a `#minJwksReloadInterval` that is not an
-  /// Integer >= 0, raises.
+  /// An unknown option, a `#minJwksReloadInterval` that is not an
+  /// Integer >= 0, or a `#deadline` that is not an Integer > 0, raises.
   class fromDiscovery: issuer :: String preset: preset :: Dictionary options: opts :: Dictionary -> Result(OAuthServer, OAuthError) =>
-    known := #(#maxBodyBytes, #timeout, #allowUnsafeHttp, #minJwksReloadInterval)
+    known := #(#maxBodyBytes, #timeout, #deadline, #allowUnsafeHttp, #minJwksReloadInterval)
     bad := opts keys reject: [:k | known includes: k]
     bad isEmpty ifFalse: [
       Error signal: "OAuthServer: unknown options {bad printString}"
     ]
+    (opts includesKey: #deadline)
+      ifTrue: [
+        deadline := opts at: #deadline
+        ((deadline isKindOf: Integer) and: [
+          deadline > 0
+        ]) ifFalse: [
+          Error signal: "OAuthServer: #deadline must be an Integer > 0"
+        ]
+      ]
     (opts includesKey: #minJwksReloadInterval)
       ifTrue: [
         interval := opts at: #minJwksReloadInterval
@@ -132,6 +164,9 @@ typed Value subclass: OAuthServer
     ]
     (opts includesKey: #timeout) ifTrue: [
       shimOpts := shimOpts at: #timeout put: (opts at: #timeout)
+    ]
+    (opts includesKey: #deadline) ifTrue: [
+      shimOpts := shimOpts at: #deadline put: (opts at: #deadline)
     ]
     (opts includesKey: #minJwksReloadInterval)
       ifTrue: [

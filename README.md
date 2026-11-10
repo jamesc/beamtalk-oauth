@@ -111,6 +111,34 @@ tree) instead of `fromPreset:`/`fromDiscovery:`. It keeps the provider
 configuration and JWKS fresh, and `worker server unwrap` answers an
 `OAuthServer` for the same calls.
 
+### Timeouts and the deadline
+
+Two options bound the time a call takes. Pass them to
+`OAuthServer fromDiscovery:preset:options:` or in a `ProviderWorker`'s
+`#options`:
+
+- `#timeout`: the timeout of each HTTP request, in milliseconds (10 s
+  for a `ProviderWorker`, `oidcc`'s 60 s otherwise).
+- `#deadline`: the time one operation may take overall, in milliseconds
+  (an Integer > 0, default 4500). The operations are `exchangeCode:`,
+  `refresh:`, `userInfo:`, and `authorizeUrl:` when it pushes the
+  request with PAR. Every request an operation makes draws from its
+  deadline: the token request, a JWKS reload for a rotated key, userinfo,
+  distributed-claim fetches and PAR. Each request times out at what is
+  left of the deadline, or at `#timeout` if that is sooner.
+
+The default deadline sits under the 5 s timeout of a Beamtalk actor
+call, so an operation made inside one answers an `OAuthError` before the
+call itself times out. When the deadline runs out, the operation answers
+`transport` with a description that says the deadline was exceeded.
+The deadline applies whoever calls, not only an actor, and caps
+`#timeout`. A script or plain process that talks to a token endpoint
+slower than 4.5 s can raise `#deadline`; a value of 5000 or more gives up
+the guarantee for callers inside an actor call. A refresh cut off by the
+deadline may already have been accepted by the provider: with rotating
+refresh tokens the old one is then spent, and the user must sign in
+again. Discovery, `revoke:` and `tokenInfo:` are not bounded by it.
+
 ## Server-side web apps
 
 A Beamtalk web app is a confidential client: register a client secret
@@ -175,7 +203,7 @@ instead.
 | provider codes, verbatim | `invalid_grant`, `invalid_client`, `access_denied`, `login_required`, ... |
 | `provider_error` | the callback carried an unregistered error code (in `detail`) |
 | `oidcc` reasons | `missing_claim`, `token_expired`, `sub_invalid`, `no_supported_auth_method`, `no_supported_code_challenge`, ... |
-| `transport` | the request failed (connect, TLS, timeout), or revocation / token info got an error answer that is not JSON |
+| `transport` | the request failed (connect, TLS, timeout), the operation's `#deadline` ran out, or revocation / token info got an error answer that is not JSON |
 | `http_error` | the provider answered an error status whose body has no `error` member |
 | `oidcc_crash` | `oidcc` raised on a malformed provider answer |
 | `bad_subject` | the userinfo `sub` is not the ID token's subject |

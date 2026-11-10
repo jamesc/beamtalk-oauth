@@ -87,6 +87,8 @@ typed Value subclass: OAuthError
   ///   an `http_error` without an `error` member answers `http_error`.
   /// - `{http_client, Reason}` (the HTTP adapter got no response) answers
   ///   `transport`.
+  /// - `deadline_exceeded` (the operation's `#deadline` ran out; see
+  ///   `OAuthServer`) answers `transport`, described as such.
   /// - `{insecure_endpoint, Field, Url}` (the shim's HTTPS-only check)
   ///   answers `insecure_endpoint`, naming the field and URL.
   /// - An atom, or a tuple whose first element is an atom, answers that
@@ -137,6 +139,15 @@ typed Value subclass: OAuthError
     (tag =:= #http_client and: [
       term isKindOf: Tuple
     ]) ifTrue: [^self fromHttpClient: term detail: detail]
+    tag =:= #deadline_exceeded
+      ifTrue: [
+        ^self
+          new: #{
+            #code => "transport",
+            #description => "deadline exceeded: the operation did not finish within its #deadline",
+            #detail => detail
+          }
+      ]
     ((tag =:= #insecure_endpoint and: [
       term isKindOf: Tuple
     ]) and: [term size =:= 3])

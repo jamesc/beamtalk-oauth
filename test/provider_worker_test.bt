@@ -73,16 +73,23 @@ TestCase subclass: ProviderWorkerTest
     self retrieveWith: server context client: client
 
   // An exchange through a provider context (say one with a small
-  // unknown-kid budget, `with_jwks_budget/2`).
+  // deadline, `with_deadline/2`).
   retrieveWith: context client: client :: Dictionary -> Result =>
     Erlang beamtalk_oauth_oidcc
       retrieve_token: context
       with: client
       with: self codeParams
 
-  // `server`'s context with an unknown-kid budget of `ms`.
+  // `server`'s context with an operation deadline of `ms` (0 allowed).
   budgeted: server :: OAuthServer ms: ms :: Integer =>
-    Erlang beamtalk_oauth_oidcc with_jwks_budget: server context with: ms
+    Erlang beamtalk_oauth_oidcc with_deadline: server context with: ms
+
+  // `result` (a shim answer) failed with the deadline error.
+  assertDeadline: result :: Result =>
+    self assert: result isError
+    err := OAuthError fromOidcc: result error
+    self assert: err code equals: "transport"
+    self assert: (err description includesSubstring: "deadline exceeded")
 
   now -> Integer => Erlang erlang monotonic_time: #millisecond
 
@@ -165,6 +172,24 @@ TestCase subclass: ProviderWorkerTest
     self exchange: after
     self assert: (self.provider hits: "/jwks") equals: 2
 
+  testBackgroundLoadsIgnoreDeadline =>
+    // The worker's own loads are not operations: a slow JWKS load longer
+    // than #deadline still lands.
+    self.provider keyId: "key-1"
+    worker := self startWith: #{#cacheTtl => 100, #deadline => 100}
+    before := self assertOk: worker server
+    self.provider rotateKeyTo: "key-2"
+    self.provider slow: "/jwks" by: 400
+    Erlang gen_server cast: worker oidccWorker with: #refresh_jwks
+    Erlang timer sleep: 600
+    self assert: (self assertOk: worker server) equals: before
+    Erlang timer sleep: 100
+    after := self assertOk: worker server
+    self deny: after =:= before
+    self.provider slow: "/jwks" by: 0
+    self exchange: after
+    self assert: (self.provider hits: "/jwks") equals: 2
+
   testBadCacheOptionsAreRefused =>
     #(#cacheTtl, #minJwksReloadInterval)
       do: [:opt |
@@ -178,6 +203,26 @@ TestCase subclass: ProviderWorkerTest
             self assert: (err description includesSubstring: opt asString)
           ]
       ]
+
+  testBadDeadlineIsRefused =>
+    #(0, -1, "soon")
+      do: [:value |
+        err := (ProviderWorker
+          issuer: self.provider issuer
+          preset: #{}
+          options: (self unsafe at: #deadline put: value)) error
+        self assert: err code equals: "config"
+        self assert: (err description includesSubstring: "deadline")
+      ]
+
+  testDeadlineOptionReachesServer =>
+    worker := self startWith: #{#deadline => 300}
+    server := self assertOk: worker server
+    self.provider slow: "/token" by: 1000
+    before := self now
+    result := self retrieve: server client: self confidential
+    self assertDeadline: result
+    self assert: self now - before < 800
 
   testPresetQuirksApply =>
     preset := ProviderPresets gitlab
@@ -527,13 +572,17 @@ TestCase subclass: ProviderWorkerTest
         worker stop
       ]
 
-  testSpentBudgetAsksNoWorkerReload =>
+  testSpentDeadlineAsksNoWorkerReload =>
     self.provider keyId: "key-1"
     worker := self start: #{}
     server := self assertOk: worker server
     self.provider rotateKeyTo: "key-2"
-    result := self retrieveWith: (self budgeted: server ms: 0) client: self confidential
-    self assert: result isError
+    // The unknown-kid refresh of an operation whose deadline is already
+    // spent (as by a slow token request).
+    opts := Erlang beamtalk_oauth_oidcc call_opts: (self budgeted: server ms: 1)
+    Erlang timer sleep: 20
+    refreshed := (opts at: #refresh_jwks) value: nil value: "key-2"
+    self assert: refreshed equals: {#error, #deadline_exceeded}
     // No reload was asked of the worker (one would land within this).
     Erlang timer sleep: 200
     self assert: (self.provider hits: "/jwks") equals: 1
@@ -541,7 +590,7 @@ TestCase subclass: ProviderWorkerTest
     self exchange: server
     self assert: (self.provider hits: "/jwks") equals: 2
 
-  testSlowWorkerReloadIsBoundedByBudget =>
+  testSlowWorkerReloadIsBoundedByDeadline =>
     self.provider keyId: "key-1"
     worker := self start: #{}
     server := self assertOk: worker server
@@ -550,11 +599,11 @@ TestCase subclass: ProviderWorkerTest
     before := self now
     result := self retrieveWith: (self budgeted: server ms: 300) client: self confidential
     elapsed := self now - before
-    // The wait for the worker's slow reload ends with the budget.
-    self assert: result isError
+    // The wait for the worker's slow reload ends with the deadline.
+    self assertDeadline: result
     self assert: elapsed < 1200
 
-  testSlowDirectLoadIsBoundedByBudget =>
+  testSlowDirectLoadIsBoundedByDeadline =>
     self.provider keyId: "key-1"
     worker := self startWith: #{
       #backoffMin => 60000,
@@ -571,8 +620,8 @@ TestCase subclass: ProviderWorkerTest
     before := self now
     result := self retrieveWith: (self budgeted: server ms: 300) client: self confidential
     elapsed := self now - before
-    // The direct load times out at what is left of the budget.
-    self assert: result isError
+    // The direct load times out at what is left of the deadline.
+    self assertDeadline: result
     self assert: elapsed < 1200
     self assert: (self.provider hits: "/jwks") equals: 4
 
