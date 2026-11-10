@@ -30,7 +30,7 @@ typed Value subclass: OAuthError
   /// HTTP status when the error came from a provider response.
   field: status :: Integer | Nil = nil
   /// The original error term, redacted of secrets.
-  field: detail :: Object = nil
+  field: detail :: Dynamic = nil
 
   /// An error with `code` and `description` and no status or detail.
   class code: code :: String description: description :: String -> OAuthError =>
@@ -107,7 +107,7 @@ typed Value subclass: OAuthError
   /// `secrets` (the tokens and client secret the request carried) replaced
   /// by the marker first (see `scrub:secrets:`), so a provider error that
   /// echoes a token cannot carry it into `description` or `detail`.
-  class fromOidcc: reason :: Object secrets: secrets :: List(String) -> OAuthError =>
+  class fromOidcc: reason :: Dynamic secrets: secrets :: List(String) -> OAuthError =>
     // An FFI `{error, R}` arrives as `Result error:` an Exception whose
     // `reason` is `R`.
     term := (reason isKindOf: Exception) ifTrue: [

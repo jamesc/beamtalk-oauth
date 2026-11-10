@@ -695,7 +695,7 @@ TestCase subclass: ProviderWorkerTest
       #issuer => self.provider issuer,
       #options => self unsafe
     }
-    child := (sup childWithId: #provider) unwrap
+    child := self providerChildOf: sup
     self exchange: (self assertOk: child server)
     // The oidcc worker crashing takes the ProviderWorker with it, and the
     // supervisor restarts both.
@@ -705,6 +705,10 @@ TestCase subclass: ProviderWorkerTest
     sup stop
 
   // The running #provider child once it is no longer `old`.
+  // The supervisor's #provider child (childWithId: answers it untyped).
+  providerChildOf: sup :: ProviderWorkerSup -> Dynamic =>
+    (sup childWithId: #provider) unwrap
+
   waitForRestartOf: old in: sup :: ProviderWorkerSup =>
     current := nil
     tries := 0
