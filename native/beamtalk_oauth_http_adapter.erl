@@ -41,10 +41,13 @@ endpoints a userinfo response names before `oidcc` fetches them
 With `deadline => At` in the config (absolute, in
 `erlang:monotonic_time(millisecond)`), the operation's deadline set by
 `beamtalk_oauth_oidcc:call_opts/1`, each request times out at what is
-left of it, or at `oidcc`'s timeout if that is sooner. Once nothing is
-left no request starts. A spent deadline, or a request that failed
-without a response once the deadline had passed, answers
-`{error, deadline_exceeded}` (not wrapped in `http_client`).
+left of it, or at `oidcc`'s timeout if that is sooner, and runs in a
+helper process killed once the deadline passes (`HTTPClient`'s timeout
+alone does not bound a response that trickles in). Once nothing is left
+no request starts. A spent deadline, a request cut off by it, or one
+that failed without a response once the deadline had passed (but did
+not crash), answers `{error, deadline_exceeded}` (not wrapped in
+`http_client`).
 
 A `200` answer to a `GET` of a discovery document is handed to
 `beamtalk_oauth_oidcc:mark_discovery/3`, which marks a document that
@@ -133,14 +136,49 @@ request(Method, Request, HttpOptions, _RequestOptions, #{client := Client} = Con
             {error, deadline_exceeded};
         Left ->
             observe(Request, started, Config),
-            Answer =
+            Answer = within(Left, fun() ->
                 try
                     do_request(Method, Request, clamp(HttpOptions, Left), Client, Config)
                 catch
                     Class:_Reason -> {error, {http_client, {raised, Class}}}
-                end,
+                end
+            end),
             observe(Request, outcome(Answer), Config),
             past_deadline(Answer, Config)
+    end.
+
+%% `Fun()' (a request), cut off after `Left' ms. `HTTPClient`'s timeout
+%% bounds connecting and the wait for each read, not the whole response:
+%% a server that trickles its answer could run past the deadline. So with
+%% a deadline the request runs in a helper process, killed (closing its
+%% socket) once `Left' has passed; the answer is then
+%% `{error, deadline_exceeded}'. A body captured in the helper (`capture')
+%% is put in the caller's dictionary.
+within(infinity, Fun) ->
+    Fun();
+within(Left, Fun) ->
+    Tag = make_ref(),
+    Caller = self(),
+    {Pid, Monitor} = spawn_monitor(fun() ->
+        Answer = Fun(),
+        Caller ! {Tag, Answer, get(?CAPTURE_KEY)}
+    end),
+    receive
+        {Tag, Answer, Captured} ->
+            erlang:demonitor(Monitor, [flush]),
+            Captured =/= undefined andalso put(?CAPTURE_KEY, Captured),
+            Answer;
+        {'DOWN', Monitor, process, Pid, _Reason} ->
+            {error, {http_client, {raised, exit}}}
+    after Left ->
+        exit(Pid, kill),
+        erlang:demonitor(Monitor, [flush]),
+        %% An answer sent just before the kill is dropped.
+        receive
+            {Tag, _, _} -> ok
+        after 0 -> ok
+        end,
+        {error, deadline_exceeded}
     end.
 
 %% Milliseconds left of the config's `deadline' (absolute, monotonic ms),
@@ -159,7 +197,9 @@ clamp(HttpOptions, Left) ->
     [{timeout, Timeout} | proplists:delete(timeout, HttpOptions)].
 
 %% A request that failed (no response) once the deadline had passed was
-%% cut short by it: `{error, deadline_exceeded}'.
+%% cut short by it: `{error, deadline_exceeded}'. A crash stays a crash.
+past_deadline({error, {http_client, {raised, _}}} = Answer, _Config) ->
+    Answer;
 past_deadline({error, {http_client, _}} = Answer, Config) ->
     case time_left(Config) of
         0 -> {error, deadline_exceeded};

@@ -172,6 +172,24 @@ TestCase subclass: ProviderWorkerTest
     self exchange: after
     self assert: (self.provider hits: "/jwks") equals: 2
 
+  testBackgroundLoadsIgnoreDeadline =>
+    // The worker's own loads are not operations: a slow JWKS load longer
+    // than #deadline still lands.
+    self.provider keyId: "key-1"
+    worker := self startWith: #{#cacheTtl => 100, #deadline => 100}
+    before := self assertOk: worker server
+    self.provider rotateKeyTo: "key-2"
+    self.provider slow: "/jwks" by: 400
+    Erlang gen_server cast: worker oidccWorker with: #refresh_jwks
+    Erlang timer sleep: 600
+    self assert: (self assertOk: worker server) equals: before
+    Erlang timer sleep: 100
+    after := self assertOk: worker server
+    self deny: after =:= before
+    self.provider slow: "/jwks" by: 0
+    self exchange: after
+    self assert: (self.provider hits: "/jwks") equals: 2
+
   testBadCacheOptionsAreRefused =>
     #(#cacheTtl, #minJwksReloadInterval)
       do: [:opt |

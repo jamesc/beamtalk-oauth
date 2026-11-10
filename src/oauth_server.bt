@@ -52,8 +52,16 @@
 /// request) if that is sooner, and once it is spent no request starts.
 /// The operation then answers a `transport` error that says the deadline
 /// was exceeded; a key rotation during a slow exchange reports that too,
-/// not a missing key. Discovery itself and `TokenRevocation` are not
-/// bounded by it.
+/// not a missing key. Discovery itself and `TokenRevocation`
+/// (`OAuthFlows revoke:` and `tokenInfo:`) are not bounded by it.
+///
+/// The deadline caps `#timeout`, and it applies whoever calls, not only
+/// an actor. A script or plain process talking to a token endpoint that
+/// takes longer than 4.5 s can raise `#deadline`. A value of 5000 or more
+/// gives up the guarantee for callers inside an actor call. A refresh cut
+/// off by the deadline may already have been accepted by the provider:
+/// with rotating refresh tokens, the old one is then spent and the user
+/// must sign in again.
 ///
 /// ## Examples
 /// ```beamtalk
@@ -107,7 +115,8 @@ typed Value subclass: OAuthServer
   /// As `fromDiscovery:preset:`, with transport options:
   ///
   /// - `#maxBodyBytes` — the response cap (default 1 MiB);
-  /// - `#timeout` — per-request timeout in milliseconds;
+  /// - `#timeout` — per-request timeout in milliseconds, capped by what
+  ///   is left of `#deadline`;
   /// - `#deadline` — each operation's deadline in milliseconds, an
   ///   Integer > 0 (default 4500; see the class comment);
   /// - `#minJwksReloadInterval` — the least time (ms, an Integer >= 0)

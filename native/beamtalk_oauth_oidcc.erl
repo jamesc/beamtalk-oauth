@@ -158,8 +158,9 @@ Discovery: load the provider configuration for `Issuer` and its JWKS.
 * `max_body_bytes` — the response cap, default 1 MiB;
 * `timeout` — per-request timeout in milliseconds;
 * `deadline` — the deadline of each later operation on the provider, in
-  milliseconds: a positive Integer, default 4500 (see `call_opts/1`). It
-  does not bound discovery itself;
+  milliseconds: a positive Integer, default 4500 (see `call_opts/1`);
+  anything else answers `{error, {invalid_option, deadline}}`. It does
+  not bound discovery itself;
 * `min_jwks_reload_interval` — the least time (ms) between two JWKS
   reloads for a token that names an unknown `kid`, default 30 s (see
   `call_opts/1`).
@@ -179,6 +180,7 @@ discover(Issuer0, Opts) when is_map(Opts) ->
     Unsafe = maps:get(allow_unsafe_http, Opts, false) =:= true,
     LoadOpts = #{request_opts := RequestOpts} = load_opts(Opts),
     maybe
+        {ok, Deadline} ?= deadline(Opts),
         ok ?= check_unsafe_allowed(Unsafe),
         ok ?= check_url(issuer, Issuer, Unsafe),
         {ok, {Config, _ConfigExpiry}} ?=
@@ -188,7 +190,7 @@ discover(Issuer0, Opts) when is_map(Opts) ->
         {ok, {Jwks, JwksExpiry}} ?= oidcc_provider_configuration:load_jwks(JwksUri, LoadOpts),
         ok = keep_discovered_jwks(JwksUri, Jwks, JwksExpiry),
         Interval = maps:get(min_jwks_reload_interval, Opts, ?MIN_JWKS_RELOAD_INTERVAL),
-        Source = #{jwks_reload_interval => Interval, deadline => deadline(Opts)},
+        Source = #{jwks_reload_interval => Interval, deadline => Deadline},
         {ok, provider_info(Config, Jwks, RequestOpts, Source)}
     end.
 
@@ -448,12 +450,12 @@ multi-second waits.
 with_deadline({beamtalk_oauth_provider, Ctx}, Ms) when is_integer(Ms), Ms >= 0 ->
     {beamtalk_oauth_provider, Ctx#{deadline => Ms}}.
 
-%% The `deadline' option when it is a positive Integer, else the default.
-%% (`OAuthServer' and `ProviderWorker' refuse any other value first.)
+%% `{ok, Ms}' for the `deadline' option (default 4500), which must be a
+%% positive Integer; `{error, {invalid_option, deadline}}' otherwise.
 deadline(Opts) ->
     case maps:get(deadline, Opts, ?DEFAULT_DEADLINE) of
-        Ms when is_integer(Ms), Ms > 0 -> Ms;
-        _ -> ?DEFAULT_DEADLINE
+        Ms when is_integer(Ms), Ms > 0 -> {ok, Ms};
+        _ -> {error, {invalid_option, deadline}}
     end.
 
 %% Milliseconds left before `Deadline', at least 0.

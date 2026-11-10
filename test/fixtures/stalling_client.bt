@@ -1,0 +1,22 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+/// StallingClient — an `HTTPClient` stand-in whose request takes 2 s
+/// whatever `#timeout` it is given, as a response that trickles in a few
+/// bytes at a time does (`HTTPClient`'s timeout bounds each read, not the
+/// whole response). Tests hand it to the HTTP adapter as its `client` to
+/// show the deadline cuts the request off regardless.
+///
+/// ## Examples
+/// ```beamtalk
+/// StallingClient stallMs   // => 2000
+/// ```
+Object subclass: StallingClient
+
+  /// How long each request takes, in milliseconds.
+  class stallMs -> Integer => 2000
+
+  /// The `HTTPClient` request protocol: wait, then answer an error.
+  class request: _method :: Object url: _url :: Object options: _opts :: Dictionary -> Result =>
+    Erlang timer sleep: self stallMs
+    Result error: "stalled"

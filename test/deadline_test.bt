@@ -77,17 +77,33 @@ TestCase subclass: DeadlineTest
     self assert: elapsed < 800
 
   testKeyRotationDuringSlowExchangeAnswersDeadline =>
-    server := self discover: #{#deadline => 600}
+    server := self discover: #{#deadline => 900}
     self.provider rotateKeyTo: "key-2"
-    self.provider slow: "/token" by: 400
-    self.provider slow: "/jwks" by: 1000
+    self.provider slow: "/token" by: 300
+    self.provider slow: "/jwks" by: 2000
     before := self now
     result := self exchangeWith: server
     elapsed := self now - before
-    // The token request used most of the deadline; the reload for the new
+    // The token request used part of the deadline; the reload for the new
     // key runs out of it: the deadline is reported, not a missing key.
     self assertDeadline: result
-    self assert: elapsed < 1000
+    self assert: (self.provider hits: "/jwks") equals: 2
+    self assert: elapsed < 1600
+
+  testStalledResponseIsCutOff =>
+    // A request whose client overruns its own timeout (as a trickling
+    // response does) is still cut off at the deadline.
+    config := #{#client => StallingClient, #deadline => self now + 200}
+    before := self now
+    result := Erlang beamtalk_oauth_http_adapter
+      request: #get
+      with: {Binary fromIolist: #("https://idp.example/token"), #()}
+      with: #()
+      with: #()
+      with: config
+    self assert: (OAuthError fromOidcc: result error) code equals: "transport"
+    self assert: ((OAuthError fromOidcc: result error) description includesSubstring: "deadline exceeded")
+    self assert: self now - before < 1000
 
   testSlowRefreshAnswersDeadline =>
     toks := (self exchangeWith: (self discover: #{})) unwrap
@@ -146,3 +162,12 @@ TestCase subclass: DeadlineTest
     #(0, -1, "soon", 1.5) do: [:value |
       self should: [self discover: #{#deadline => value}] raise: #signal
     ]
+
+  testShimRefusesBadDeadline =>
+    // The Erlang API refuses it too, rather than using the default.
+    found := Erlang beamtalk_oauth_oidcc discover: self.provider issuer with: #{
+      #client => HTTPClient,
+      #allow_unsafe_http => true,
+      #deadline => 0
+    }
+    self assert: (OAuthError fromOidcc: found error) code equals: "invalid_option"

@@ -131,8 +131,13 @@ The default deadline sits under the 5 s timeout of a Beamtalk actor
 call, so an operation made inside one answers an `OAuthError` before the
 call itself times out. When the deadline runs out, the operation answers
 `transport` with a description that says the deadline was exceeded.
-Raise `#deadline` only if every caller waits longer than 5 s. Discovery
-and `TokenRevocation` are not bounded by it.
+The deadline applies whoever calls, not only an actor, and caps
+`#timeout`. A script or plain process that talks to a token endpoint
+slower than 4.5 s can raise `#deadline`; a value of 5000 or more gives up
+the guarantee for callers inside an actor call. A refresh cut off by the
+deadline may already have been accepted by the provider: with rotating
+refresh tokens the old one is then spent, and the user must sign in
+again. Discovery, `revoke:` and `tokenInfo:` are not bounded by it.
 
 ## Server-side web apps
 
