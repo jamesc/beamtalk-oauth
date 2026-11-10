@@ -108,9 +108,10 @@ TestCase subclass: NativeLayerTest
       with: self adapterConfig
     self assert: got isError
     reason := got error reason
-    self assert: ((reason isKindOf: Tuple) and: [
-      (reason at: 1) =:= #http_client
-    ])
+    self assert: (reason isKindOf: Tuple)
+    (reason isKindOf: Tuple) ifTrue: [
+      self assert: (reason at: 1) equals: #http_client
+    ]
     text := reason printString
     self deny: (text includesSubstring: "c2VjcmV0")
     self deny: (text includesSubstring: "abc123")
@@ -362,9 +363,10 @@ TestCase subclass: NativeLayerTest
     resp := (HTTPClient get: url headers: #(#("authorization", "Bearer at-1"))) unwrap
     self assert: resp status equals: 200
     claims := (Json parse: resp body asStringUnchecked) unwrap
-    self assert: ((claims isKindOf: Dictionary) and: [
-      (claims at: "sub") =:= "user-1"
-    ])
+    self assert: (claims isKindOf: Dictionary)
+    (claims isKindOf: Dictionary) ifTrue: [
+      self assert: (claims at: "sub") equals: "user-1"
+    ]
 
   // ===== httpc guard =====
   testGuardCountsCalls =>
