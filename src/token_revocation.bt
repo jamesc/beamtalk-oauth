@@ -357,9 +357,9 @@ Object subclass: TokenRevocation
   /// `"expires_in": "3599"`); nil otherwise.
   class integerOf: value :: Object -> Integer | Nil =>
     (value isKindOf: Integer) ifTrue: [^value]
-    ((value isKindOf: String) and: [
-      value matchesRegex: "^[0-9]+$"
-    ]) ifTrue: [^value asInteger]
+    (value isKindOf: String) ifTrue: [
+      (value matchesRegex: "^[0-9]+$") ifTrue: [^value asInteger]
+    ]
     nil
 
   // ===== Shared =====

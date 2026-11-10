@@ -436,9 +436,12 @@ Object subclass: OAuthFlows
     (query isKindOf: String) ifFalse: [^nil]
     raw := query
     parsed := Erlang uri_string parse: query
-    ((parsed isKindOf: Dictionary) and: [
-      parsed includesKey: #scheme
-    ]) ifTrue: [raw := (parsed at: #query ifAbsent: [""]) asStringUnchecked]
+    (parsed isKindOf: Dictionary)
+      ifTrue: [
+        (parsed includesKey: #scheme) ifTrue: [
+          raw := (parsed at: #query ifAbsent: [""]) asStringUnchecked
+        ]
+      ]
     (raw startsWith: "?") ifTrue: [raw := raw drop: 1]
     raw isEmpty ifTrue: [^#()]
     dissected := Erlang uri_string dissect_query: raw
