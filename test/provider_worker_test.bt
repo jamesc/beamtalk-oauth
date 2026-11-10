@@ -507,8 +507,10 @@ TestCase subclass: ProviderWorkerTest
     self.provider rotateKeyTo: "key-2"
     result := self retrieveWith: (self budgeted: server ms: 0) client: self confidential
     self assert: result isError
+    // No reload was asked of the worker (one would land within this).
+    Erlang timer sleep: 200
     self assert: (self.provider hits: "/jwks") equals: 1
-    // No reload used up the worker's interval: the next exchange reloads.
+    // None used up the worker's interval: the next exchange reloads.
     self exchange: server
     self assert: (self.provider hits: "/jwks") equals: 2
 
