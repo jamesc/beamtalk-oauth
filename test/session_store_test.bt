@@ -536,12 +536,13 @@ TestCase subclass: SessionStoreTest
     self assert: (store consume: self.session state boundTo: self.binding) error code equals: "expired_session"
 
   testRestoreWithSystemClockKeepsTheExpiry =>
-    store := SessionStore spawnWith: #{#ttl => 300}
+    // Wide margins: test classes run concurrently, so a tight TTL flakes.
+    store := SessionStore spawnWith: #{#ttl => 1000}
     store create: self.session boundTo: self.binding
     taken := (store consume: self.session state boundTo: self.binding) unwrap
-    Timer sleep: 200
+    Timer sleep: 300
     (store restore: taken boundTo: self.binding) unwrap
-    Timer sleep: 150
+    Timer sleep: 900
     self assert: (store consume: self.session state boundTo: self.binding) error code equals: "expired_session"
 
   testRestoreOfAnExpiredSessionStoresNothing =>

@@ -154,8 +154,8 @@ reason into an exception, and the caller needs the reason itself.
 check(Config) ->
     case validate(Config) of
         {ok, _Issuer} -> nil;
-        {error, {config, Text}} -> {config, {beamtalk_string, Text}};
-        {error, {insecure_endpoint, Field, Url}} -> {insecure_endpoint, Field, {beamtalk_string, Url}}
+        {error, {config, Text}} -> {config, str(Text)};
+        {error, {insecure_endpoint, Field, Url}} -> {insecure_endpoint, Field, str(Url)}
     end.
 
 %% `{ok, Issuer}' for a good config, else `{error, Reason}'.
@@ -273,7 +273,7 @@ handle_call({beamtalk_oauth_unknown_kid, Kid}, From, #{worker := Worker} = State
             end
     end;
 handle_call({issuer, []}, _From, #{issuer := Issuer} = State) ->
-    {reply, {ok, {beamtalk_string, Issuer}}, State};
+    {reply, {ok, str(Issuer)}, State};
 handle_call({oidccWorker, []}, _From, #{worker := Worker} = State) ->
     {reply, {ok, Worker}, State};
 handle_call({Selector, _Args}, _From, State) ->
@@ -466,21 +466,26 @@ build(
                 provider_worker => Self,
                 jwks_reload_interval => Interval
             }),
-            beamtalk_result:'ok:'(send_class('OAuthServer', 'fromShim:preset:', [Info, Preset]));
+            beamtalk_native_api:result_from_tuple(
+                {ok, send_class('OAuthServer', 'fromShim:preset:', [Info, Preset])}
+            );
         {error, Reason} ->
             error_result(Reason)
     end.
 
 error_result(Reason) ->
-    beamtalk_result:'makeError:'(send_class('OAuthError', 'fromOidcc:', [Reason])).
+    %% `Result error:` keeps the OAuthError itself as the reason;
+    %% `result_from_tuple/1` would wrap it in an Exception.
+    send_class('Result', 'error:', [send_class('OAuthError', 'fromOidcc:', [Reason])]).
 
-%% A class-side send to one of this package's classes. Native code has no
-%% supported send API yet (BT-4556); the HTTP adapter uses the same call.
+%% A class-side send through the runtime's supported native API.
 send_class(ClassName, Selector, Args) ->
-    case beamtalk_class_registry:resolve_class_object(ClassName) of
-        undefined -> erlang:error({class_not_loaded, ClassName});
-        Class -> beamtalk_message_dispatch:send(Class, Selector, Args)
+    case beamtalk_native_api:class_named(ClassName) of
+        {ok, Class} -> beamtalk_native_api:send(Class, Selector, Args);
+        {error, _} -> erlang:error({class_not_loaded, ClassName})
     end.
+
+str(B) -> beamtalk_native_api:string_from_binary(B).
 
 %% The `server' reply for the cache, built once per cache contents (the
 %% `OAuthServer' is an immutable value).
@@ -634,10 +639,17 @@ fetch(Worker, Call, Deadline) ->
 
 issuer(Config) ->
     case maps:get(issuer, Config, nil) of
-        {beamtalk_string, B} when is_binary(B), B =/= <<>> -> {ok, B};
         B when is_binary(B), B =/= <<>> -> {ok, B};
-        _ -> {error, {config, <<"ProviderWorker needs an #issuer String">>}}
+        V ->
+            try beamtalk_native_api:string_to_binary(V) of
+                <<>> -> issuer_error();
+                B -> {ok, B}
+            catch
+                error:_ -> issuer_error()
+            end
     end.
+
+issuer_error() -> {error, {config, <<"ProviderWorker needs an #issuer String">>}}.
 
 preset(Config) ->
     case maps:get(preset, Config, #{}) of
@@ -712,7 +724,9 @@ unknown_options_text(Unknown) ->
 http_client(Config) ->
     case maps:find(client, Config) of
         {ok, Client} -> Client;
-        error -> beamtalk_class_registry:resolve_class_object('HTTPClient')
+        error ->
+            {ok, Client} = beamtalk_native_api:class_named('HTTPClient'),
+            Client
     end.
 
 %% The oidcc worker's load options, with the HTTP adapter told to report

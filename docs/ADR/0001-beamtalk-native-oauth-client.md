@@ -501,9 +501,13 @@ lands in browser history.
   on every `oidcc` call, so `oidcc` never touches `httpc` (a test guard
   fails the suite on any `httpc:request` call). The adapter sends
   `request:url:options:` to the `HTTPClient` class object passed in its
-  config (via `beamtalk_message_dispatch:send/3` until BT-4556 provides
-  a supported API) and converts the returned `Result` and
-  `HTTPResponse` to what `oidcc` expects. TLS verification, no-redirect behaviour,
+  config through `beamtalk_native_api`, the runtime's supported API for
+  native code (BT-4556): `send/4` with a bound above the request timeout,
+  `string_from_binary/1` / `string_to_binary/1` for Strings and
+  `result_to_tuple/1` for the `Result`, with the `HTTPResponse` read through
+  its `status`, `headers` and `body` accessors. It converts those to what
+  `oidcc` expects. No `native/` module builds or matches a runtime value
+  layout by hand. TLS verification, no-redirect behaviour,
   `#maxBodyBytes` and (later) proxy settings are then identical for
   every provider call.
 - **Proxies.** Desktop apps on corporate networks need them, and neither
@@ -775,7 +779,8 @@ Slice plan (sizes rough, calibrated on `beamtalk-mint` and the
     `beamtalk_message_dispatch:send/3`. Beamtalk Strings cross as
     `{beamtalk_string, Bin}` and a `Result` arrives as a map
     (`isOk`/`okValue`/`errReason`), so the adapter tags outgoing values
-    and untags responses into the `httpc` shape `oidcc` expects.
+    and untags responses into the `httpc` shape `oidcc` expects. (BT-4571
+    later moved this to `beamtalk_native_api`; see "Seams and rules".)
   - Done: `oidcc` discovery plus JWKS for GitLab and Google over the
     adapter.
   - Done: `oidcc_token:retrieve` against a local `HTTPServer` fixture
