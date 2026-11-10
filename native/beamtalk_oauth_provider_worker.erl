@@ -101,6 +101,10 @@ refuses non-HTTPS URLs; `oidcc` alone would fetch a plain-HTTP `jwks_uri`.
 %% given.
 -define(LOAD_REQUEST_TIMEOUT, 10000).
 
+%% oidcc's request timeout when none is given (a `timeout' that is not a
+%% positive Integer is dropped).
+-define(OIDCC_REQUEST_TIMEOUT, 60000).
+
 %% How long a background cache read waits: a full configuration plus JWKS
 %% load at the request timeout, with room to spare.
 -define(CACHE_READ_TIMEOUT, 30000).
@@ -198,9 +202,10 @@ init(Config) ->
                         last_kid_reload => undefined,
                         kid_waiters => none,
                         kid_reload_failed => false,
+                        kid_load_mark => none,
                         config_load => ok,
                         jwks_load => ok,
-                        load_stale => 3 * maps:get(timeout, Options, ?LOAD_REQUEST_TIMEOUT),
+                        load_stale => 3 * request_timeout(Options),
                         kid_reload_interval =>
                             maps:get(minJwksReloadInterval, Options, ?MIN_JWKS_RELOAD_INTERVAL)
                     }};
@@ -298,7 +303,17 @@ kid_reload(Kid, From, #{worker := Worker} = State0, Now) ->
             end,
         Self ! {beamtalk_oauth_kid_reloaded, Failed}
     end),
-    {noreply, State0#{last_kid_reload => Now, kid_waiters => []}}.
+    %% The JWKS counts as running from the cast, as for `refresh'
+    %% (`start_reloads/2'), so a `refresh' before the load starts casts no
+    %% second one. A unique mark, so the end of this reload can tell a load
+    %% that never started from one that did.
+    Mark = {loading, Now, make_ref()},
+    {noreply, State0#{
+        last_kid_reload => Now,
+        kid_waiters => [],
+        jwks_load := Mark,
+        kid_load_mark => Mark
+    }}.
 
 %% From `beamtalk_oauth_oidcc:call_opts/1': keys the caller loaded itself
 %% after this worker answered `undefined'. They are newer than the cache, so
@@ -374,10 +389,18 @@ handle_info({beamtalk_oauth_load, Kind, Event}, State) when
     {noreply, State#{Part := Load}};
 %% An unknown-kid reload ended (its read handled just before): callers that
 %% came in meanwhile get the keys now cached.
-handle_info({beamtalk_oauth_kid_reloaded, Failed}, #{kid_waiters := Waiters} = State) ->
-    Reply = cached_jwks(State),
+%% If the JWKS still counts as running from the reload's own cast (no load
+%% started: the oidcc worker had the key, or the read gave up first), it
+%% is idle again.
+handle_info({beamtalk_oauth_kid_reloaded, Failed}, #{kid_waiters := Waiters} = State0) ->
+    Reply = cached_jwks(State0),
     lists:foreach(fun(From) -> gen_server:reply(From, Reply) end, Waiters),
-    {noreply, State#{kid_waiters := none, kid_reload_failed := Failed}};
+    State =
+        case State0 of
+            #{jwks_load := Mark, kid_load_mark := Mark} -> State0#{jwks_load := ok};
+            _ -> State0
+        end,
+    {noreply, State#{kid_waiters := none, kid_reload_failed := Failed, kid_load_mark => none}};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -541,6 +564,7 @@ idle(Part, State, Now) ->
     case maps:get(Part, State) of
         ok -> true;
         {loading, Since} -> Now - Since >= maps:get(load_stale, State);
+        {loading, Since, _Mark} -> Now - Since >= maps:get(load_stale, State);
         failed -> false
     end.
 
@@ -688,6 +712,15 @@ observed(LoadOpts, Observer) ->
     LoadOpts#{
         request_opts := RequestOpts#{http_adapter := {Adapter, Config#{load_observer => Observer}}}
     }.
+
+%% The request timeout the oidcc worker's loads use: `timeout' when it is a
+%% positive Integer, as `beamtalk_oauth_oidcc:request_opts/1' takes it,
+%% else oidcc's own default.
+request_timeout(Options) ->
+    case maps:get(timeout, Options, ?LOAD_REQUEST_TIMEOUT) of
+        T when is_integer(T), T > 0 -> T;
+        _ -> ?OIDCC_REQUEST_TIMEOUT
+    end.
 
 %% The `discover/2' options for this client, preset and options.
 shim_opts(Client, Preset, Options) ->

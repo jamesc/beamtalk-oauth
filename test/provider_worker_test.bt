@@ -500,6 +500,33 @@ TestCase subclass: ProviderWorkerTest
     Erlang timer sleep: 700
     srv stop
 
+  testKidReloadWithNoLoadLeavesRefreshFree =>
+    // An unknown-kid reload counts the JWKS as loading from its cast; when
+    // the oidcc worker already has the key no load starts, and refresh
+    // must still reload the JWKS afterwards.
+    self.provider keyId: "key-1"
+    worker := self startWith: #{#minJwksReloadInterval => 0, #backoffMin => 50}
+    old := self assertOk: worker server
+    self.provider rotateKeyTo: "key-2"
+    self exchange: old
+    self assert: (self.provider hits: "/jwks") equals: 2
+    // The oidcc worker holds key-2 now: this reload loads nothing.
+    self exchange: old
+    self assert: (self.provider hits: "/jwks") equals: 2
+    Erlang timer sleep: 60
+    worker refresh
+    self assert: (self.provider hits: "/jwks") equals: 3
+
+  testOddTimeoutStillTracksLoads =>
+    // A #timeout the request options drop (not a positive Integer) falls
+    // back to oidcc's default, for the load tracking too.
+    #(0, -5, "soon")
+      do: [:value |
+        worker := self startWith: #{#timeout => value}
+        self assertOk: worker server
+        worker stop
+      ]
+
   testSpentBudgetAsksNoWorkerReload =>
     self.provider keyId: "key-1"
     worker := self start: #{}
