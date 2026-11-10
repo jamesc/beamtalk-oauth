@@ -7,6 +7,11 @@
 TestCase subclass: RevocationTest
   field: provider = nil
 
+  // testDerivedPlainHttpEndpointNeedsTestFlag clears the global
+  // beamtalk_oauth/allow_unsafe_http_for_tests flag, which every
+  // fixture-backed test class relies on: run alone, not concurrently.
+  class serial -> Boolean => true
+
   setUp =>
     HttpcGuard install
     self.provider := FixtureProvider start
