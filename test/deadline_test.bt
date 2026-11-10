@@ -1,0 +1,148 @@
+// Copyright 2026 James Casey
+// SPDX-License-Identifier: Apache-2.0
+
+// The per-operation `#deadline` (BT-4639): every request an operation
+// makes (token, JWKS reload, userinfo) draws from one deadline, and a
+// spent deadline answers a `transport` error that says so, not an
+// actor-call timeout or a missing key. Small deadlines are injected
+// rather than waiting out the 4.5 s default. No test hits the network or
+// httpc (HttpcGuard).
+
+TestCase subclass: DeadlineTest
+  field: provider = nil
+  field: reg = nil
+  field: store = nil
+  field: binding = nil
+
+  setUp =>
+    HttpcGuard install
+    self.provider := FixtureProvider start
+    // A named key, so a rotation shows up as an unknown kid.
+    self.provider keyId: "key-1"
+    self.reg := (ClientRegistration
+      forClient: FixtureProvider clientId
+      secret: FixtureProvider clientSecret
+      redirect: "http://127.0.0.1:50278/callback") unwrap
+    self.store := SessionStore spawn
+    self.binding := Secrets generate
+    self
+
+  tearDown =>
+    self.store stop
+    self.provider stop
+    self assert: HttpcGuard calls equals: 0
+    nil
+
+  // The fixture provider, discovered with the test-only opt-in plus `opts`.
+  discover: opts :: Dictionary -> OAuthServer =>
+    all := #{#allowUnsafeHttp => true}
+    opts keysAndValuesDo: [:k :v | all := all at: k put: v]
+    (OAuthServer
+      fromDiscovery: self.provider issuer
+      preset: #{}
+      options: all) unwrap
+
+  // A code exchange through `server`, for a fresh stored session.
+  exchangeWith: server :: OAuthServer -> Result =>
+    sess := OAuthSession newSessionFor: server client: self.reg
+    (self.store create: sess boundTo: self.binding) unwrap
+    self.provider claims: #{"nonce" => sess nonce}
+    cb := (OAuthFlows
+      handleCallback: #(#("code", "code-1"), #("state", sess state))
+      store: self.store
+      boundTo: self.binding) unwrap
+    OAuthFlows
+      exchangeCode: server
+      client: self.reg
+      callback: cb
+      store: self.store
+
+  now -> Integer => Erlang erlang monotonic_time: #millisecond
+
+  // `result` failed with the deadline error.
+  assertDeadline: result :: Result =>
+    self assert: result isError
+    err := result error
+    self assert: err code equals: "transport"
+    self assert: (err description includesSubstring: "deadline exceeded")
+
+  testSlowTokenEndpointAnswersDeadline =>
+    server := self discover: #{#deadline => 300}
+    self.provider slow: "/token" by: 1000
+    before := self now
+    result := self exchangeWith: server
+    elapsed := self now - before
+    self assertDeadline: result
+    // Within the deadline (plus scheduling slack), not at the slow answer.
+    self assert: elapsed < 800
+
+  testKeyRotationDuringSlowExchangeAnswersDeadline =>
+    server := self discover: #{#deadline => 600}
+    self.provider rotateKeyTo: "key-2"
+    self.provider slow: "/token" by: 400
+    self.provider slow: "/jwks" by: 1000
+    before := self now
+    result := self exchangeWith: server
+    elapsed := self now - before
+    // The token request used most of the deadline; the reload for the new
+    // key runs out of it: the deadline is reported, not a missing key.
+    self assertDeadline: result
+    self assert: elapsed < 1000
+
+  testSlowRefreshAnswersDeadline =>
+    toks := (self exchangeWith: (self discover: #{})) unwrap
+    server := self discover: #{#deadline => 300}
+    self.provider slow: "/token" by: 1000
+    before := self now
+    result := OAuthFlows
+      refresh: server
+      client: self.reg
+      tokenSet: toks
+    self assertDeadline: result
+    self assert: self now - before < 800
+
+  testSlowUserInfoAnswersDeadline =>
+    toks := (self exchangeWith: (self discover: #{})) unwrap
+    server := self discover: #{#deadline => 300}
+    self.provider slow: "/userinfo" by: 1000
+    before := self now
+    result := OAuthFlows
+      userInfo: server
+      client: self.reg
+      tokenSet: toks
+    self assertDeadline: result
+    self assert: self now - before < 800
+
+  testDeadlineIsPerOperation =>
+    // Each operation starts its own deadline: two exchanges that each take
+    // most of it both succeed.
+    server := self discover: #{#deadline => 1500}
+    self.provider slow: "/token" by: 600
+    toks := (self exchangeWith: server) unwrap
+    self assert: (self exchangeWith: server) isOk
+    self
+      assert: (OAuthFlows
+        refresh: server
+        client: self.reg
+        tokenSet: toks) isOk
+
+  testDefaultDeadlineKeepsNormalFlows =>
+    server := self discover: #{}
+    self.provider slow: "/token" by: 200
+    toks := (self exchangeWith: server) unwrap
+    self.provider rotateKeyTo: "key-2"
+    self
+      assert: (OAuthFlows
+        refresh: server
+        client: self.reg
+        tokenSet: toks) isOk
+    self
+      assert: (OAuthFlows
+        userInfo: server
+        client: self.reg
+        tokenSet: toks) isOk
+
+  testBadDeadlineRaises =>
+    #(0, -1, "soon", 1.5) do: [:value |
+      self should: [self discover: #{#deadline => value}] raise: #signal
+    ]

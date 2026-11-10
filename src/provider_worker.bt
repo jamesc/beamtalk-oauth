@@ -44,18 +44,22 @@
 /// worker the same way while its JWKS load is running or failed, and load
 /// the keys directly instead.
 ///
-/// The unknown-key reload has a 4.5 s budget, under the 5 s actor-call
-/// timeout, counted from the start of the call that validates (so a slow
-/// token request uses part of it). The wait for the worker and any direct
-/// load share it; once it is spent no load starts, and the token fails
-/// validation.
+/// The unknown-key reload draws from the operation's deadline (`#deadline`,
+/// default 4500 ms, under the 5 s actor-call timeout; see "Deadlines" in
+/// `OAuthServer`), counted from the start of the call that validates, so a
+/// slow token request uses part of it. The wait for the worker and any
+/// direct load share it; once it is spent no load starts, and the call
+/// answers a `transport` error that says the deadline was exceeded. The
+/// worker's own background loads are not bounded by it.
 ///
 /// The worker holds no secrets; `sys:get_status` shows only its issuer and
 /// the `oidcc` worker's pid.
 ///
 /// Options, as for `OAuthServer fromDiscovery:preset:options:`
-/// (`#maxBodyBytes`, `#timeout`, test-only `#allowUnsafeHttp`, which
-/// also needs the test flag described there), plus
+/// (`#maxBodyBytes`, `#timeout`, `#deadline` (an Integer > 0, the
+/// deadline of each operation on a server it answers), test-only
+/// `#allowUnsafeHttp`, which also needs the test flag described there),
+/// plus
 /// `#backoffMin` and `#backoffMax` (ms) and `#backoffType`
 /// (`#exponential`, `#random`, `#random_exponential`) for failed loads,
 /// and `#cacheTtl` and `#minJwksReloadInterval` (ms, Integers >= 0).
