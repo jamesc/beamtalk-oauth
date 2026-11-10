@@ -215,6 +215,68 @@ TestCase subclass: NativeLayerTest
     checked := Erlang beamtalk_oauth_oidcc check_https: endpoints with: false
     self assert: (OAuthError fromOidcc: checked error) code equals: "insecure_endpoint"
 
+  testClaimSourceCheck =>
+    // Claims as oidcc has them: decoded JSON, raw binary keys.
+    claims := [:endpoint |
+      Erlang json
+        decode: (self
+          bin: (Json
+            generate: #{
+              "sub" => "user-1",
+              "_claim_names" => #{"c" => "b"},
+              "_claim_sources" => #{
+                "a" => #{"JWT" => "e30.e30.sig"},
+                "b" => #{"endpoint" => endpoint, "access_token" => "x"}
+              }
+            }))
+    ]
+    check := [:endpoint :unsafe |
+      Erlang beamtalk_oauth_oidcc check_claim_sources: (claims value: endpoint) with: unsafe
+    ]
+    self assert: (check value: "https://claims.test/b" value: false) isOk
+    insecure := check value: "http://claims.test/b" value: false
+    err := OAuthError fromOidcc: insecure error
+    self assert: err code equals: "insecure_endpoint"
+    self assert: err description equals: "claim_source must be https: http://claims.test/b"
+    // The loopback opt-in applies, as for every other endpoint.
+    self assert: (check value: "http://127.0.0.1:1/b" value: true) isOk
+    self assert: (check value: "http://127.0.0.1:1/b" value: false) isError
+    self assert: (check value: "http://claims.test/b" value: true) isError
+    // Credentials in the URL stay out of the error.
+    secretUrl := check value: "http://u:pw@claims.test/b?access_token=t#f" value: false
+    self assert: (OAuthError fromOidcc: secretUrl error) description equals: "claim_source must be https: http://claims.test/b"
+    // Not a URL, or not text: refused.
+    self assert: (check value: "mailto:x@y.test" value: false) isError
+    self assert: (check value: "/relative" value: false) isError
+    self assert: (check value: 42 value: false) isError
+    // What oidcc would not fetch is not checked: sources without
+    // `_claim_names`, and a source that carries an aggregated JWT.
+    noNames := Erlang json
+      decode: (self
+        bin: (Json generate: #{
+          "_claim_sources" => #{"b" => #{"endpoint" => "http://claims.test/b"}}
+        }))
+    self assert: (Erlang beamtalk_oauth_oidcc check_claim_sources: noNames with: false) isOk
+    both := Erlang json
+      decode: (self
+        bin: (Json
+          generate: #{
+            "_claim_names" => #{"c" => "b"},
+            "_claim_sources" => #{
+              "b" => #{
+                "JWT" => "e30.e30.sig",
+                "endpoint" => "http://claims.test/b"
+              }
+            }
+          }))
+    self assert: (Erlang beamtalk_oauth_oidcc check_claim_sources: both with: false) isOk
+    // No sources, or claims that are not a map: nothing to check.
+    noSources := Erlang json decode: (self bin: (Json generate: #{
+      "sub" => "u"
+    }))
+    self assert: (Erlang beamtalk_oauth_oidcc check_claim_sources: noSources with: false) isOk
+    self assert: (Erlang beamtalk_oauth_oidcc check_claim_sources: #(1, 2) with: false) isOk
+
   testClockSkewIsSet =>
     skew := (Erlang application get_env: #oidcc with: #max_clock_skew) unwrap
     self assert: skew equals: 60

@@ -829,3 +829,311 @@ TestCase subclass: OAuthFlowsTest
     desc := got error description
     self deny: (desc includesSubstring: "\n")
     self assert: desc size <= OAuthFlows maxEchoSize
+
+  // ===== Distributed claims =====
+  // The fixture rediscovered with signed userinfo (ES256) allowed: a
+  // distributed claim is a JWT validated against the userinfo algorithms.
+  signedUserinfoServer -> OAuthServer =>
+    self.provider discoveryOverrides: #{
+      "userinfo_signing_alg_values_supported" => #("ES256")
+    }
+    self discover: #{}
+
+  // Userinfo claims for `user-1` naming the claim `claimN` from the source
+  // `srcN` at the Nth of `endpoints`.
+  claimsWithSources: endpoints :: List -> Dictionary =>
+    names := #{}
+    sources := #{}
+    (1 to: endpoints size)
+      do: [:i |
+        names := names at: "claim{i}" put: "src{i}"
+        sources := sources at: "src{i}" put: #{
+          "endpoint" => (endpoints at: i),
+          "access_token" => "ext-at"
+        }
+      ]
+    #{"sub" => "user-1", "_claim_names" => names, "_claim_sources" => sources}
+
+  // Answer `/userinfo` with `claims` as JSON.
+  userinfoAnswers: claims :: Dictionary -> Nil =>
+    self.provider
+      respond: "/userinfo"
+      status: 200
+      body: (Json generate: claims)
+      contentType: "application/json"
+    nil
+
+  // The userinfo claims for `toks`, with the test's registration.
+  userInfoFor: toks :: TokenSet -> Result =>
+    OAuthFlows
+      userInfo: self.server
+      client: self.reg
+      tokenSet: toks
+
+  testDistributedClaimsFromAnAllowedEndpoint =>
+    self.server := self signedUserinfoServer
+    toks := self exchange
+    // The source answers a JWT signed with the provider's key.
+    self.provider claims: #{"claim1" => #("admins")}
+    self.provider
+      respond: "/claims"
+      status: 200
+      body: self.provider idToken
+      contentType: "application/jwt"
+    self.provider claims: #{}
+    self userinfoAnswers: (self claimsWithSources: #("{self.provider issuer}/claims"))
+    info := (self userInfoFor: toks) unwrap
+    self assert: (info at: "claim1") equals: #("admins")
+    self assert: (self.provider hits: "/claims") equals: 1
+
+  testInsecureClaimSourceFailsBeforeAnyFetch =>
+    self.server := self signedUserinfoServer
+    toks := self exchange
+    self userinfoAnswers: (self claimsWithSources: #("{self.provider issuer}/claims", "http://claims.example.test/groups"))
+    log := EventLog spawn
+    log listenTo: #(#beamtalk_oauth, #http_adapter, #refused)
+    err := (self userInfoFor: toks) error
+    log detach
+    self assert: err code equals: "insecure_endpoint"
+    self assert: (err description includesSubstring: "claim_source")
+    self assert: (err description includesSubstring: "http://claims.example.test/groups")
+    // The refusal is visible to telemetry, like a refused request URL.
+    self assert: (log events includes: #{#reason => #insecure_claim_source})
+    log stop
+    // The allowed source was not fetched either.
+    self assert: (self.provider hits: "/claims") equals: 0
+
+  testInsecureClaimSourceInSignedUserinfo =>
+    self.server := self signedUserinfoServer
+    toks := self exchange
+    sources := self claimsWithSources: #("{self.provider issuer}/claims", "http://claims.example.test/groups")
+    self.provider
+      claims: #{
+        "_claim_names" => (sources at: "_claim_names"),
+        "_claim_sources" => (sources at: "_claim_sources")
+      }
+    self.provider
+      respond: "/userinfo"
+      status: 200
+      body: self.provider idToken
+      contentType: "application/jwt"
+    err := (self userInfoFor: toks) error
+    self assert: err code equals: "insecure_endpoint"
+    self assert: (err description includesSubstring: "claim_source")
+    self assert: (self.provider hits: "/claims") equals: 0
+
+  testClaimSourcesAreFoundWhateverTheContentType =>
+    self.server := self signedUserinfoServer
+    toks := self exchange
+    // oidcc reads `application/jwt+json` as JSON; the check must too.
+    self.provider
+      respond: "/userinfo"
+      status: 200
+      body: (Json generate: (self claimsWithSources: #("{self.provider issuer}/claims", "http://claims.example.test/groups")))
+      contentType: "application/jwt+json"
+    err := (self userInfoFor: toks) error
+    self assert: err code equals: "insecure_endpoint"
+    self assert: (self.provider hits: "/claims") equals: 0
+
+  testClaimSourceUrlCredentialsStayOutOfTheError =>
+    toks := self exchange
+    self userinfoAnswers: (self claimsWithSources: #("http://user:pw-secret@claims.example.test/groups?access_token=qs-secret#frag"))
+    err := (self userInfoFor: toks) error
+    self assert: err code equals: "insecure_endpoint"
+    self assert: err description equals: "claim_source must be https: http://claims.example.test/groups"
+    text := err printString ++ err asJson printString ++ err detail printString
+    self deny: (text includesSubstring: "pw-secret")
+    self deny: (text includesSubstring: "qs-secret")
+
+  testAggregatedClaimNeedsNoEndpointCheck =>
+    toks := self exchange
+    // A source carrying an aggregated JWT has no endpoint to check; oidcc
+    // then validates the JWT (here, one it cannot verify).
+    self
+      userinfoAnswers: #{
+        "sub" => "user-1",
+        "_claim_names" => #{"claim1" => "src1"},
+        "_claim_sources" => #{"src1" => #{"JWT" => "e30.e30.sig"}}
+      }
+    err := (self userInfoFor: toks) error
+    // The JWT's header names no `alg`, which makes oidcc raise.
+    self assert: err code equals: "oidcc_crash"
+
+  // ===== Non-object JSON bodies =====
+  testNonObjectTokenBodyIsAnError =>
+    #("[1, 2]", """at-1""", "42", "null")
+      do: [:body |
+        sess := self newSession
+        self.provider
+          respond: "/token"
+          status: 200
+          body: body
+          contentType: "application/json"
+        got := self
+          exchange: self.server
+          client: self.reg
+          callback: (self callbackFor: sess)
+        self assert: (self codeOf: got) equals: "oidcc_crash"
+        self deny: (got error asJson printString includesSubstring: sess codeVerifier)
+      ]
+
+  testNonObjectRefreshBodyIsAnError =>
+    toks := self exchange
+    #("[1, 2]", """rt-1""", "42")
+      do: [:body |
+        self.provider
+          respond: "/token"
+          status: 200
+          body: body
+          contentType: "application/json"
+        got := OAuthFlows
+          refresh: self.server
+          client: self.reg
+          tokenSet: toks
+        self assert: (self codeOf: got) equals: "oidcc_crash"
+      ]
+
+  testNonObjectUserinfoBodyIsAnError =>
+    toks := self exchange
+    #("[1, 2]", """user-1""", "42", "null")
+      do: [:body |
+        self.provider
+          respond: "/userinfo"
+          status: 200
+          body: body
+          contentType: "application/json"
+        self assert: (self codeOf: (self userInfoFor: toks)) equals: "oidcc_crash"
+      ]
+
+  // ===== Pushed authorization requests =====
+  testPushedAuthorizationRequestGoesThroughTheAdapter =>
+    self.provider discoveryOverrides: #{
+      "pushed_authorization_request_endpoint" => "{self.provider issuer}/par"
+    }
+    self.server := self discover: #{}
+    requestUri := "urn:ietf:params:oauth:request_uri:par-1"
+    self.provider
+      respond: "/par"
+      status: 201
+      body: (Json generate: #{"request_uri" => requestUri, "expires_in" => 60})
+      contentType: "application/json"
+    sess := self newSession
+    url := (OAuthFlows
+      authorizeUrl: self.server
+      client: self.reg
+      scopes: #("openid")
+      session: sess) unwrap
+    q := self queryOf: url
+    self assert: (q at: "request_uri") equals: requestUri
+    self assert: (q at: "client_id") equals: FixtureProvider clientId
+    // The state and nonce went to the PAR endpoint, not into the URL.
+    self deny: (url includesSubstring: sess state)
+    self deny: (url includesSubstring: sess nonce)
+    self assert: (self.provider hits: "/par") equals: 1
+
+  testPushedAuthorizationRequestErrorIsRedacted =>
+    self.provider discoveryOverrides: #{
+      "pushed_authorization_request_endpoint" => "{self.provider issuer}/par"
+    }
+    self.server := self discover: #{}
+    sess := self newSession
+    self.provider
+      fail: "/par"
+      status: 400
+      body: #{
+        "error" => "invalid_request",
+        "error_description" => "client {FixtureProvider clientSecret} state {sess state}",
+        sess codeVerifier => sess nonce
+      }
+    err := (OAuthFlows
+      authorizeUrl: self.server
+      client: self.reg
+      scopes: #("openid")
+      session: sess) error
+    self assert: err code equals: "invalid_request"
+    self assert: err status equals: 400
+    self assertRedacted: err of: #(FixtureProvider clientSecret, sess state, sess nonce, sess codeVerifier)
+
+  // ===== Redaction =====
+  testRefreshErrorEchoingTheRefreshTokenIsRedacted =>
+    toks := self exchange
+    self.provider
+      fail: "/token"
+      status: 400
+      body: #{
+        "error" => "invalid_grant",
+        "error_description" => "refresh token rt-1 was revoked",
+        "refresh_token" => "rt-1",
+        "hint" => "rt-1",
+        "client" => FixtureProvider clientSecret,
+        "rt-1" => "revoked"
+      }
+    err := (OAuthFlows
+      refresh: self.server
+      client: self.reg
+      tokenSet: toks) error
+    self assert: err code equals: "invalid_grant"
+    self assert: err status equals: 400
+    self assertRedacted: err of: #("rt-1", FixtureProvider clientSecret)
+
+  testUserinfoErrorEchoingTheTokensIsRedacted =>
+    toks := self exchange
+    self.provider
+      fail: "/userinfo"
+      status: 401
+      body: #{
+        "error" => "invalid_token",
+        "error_description" => "token at-1 (refresh rt-1) expired",
+        "hint" => "rt-1"
+      }
+    err := (self userInfoFor: toks) error
+    self assert: err code equals: "invalid_token"
+    self assert: err status equals: 401
+    self assertRedacted: err of: #("rt-1", "at-1")
+
+  testExchangeErrorEchoingTheCodeIsRedacted =>
+    sess := self newSession
+    self.provider
+      fail: "/token"
+      status: 400
+      body: #{
+        "error" => "invalid_grant",
+        "error_description" => "code code-1 with verifier {sess codeVerifier}",
+        "secret" => FixtureProvider clientSecret
+      }
+    err := (self
+      exchange: self.server
+      client: self.reg
+      callback: (self callbackFor: sess)) error
+    self assert: err code equals: "invalid_grant"
+    self assertRedacted: err of: #("code-1", sess codeVerifier, FixtureProvider clientSecret)
+
+  // Assert that no part of `err` shows any of `secrets`.
+  assertRedacted: err :: OAuthError of: secrets :: List(String) -> Nil =>
+    text := err printString
+      ++ err description
+      ++ err asJson printString
+      ++ err detail printString
+    secrets do: [:secret | self deny: (text includesSubstring: secret)]
+    nil
+
+  // ===== Unsigned ID tokens =====
+  // `text` as unpadded base64url.
+  base64Url: text :: String -> String =>
+    text asBase64Url replaceAll: "=" with: ""
+
+  testAlgNoneIdTokenIsRejected =>
+    sess := self newSession
+    header := self base64Url: (Json generate: #{
+      "alg" => "none",
+      "typ" => "JWT"
+    })
+    payload := self base64Url: (Json generate: self.provider idTokenClaims)
+    self.provider tokenFields: #{"id_token" => "{header}.{payload}."}
+    got := self
+      exchange: self.server
+      client: self.reg
+      callback: (self callbackFor: sess)
+    // oidcc accepts only the advertised algorithms (ES256), so no key
+    // verifies an unsigned token.
+    self assert: (self codeOf: got) equals: "no_matching_key"

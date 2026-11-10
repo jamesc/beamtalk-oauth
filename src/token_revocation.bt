@@ -368,7 +368,7 @@ Object subclass: TokenRevocation
   /// (with its status and `error_description`) when the body is a JSON
   /// object that carries one, otherwise `transport` with the status.
   /// The body is never quoted, and any member that contains the token or
-  /// the client secret is redacted (see `scrub:secrets:`).
+  /// the client secret is redacted (see `OAuthError scrub:secrets:`).
   class errorFor: resp :: HTTPResponse doing: what :: String secrets: secrets :: List(String) -> OAuthError =>
     status := resp status
     body := self jsonOf: resp
@@ -376,7 +376,7 @@ Object subclass: TokenRevocation
       (body at: "error" ifAbsent: [nil]) isKindOf: String
     ])
       ifTrue: [
-        ^OAuthError fromOidcc: {#http_error, status, self scrub: body secrets: secrets}
+        ^OAuthError fromOidcc: {#http_error, status, OAuthError scrub: body secrets: secrets}
       ]
     OAuthError
       new: #{
@@ -384,39 +384,6 @@ Object subclass: TokenRevocation
         #description => "{what} answered HTTP {status}",
         #status => status
       }
-
-  /// `term` (parsed JSON) with every String that contains one of
-  /// `secrets`, raw or URL-encoded, replaced by `"[redacted]"`, at any
-  /// depth. Empty secrets are ignored.
-  class scrub: term :: Object secrets: secrets :: List(String) -> Object =>
-    (term isKindOf: String)
-      ifTrue: [
-        ^(self mentions: term secrets: secrets) ifTrue: [
-          OAuthError redacted
-        ] ifFalse: [term]
-      ]
-    (term isKindOf: List) ifTrue: [
-      ^term collect: [:each | self scrub: each secrets: secrets]
-    ]
-    (term isKindOf: Dictionary) ifFalse: [^term]
-    out := #{}
-    term keysAndValuesDo: [:k :v |
-      out := out at: k put: (self scrub: v secrets: secrets)
-    ]
-    out
-
-  /// True when `text` contains a non-empty member of `secrets`, raw or
-  /// URL-encoded.
-  class mentions: text :: String secrets: secrets :: List(String) -> Boolean =>
-    secrets
-      anySatisfy: [:secret |
-        secret isEmpty not
-          and: [
-            (text includesSubstring: secret) or: [
-              text includesSubstring: secret urlEncoded
-            ]
-          ]
-      ]
 
   /// One `HTTPClient` request, answering `Result(HTTPResponse, OAuthError)`.
   /// Any failure, whether a `Result error:` or a raised `Error` (whose
@@ -443,7 +410,7 @@ Object subclass: TokenRevocation
   class transportError: e :: Object secrets: secrets :: List(String) -> OAuthError =>
     message := (e respondsTo: #message) ifTrue: [e message] ifFalse: [nil]
     safe := (message isKindOf: String) and: [
-      (self mentions: message secrets: secrets) not
+      (OAuthError mentions: message secrets: secrets) not
     ]
     OAuthError transport: (safe ifTrue: [
       message

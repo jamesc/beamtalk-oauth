@@ -31,7 +31,9 @@ issuer with another provider's context is refused before any request
 
 Errors are `oidcc`'s own reasons, plus `{insecure_endpoint, Field, Url}`
 from the HTTPS-only check, `{http_client, Reason}` from the adapter,
-and, from this shim, `{missing_param, Key}`, `{session_mismatch, issuer}`,
+and, from this shim, `{insecure_endpoint, claim_source, Url}` (a
+userinfo `_claim_sources` endpoint that is not HTTPS),
+`{missing_param, Key}`, `{session_mismatch, issuer}`,
 `{issuer_mismatch, iss | missing_iss}`, `missing_id_token`,
 `no_userinfo_endpoint` and `{oidcc_crash, Class}` (an exception inside
 `oidcc`, caught so its stacktrace cannot carry secrets).
@@ -51,6 +53,7 @@ and, from this shim, `{missing_param, Key}`, `{session_mismatch, issuer}`,
     client_context/3,
     call_opts/1,
     check_https/2,
+    check_claim_sources/2,
     authorize_url/3,
     check_endpoints/2,
     retrieve_token/3,
@@ -392,14 +395,16 @@ map of URLs, as in `mtls_endpoint_aliases`) is HTTPS;
 With `AllowUnsafe`, plain HTTP is also accepted on a loopback host
 (`127.0.0.1`, `::1`, `localhost`), never elsewhere. Absent fields
 (`undefined`, `null`, `nil`) are skipped. The HTTP adapter checks each
-request URL as the field `request_url`.
+request URL as the field `request_url`, and `check_claim_sources/2` each
+distributed-claim endpoint as `claim_source`.
 """.
 -spec check_https(Endpoints :: map(), AllowUnsafe :: boolean()) ->
     ok | {error, {insecure_endpoint, atom() | binary(), term()}}.
 check_https(Endpoints, AllowUnsafe) when is_map(Endpoints) ->
     Fields = [
         F
-     || F <- ?ENDPOINT_FIELDS ++ [mtls_endpoint_aliases, request_url], maps:is_key(F, Endpoints)
+     || F <- ?ENDPOINT_FIELDS ++ [mtls_endpoint_aliases, request_url, claim_source],
+        maps:is_key(F, Endpoints)
     ],
     check_fields(Fields, Endpoints, AllowUnsafe =:= true).
 
@@ -727,6 +732,17 @@ Userinfo from `Provider` with `oidcc_userinfo:retrieve/3`, the answer's
 `sub` checked against `expected_subject` (`{error, bad_subject}`
 otherwise).
 
+A userinfo response may name distributed claims (OpenID Connect Core
+§5.6.2), which `oidcc` fetches from each `_claim_sources[].endpoint`.
+The adapter hands a JSON or signed-JWT userinfo response to
+`check_claim_sources/2` before `oidcc` sees it, so a source endpoint that
+is not HTTPS fails the call with `{insecure_endpoint, claim_source, Url}`
+before any source is fetched, and before `oidcc` checks the response's
+signature and subject. An encrypted userinfo JWT cannot be read there:
+its plain-HTTP sources are refused one by one by the adapter's own
+request-URL check (`{http_client, insecure_url}`), after any HTTPS
+source listed before them has been fetched.
+
 `Client` is as for `retrieve_token/3` (the id is the expected audience
 of a signed userinfo response); `Params` is
 `#{issuer, access_token, token_type, expected_subject}`. Answers
@@ -745,13 +761,113 @@ userinfo({beamtalk_oauth_provider, _} = Provider, Client, Params) when
         ok ?= check_issuer(Provider, Issuer),
         Context = client_context(Provider, ClientId, maps:get(client_secret, Client, nil)),
         Access = #oidcc_token_access{token = AccessToken, type = Type},
-        Opts = (call_opts(Provider))#{expected_subject => Subject},
+        Opts = (claim_source_check(Provider, call_opts(Provider)))#{
+            expected_subject => Subject
+        },
         ok ?= check_userinfo_endpoint(Provider),
         {ok, Claims} ?= guard(fun() -> oidcc_userinfo:retrieve(Access, Context, Opts) end),
         {ok, to_beamtalk(Claims)}
     end;
 userinfo(_Provider, _Client, _Params) ->
     {error, invalid_provider}.
+
+%% `Opts` with the adapter told to run `check_claim_sources/2` on a
+%% successful response from `Provider`'s userinfo endpoint (or its mTLS
+%% alias), before `oidcc` reads it and fetches any distributed claims.
+claim_source_check(
+    {beamtalk_oauth_provider, #{config := Config}},
+    #{request_opts := #{http_adapter := {Mod, Cfg}} = RequestOpts} = Opts
+) ->
+    #oidcc_provider_configuration{
+        userinfo_endpoint = Endpoint, mtls_endpoint_aliases = Aliases
+    } = Config,
+    Urls = [
+        iolist_to_binary(U)
+     || U <- [Endpoint, maps:get(<<"userinfo_endpoint">>, aliases(Aliases), undefined)],
+        is_binary(U) orelse is_list(U)
+    ],
+    Check = fun
+        (get, Url, {ok, {{_, 200, _}, _Headers, Body}}, Unsafe) ->
+            case lists:member(iolist_to_binary(Url), Urls) of
+                true -> check_claim_sources(userinfo_claims(Body), Unsafe);
+                false -> ok
+            end;
+        (_Method, _Url, _Answer, _Unsafe) ->
+            ok
+    end,
+    Opts#{request_opts := RequestOpts#{http_adapter := {Mod, Cfg#{response_check => Check}}}}.
+
+aliases(Map) when is_map(Map) -> Map;
+aliases(_) -> #{}.
+
+-doc """
+`ok` when every distributed-claim source endpoint in a userinfo claims
+map is HTTPS (or, with `AllowUnsafe`, plain HTTP on a loopback host), as
+`check_https/2` decides; `{error, {insecure_endpoint, claim_source, Url}}`
+for the first that is not.
+
+The sources checked are the ones `oidcc` would fetch: claims with both
+`_claim_names` and `_claim_sources`, and in `_claim_sources` each source
+with an `endpoint` and no aggregated `JWT`. A source with an endpoint
+that is not text fails. `Url` in the error is the endpoint without its
+user info, query or fragment, which can carry credentials.
+""".
+-spec check_claim_sources(Claims :: term(), AllowUnsafe :: boolean()) ->
+    ok | {error, {insecure_endpoint, claim_source, binary()}}.
+check_claim_sources(#{<<"_claim_names">> := _, <<"_claim_sources">> := Sources}, Unsafe) when
+    is_map(Sources)
+->
+    check_sources(maps:values(Sources), Unsafe);
+check_claim_sources(_Claims, _Unsafe) ->
+    ok.
+
+check_sources([], _Unsafe) ->
+    ok;
+check_sources([#{<<"JWT">> := _Aggregated} | Rest], Unsafe) ->
+    check_sources(Rest, Unsafe);
+check_sources([#{<<"endpoint">> := Endpoint} | Rest], Unsafe) ->
+    case check_https(#{claim_source => Endpoint}, Unsafe) of
+        ok -> check_sources(Rest, Unsafe);
+        {error, _} -> {error, {insecure_endpoint, claim_source, display_url(Endpoint)}}
+    end;
+check_sources([_Other | Rest], Unsafe) ->
+    check_sources(Rest, Unsafe).
+
+%% `Url` as `scheme://host[:port]/path`, for an error: the user info,
+%% query and fragment of a provider-supplied URL can carry credentials.
+display_url(Url) when is_binary(Url) ->
+    case uri_string:parse(Url) of
+        #{} = Parts ->
+            Kept = maps:with([scheme, host, port, path], Parts),
+            case uri_string:recompose(Kept) of
+                Bin when is_binary(Bin) -> Bin;
+                _ -> <<"[invalid URL]">>
+            end;
+        _ ->
+            <<"[invalid URL]">>
+    end;
+display_url(_NotText) ->
+    <<"[invalid URL]">>.
+
+%% The claims of a userinfo response body, read without validation (only
+%% to find `_claim_sources`): a JSON object, else the payload of a signed
+%% compact JWT. The content type is not consulted, so no type `oidcc`
+%% reads differently can hide the sources. Anything else (an encrypted
+%% JWT, a malformed body) is `#{}`; `oidcc` judges the body itself.
+userinfo_claims(Body) ->
+    try
+        json:decode(Body)
+    catch
+        _:_ -> jws_payload(Body)
+    end.
+
+jws_payload(Body) ->
+    try
+        [_Header, Payload, _Signature] = binary:split(Body, <<".">>, [global]),
+        json:decode(base64:decode(Payload, #{mode => urlsafe, padding => false}))
+    catch
+        _:_ -> #{}
+    end.
 
 %% The text values of `Keys` in `Map`, or `{error, {missing_param, Key}}`
 %% for the first that is absent or not text (nil included).

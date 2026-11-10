@@ -19,7 +19,8 @@ as a map. Requests are tagged on the way out; responses are converted
 back to the `httpc` shape `oidcc` expects: lowercase charlist header names
 and a binary body.
 
-Every failure answers `{error, {http_client, Reason}}`, where `Reason` is
+Every failure but a `response_check` refusal (below) answers
+`{error, {http_client, Reason}}`, where `Reason` is
 the `HTTPClient` error's message (a binary) or a fixed atom. It never
 carries the request: no URL query, headers or body, which hold codes,
 secrets and tokens.
@@ -29,6 +30,13 @@ response is also kept in the calling process's dictionary under
 `beamtalk_oauth_captured_body` (see `take_captured/0`). The shim uses
 this for refresh: `oidcc_token:refresh/3` discards a response that has
 no ID token, and the shim must still read it.
+
+With `response_check => Fun` in the config, each response is passed to
+`Fun(Method, Url, {ok, Response}, AllowUnsafe)` before `oidcc` sees it;
+an `{error, Reason}` from it is answered as is (not wrapped in
+`http_client`). The shim uses this to HTTPS-check the distributed-claim
+endpoints a userinfo response names before `oidcc` fetches them
+(`beamtalk_oauth_oidcc:check_claim_sources/2`).
 
 A `200` answer to a `GET` of a discovery document is handed to
 `beamtalk_oauth_oidcc:mark_discovery/3`, which marks a document that
@@ -42,7 +50,8 @@ before Beamtalk code sees the configuration. `allow_unsafe_http` (tests
 only) also admits plain HTTP on a loopback host, as
 `beamtalk_oauth_oidcc:check_https/2` does. Each refusal emits the
 telemetry event `[beamtalk_oauth, http_adapter, refused]` (metadata
-`#{reason => insecure_url}`), so a refused background load is visible.
+`#{reason => insecure_url}`, or `#{reason => insecure_claim_source}` for a
+`response_check` refusal), so a refused background load is visible.
 """.
 
 -behaviour(oidcc_http_adapter).
@@ -64,8 +73,9 @@ take_captured() ->
 
 -define(DEFAULT_MAX_BODY, 1048576).
 
-%% Emitted for every refused request, with `#{reason => insecure_url}' as
-%% metadata (never the URL).
+%% Emitted for every refused request or response, with
+%% `#{reason => insecure_url | insecure_claim_source}' as metadata (never
+%% the URL).
 -define(REFUSED_EVENT, [beamtalk_oauth, http_adapter, refused]).
 %% oidcc's own default; used when oidcc passes `infinity`, which
 %% `HTTPClient` does not accept.
@@ -82,7 +92,7 @@ malformed_headers | unsupported_ssl_options | insecure_url}}`); any crash answer
 """.
 -spec request(Method, Request, HttpOptions, RequestOptions, Config) ->
     {ok, {{string(), non_neg_integer(), string()}, [{string(), string()}], binary()}}
-    | {error, {http_client, term()}}
+    | {error, term()}
 when
     Method :: oidcc_http_adapter:method(),
     Request :: oidcc_http_adapter:request(),
@@ -91,7 +101,9 @@ when
     Config :: #{
         client := term(),
         max_body_bytes => non_neg_integer() | unlimited,
-        allow_unsafe_http => boolean()
+        allow_unsafe_http => boolean(),
+        capture => boolean(),
+        response_check => fun((atom(), term(), {ok, term()}, boolean()) -> ok | {error, term()})
     }.
 request(Method, Request, HttpOptions, _RequestOptions, #{client := Client} = Config) ->
     %% Everything runs inside the try: a crash anywhere here (a header
@@ -124,10 +136,26 @@ do_request(Method, Request, HttpOptions, Client, Config) ->
             beamtalk_message_dispatch:send(Client, 'request:url:options:', [Method, str(Url), Opts])
         ),
         capture(Method, Answer, Config),
+        ok ?= check_response(Method, Url, Answer, Config),
         mark_discovery(Method, Url, Answer)
     else
+        {response_refused, Reason} -> {error, Reason};
         {error, Reason} -> {error, {http_client, Reason}}
     end.
+
+%% The config's `response_check`, if any, on a response that arrived:
+%% `ok`, or `{response_refused, Reason}`, answered as `{error, Reason}`.
+check_response(Method, Url, {ok, _} = Answer, #{response_check := Check} = Config) when
+    is_function(Check, 4)
+->
+    case Check(Method, Url, Answer, unsafe(Config)) of
+        ok -> ok;
+        {error, Reason} ->
+            telemetry:execute(?REFUSED_EVENT, #{count => 1}, #{reason => insecure_claim_source}),
+            {response_refused, Reason}
+    end;
+check_response(_Method, _Url, _Answer, _Config) ->
+    ok.
 
 capture(post, {ok, {_Status, _Headers, Body}}, #{capture := true}) ->
     put(?CAPTURE_KEY, Body),
