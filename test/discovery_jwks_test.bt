@@ -29,9 +29,13 @@ TestCase subclass: DiscoveryJwksTest
       preset: #{}
       options: all) unwrap
 
-  retrieve: server :: OAuthServer -> Result =>
+  retrieve: server :: OAuthServer -> Result => self retrieveWith: server context
+
+  // An exchange through a provider context (say one with a small
+  // unknown-kid budget, `with_jwks_budget/2`).
+  retrieveWith: context -> Result =>
     Erlang beamtalk_oauth_oidcc
-      retrieve_token: server context
+      retrieve_token: context
       with: #{
         #client_id => FixtureProvider clientId,
         #client_secret => FixtureProvider clientSecret
@@ -95,6 +99,30 @@ TestCase subclass: DiscoveryJwksTest
     self assertOk: (self retrieve: fresh)
     self assertOk: (self retrieve: server)
     self assert: self jwksHits equals: 3
+
+  // ===== the 4.5 s budget (BT-4618) =====
+  testSlowReloadIsBoundedByBudget =>
+    server := self discover: #{}
+    self.provider rotateKeyTo: "key-2"
+    self.provider slow: "/jwks" by: 1500
+    context := Erlang beamtalk_oauth_oidcc with_jwks_budget: server context with: 300
+    before := Erlang erlang monotonic_time: #millisecond
+    result := self retrieveWith: context
+    elapsed := (Erlang erlang monotonic_time: #millisecond) - before
+    // The reload times out at what is left of the budget, well before the
+    // slow answer: validation fails instead of overrunning the call.
+    self assert: result isError
+    self assert: elapsed < 1200
+
+  testSpentBudgetStartsNoReload =>
+    server := self discover: #{}
+    self.provider rotateKeyTo: "key-2"
+    context := Erlang beamtalk_oauth_oidcc with_jwks_budget: server context with: 0
+    self assert: (self retrieveWith: context) isError
+    self assert: self jwksHits equals: 1
+    // No reload was claimed for the interval: one with time left loads.
+    self assertOk: (self retrieve: server)
+    self assert: self jwksHits equals: 2
 
   testBadIntervalRaises =>
     #(-1, "soon")

@@ -70,10 +70,21 @@ TestCase subclass: ProviderWorkerTest
     }
 
   retrieve: server :: OAuthServer client: client :: Dictionary -> Result =>
+    self retrieveWith: server context client: client
+
+  // An exchange through a provider context (say one with a small
+  // unknown-kid budget, `with_jwks_budget/2`).
+  retrieveWith: context client: client :: Dictionary -> Result =>
     Erlang beamtalk_oauth_oidcc
-      retrieve_token: server context
+      retrieve_token: context
       with: client
       with: self codeParams
+
+  // `server`'s context with an unknown-kid budget of `ms`.
+  budgeted: server :: OAuthServer ms: ms :: Integer =>
+    Erlang beamtalk_oauth_oidcc with_jwks_budget: server context with: ms
+
+  now -> Integer => Erlang erlang monotonic_time: #millisecond
 
   exchange: server :: OAuthServer -> Dictionary =>
     self assertOk: (self retrieve: server client: self confidential)
@@ -406,6 +417,81 @@ TestCase subclass: ProviderWorkerTest
     self.worker refresh
     self.worker refresh
     self assert: (self.provider hits: "/.well-known/openid-configuration") equals: 2
+
+  testRefreshDuringOutageAddsNoRetryChain =>
+    // BT-4618: each failed oidcc load starts its own backoff retry chain,
+    // so refresh leaves a part whose last load failed to the chain
+    // already retrying it.
+    discovery := "/.well-known/openid-configuration"
+    self.worker := (ProviderWorker
+      issuer: self.provider issuer
+      preset: #{}
+      options: #{
+        #allowUnsafeHttp => true,
+        #backoffMin => 50,
+        #backoffMax => 400,
+        #backoffType => #exponential
+      }) unwrap
+    self assertOk: self.worker server
+    loads := [(self.provider hits: discovery) + (self.provider hits: "/jwks")]
+    base := loads value
+    // The provider goes down: both loads fail.
+    self.provider failNext: discovery times: 1000
+    self.provider failNext: "/jwks" times: 1000
+    #(1, 2, 3, 4, 5, 6) do: [:i |
+      self assert: self.worker refresh equals: nil
+      Erlang timer sleep: 60
+    ]
+    // The first refresh's two loads, then the two chains' retries, their
+    // shared backoff doubling from 50 ms: the configuration at 50 and
+    // 250 ms, the JWKS at 100 (and maybe 500) ms. A chain per refresh
+    // would add two loads per refresh, 12 in all.
+    outage := loads value - base
+    self assert: outage >= 2
+    self assert: outage <= 7
+    // The provider recovers; each chain's next retry (within 400 ms)
+    // succeeds, and refresh reloads both again.
+    self.provider failNext: discovery times: 0
+    self.provider failNext: "/jwks" times: 0
+    Erlang timer sleep: 500
+    before := loads value
+    self.worker refresh
+    self assert: loads value equals: before + 2
+
+  testSlowWorkerReloadIsBoundedByBudget =>
+    self.provider keyId: "key-1"
+    worker := self start: #{}
+    server := self assertOk: worker server
+    self.provider rotateKeyTo: "key-2"
+    self.provider slow: "/jwks" by: 1500
+    before := self now
+    result := self retrieveWith: (self budgeted: server ms: 300) client: self confidential
+    elapsed := self now - before
+    // The wait for the worker's slow reload ends with the budget.
+    self assert: result isError
+    self assert: elapsed < 1200
+
+  testSlowDirectLoadIsBoundedByBudget =>
+    self.provider keyId: "key-1"
+    worker := self startWith: #{
+      #backoffMin => 60000,
+      #backoffMax => 60000,
+      #minJwksReloadInterval => 0
+    }
+    server := self assertOk: worker server
+    self.provider rotateKeyTo: "key-2"
+    // The worker's reload and the direct load both fail: the worker then
+    // answers at once that the caller should load the keys itself.
+    self.provider failNext: "/jwks" times: 2
+    self assert: (self retrieve: server client: self confidential) isError
+    self.provider slow: "/jwks" by: 1500
+    before := self now
+    result := self retrieveWith: (self budgeted: server ms: 300) client: self confidential
+    elapsed := self now - before
+    // The direct load times out at what is left of the budget.
+    self assert: result isError
+    self assert: elapsed < 1200
+    self assert: (self.provider hits: "/jwks") equals: 4
 
   testUnsafeHttpNeedsTestFlag =>
     unset := [

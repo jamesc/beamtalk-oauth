@@ -31,9 +31,14 @@ does `server` wait (up to 4.5 s, in a helper) for the first load. (The
 `oidcc` worker is not registered under a name, so its ETS read path is
 not used.)
 
-`refresh` comes through here and is rate-limited to one per `backoffMin`,
-so callers cannot pile reloads (each with its own oidcc backoff retry
-chain) onto a provider that is down. Unknown-`kid` reloads (from
+`refresh` comes through here and is rate-limited to one per `backoffMin`.
+Each failed `oidcc` load starts its own backoff retry chain, so `refresh`
+also skips a part (configuration or JWKS) whose last load failed: the
+chain already running for it keeps retrying, and `refresh` reloads that
+part again once a load of it succeeds. This process learns each load's
+outcome from the HTTP adapter (its `load_observer`, set on the `oidcc`
+worker's loads only); a load counts as failed when its response is not a
+`200`. Unknown-`kid` reloads (from
 `beamtalk_oauth_oidcc:call_opts/1`) are limited to one per
 `minJwksReloadInterval` (default 30 s). Within it no load starts: a
 caller gets the keys the reload under way reads, once it ends, or else
@@ -43,10 +48,10 @@ leaves the keys unchanged and still without the `kid` (the load failed,
 or the provider has no such key), the caller is told to load the keys
 itself (`undefined`), so a failed reload falls back to a direct load;
 the caller hands the keys it loads back (`beamtalk_oauth_direct_jwks`).
-Until the keys change, later unknown-`kid` reloads (still one per
-interval) skip the `oidcc` worker and go straight to that direct load:
-each failed `oidcc` load starts its own backoff retry chain, so casting
-reloads at a provider that is down would pile up chains.
+Until the keys change, and while the `oidcc` worker's last JWKS load
+failed, later unknown-`kid` reloads (still one per interval) skip the
+`oidcc` worker and go straight to that direct load, so casting reloads
+at a provider that is down does not pile up chains.
 The waits run in helper processes, answered with `gen_server:reply/2`.
 
 Config (the `spawnWith:` map, Symbol keys arriving as atoms):
@@ -166,7 +171,7 @@ init(Config) ->
             BackoffMin = maps:get(backoffMin, Options, 1000),
             WorkerOpts = #{
                 issuer => Issuer,
-                provider_configuration_opts => LoadOpts,
+                provider_configuration_opts => observed(LoadOpts, self()),
                 backoff_min => BackoffMin,
                 backoff_max => maps:get(backoffMax, Options, 30000),
                 backoff_type => maps:get(backoffType, Options, random_exponential)
@@ -189,6 +194,8 @@ init(Config) ->
                         last_kid_reload => undefined,
                         kid_waiters => none,
                         kid_reload_failed => false,
+                        config_failed => false,
+                        jwks_failed => false,
                         kid_reload_interval =>
                             maps:get(minJwksReloadInterval, Options, ?MIN_JWKS_RELOAD_INTERVAL)
                     }};
@@ -216,13 +223,19 @@ handle_call({server, []}, _From, State0) ->
     {reply, Reply, read_when_stale(State)};
 handle_call({refresh, []}, From, #{worker := Worker} = State0) ->
     State = reload(State0, last_reload, reload_interval, fun() ->
+        %% No reload of a part whose last load failed: oidcc's backoff
+        %% retry chain for it is still running, and a failed reload would
+        %% start a second chain beside it.
+        case State0 of
+            #{config_failed := false} -> gen_server:cast(Worker, refresh_configuration);
+            _ -> ok
+        end,
         %% A JWKS reload before any configuration has loaded crashes the
         %% oidcc worker (it reads `jwks_uri' from the missing
         %% configuration), so only the configuration is reloaded then; its
         %% first load chains the JWKS.
-        gen_server:cast(Worker, refresh_configuration),
         case State0 of
-            #{cache := {_, _}} -> gen_server:cast(Worker, refresh_jwks);
+            #{cache := {_, _}, jwks_failed := false} -> gen_server:cast(Worker, refresh_jwks);
             _ -> ok
         end
     end),
@@ -242,11 +255,14 @@ handle_call({beamtalk_oauth_unknown_kid, Kid}, From, #{worker := Worker} = State
             %% Within the interval: no load. The caller validates with the
             %% newest keys read, and fails if they lack `Kid'.
             {reply, cached_jwks(State0), State0};
-        {#{kid_reload_failed := true}, {true, Now}} ->
-            %% The last reload failed (or found no such key): no further
-            %% oidcc reload, whose failure would start another oidcc
-            %% backoff retry chain beside the first. The caller loads the
-            %% keys itself, and hands them back (`direct_jwks').
+        {#{kid_reload_failed := Failed, jwks_failed := LoadFailed}, {true, Now}} when
+            Failed orelse LoadFailed
+        ->
+            %% The last reload failed (or found no such key), or the oidcc
+            %% worker's last JWKS load failed: no further oidcc reload,
+            %% whose failure would start another oidcc backoff retry chain
+            %% beside the first. The caller loads the keys itself, and
+            %% hands them back (`direct_jwks').
             {reply, undefined, State0#{last_kid_reload => Now}};
         {_, {true, Now}} ->
             Self = self(),
@@ -334,6 +350,13 @@ handle_info({beamtalk_oauth_read, Background, Read}, #{cache := Cache} = State0)
                 State2
         end,
     {noreply, State};
+%% From the HTTP adapter, for each request the oidcc worker makes
+%% (`observed/2'): whether its last configuration or JWKS load failed, so
+%% that a backoff retry chain for it is running.
+handle_info({beamtalk_oauth_load, configuration, Outcome}, State) ->
+    {noreply, State#{config_failed := Outcome =:= failed}};
+handle_info({beamtalk_oauth_load, jwks, Outcome}, State) ->
+    {noreply, State#{jwks_failed := Outcome =:= failed}};
 %% An unknown-kid reload ended (its read handled just before): callers that
 %% came in meanwhile get the keys now cached.
 handle_info({beamtalk_oauth_kid_reloaded, Failed}, #{kid_waiters := Waiters} = State) ->
@@ -609,6 +632,15 @@ http_client(Config) ->
         {ok, Client} -> Client;
         error -> beamtalk_class_registry:resolve_class_object('HTTPClient')
     end.
+
+%% The oidcc worker's load options, with the HTTP adapter told to report
+%% each load's outcome to `Observer' (this process). Only the oidcc
+%% worker's loads carry it: the `request_opts' kept in the state, which
+%% servers built here use, do not.
+observed(#{request_opts := #{http_adapter := {Adapter, Config}} = RequestOpts} = LoadOpts, Observer) ->
+    LoadOpts#{
+        request_opts := RequestOpts#{http_adapter := {Adapter, Config#{load_observer => Observer}}}
+    }.
 
 %% The `discover/2' options for this client, preset and options.
 shim_opts(Client, Preset, Options) ->

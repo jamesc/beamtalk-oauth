@@ -43,6 +43,13 @@ A `200` answer to a `GET` of a discovery document is handed to
 leaves out `revocation_endpoint_auth_methods_supported` (so the marker
 survives `oidcc` applying the RFC 8414 default).
 
+With `load_observer => Pid` in the config, `Pid` is sent
+`{beamtalk_oauth_load, configuration | jwks, ok | failed}` after each
+request: `configuration` for a discovery document, else `jwks`, and `ok`
+for a `200` answer. `ProviderWorker` sets it on its `oidcc` worker's
+loads only, to learn which of them failed (and so has an `oidcc` backoff
+retry pending).
+
 Every URL must be HTTPS (`{error, {http_client, insecure_url}}`
 otherwise), whatever `oidcc` accepted: `oidcc` itself takes a plain-HTTP
 `jwks_uri`, and an `oidcc_provider_configuration_worker` fetches it
@@ -110,11 +117,35 @@ request(Method, Request, HttpOptions, _RequestOptions, #{client := Client} = Con
     %% value that is not iodata, a response of an unexpected shape) must
     %% not escape with the request in its stacktrace or arguments, where
     %% oidcc's telemetry span would re-emit it. It becomes a fixed reason.
-    try
-        do_request(Method, Request, HttpOptions, Client, Config)
-    catch
-        Class:_Reason -> {error, {http_client, {raised, Class}}}
-    end.
+    Answer =
+        try
+            do_request(Method, Request, HttpOptions, Client, Config)
+        catch
+            Class:_Reason -> {error, {http_client, {raised, Class}}}
+        end,
+    observe(Request, Answer, Config),
+    Answer.
+
+%% The config's `load_observer', if any, is told how the request went:
+%% `{beamtalk_oauth_load, configuration | jwks, ok | failed}', by whether
+%% the URL is a discovery document and whether the answer is a 200.
+observe(Request, Answer, #{load_observer := Observer}) when is_pid(Observer) ->
+    Kind =
+        try beamtalk_oauth_oidcc:is_discovery_url(element(1, Request)) of
+            true -> configuration;
+            false -> jwks
+        catch
+            _:_ -> jwks
+        end,
+    Outcome =
+        case Answer of
+            {ok, {{_, 200, _}, _, _}} -> ok;
+            _ -> failed
+        end,
+    Observer ! {beamtalk_oauth_load, Kind, Outcome},
+    ok;
+observe(_Request, _Answer, _Config) ->
+    ok.
 
 do_request(Method, Request, HttpOptions, Client, Config) ->
     maybe
