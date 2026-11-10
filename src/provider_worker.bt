@@ -15,7 +15,10 @@
 ///
 /// When a token names a key the server does not have, validation asks the
 /// worker to reload its JWKS, so the new key is kept for every later
-/// login (a `fromDiscovery:` server reloads for that one call only).
+/// login. Those reloads are limited to one per `#minJwksReloadInterval`
+/// (default 30 s): within it, a token naming a key the worker lacks fails
+/// validation without a fetch. If the worker's reload fails, validation
+/// loads the keys itself.
 ///
 /// The worker is an optimization, not a requirement: `fromDiscovery:`
 /// works everywhere (ADR 0001, Open Question 9). `oidcc` starts no
@@ -27,10 +30,11 @@
 /// (1 s to 30 s by default), and `server` answers `provider_unavailable`
 /// until a load succeeds.
 ///
-/// `server` never waits on a reload: the worker answers from the last
-/// configuration and keys it read, and picks up the `oidcc` worker's newer
-/// ones in the background. Reloads asked for by `refresh` or by an unknown
-/// key are rate-limited to one per `#backoffMin`.
+/// `server` never waits on a reload, and makes no call to the `oidcc`
+/// worker: it answers from the configuration and keys it last read. It
+/// re-reads them in the background at most once per `#cacheTtl` (default
+/// 60 s), and after an unknown-key reload. Reloads asked for by `refresh`
+/// are rate-limited to one per `#backoffMin`.
 ///
 /// The worker holds no secrets; `sys:get_status` shows only its issuer and
 /// the `oidcc` worker's pid.
@@ -39,7 +43,8 @@
 /// (`#maxBodyBytes`, `#timeout`, test-only `#allowUnsafeHttp`, which
 /// also needs the test flag described there), plus
 /// `#backoffMin` and `#backoffMax` (ms) and `#backoffType`
-/// (`#exponential`, `#random`, `#random_exponential`) for failed loads.
+/// (`#exponential`, `#random`, `#random_exponential`) for failed loads,
+/// and `#cacheTtl` and `#minJwksReloadInterval` (ms, Integers >= 0).
 ///
 /// ## In a supervision tree
 /// `supervisionSpecFor:` takes the same Dictionary as `startWith:`
@@ -140,7 +145,8 @@ Actor subclass: ProviderWorker native: beamtalk_oauth_provider_worker
     ] ifFalse: [OAuthError fromOidcc: problem]
 
   /// An `OAuthServer` from the worker's current configuration and JWKS.
-  /// Answers at once from the last configuration and keys read; only
+  /// Answers at once from the last configuration and keys read (see the
+  /// class comment on `#cacheTtl`); only
   /// before the first one does it wait (up to 4.5 s) for a load. Answers
   /// `provider_unavailable` while no load has succeeded, and
   /// `insecure_endpoint` if the configuration names a non-HTTPS endpoint.

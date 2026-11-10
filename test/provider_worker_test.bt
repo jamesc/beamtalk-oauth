@@ -32,6 +32,21 @@ TestCase subclass: ProviderWorkerTest
 
   unsafe -> Dictionary => #{#allowUnsafeHttp => true}
 
+  // A worker with the test-only opt-in plus `opts`.
+  startWith: opts :: Dictionary -> ProviderWorker =>
+    all := self unsafe
+    opts keysAndValuesDo: [:k :v | all := all at: k put: v]
+    self.worker := (ProviderWorker
+      issuer: self.provider issuer
+      preset: #{}
+      options: all) unwrap
+    self.worker
+
+  // Messages waiting in the oidcc worker's mailbox.
+  queuedAt: pid -> Integer =>
+    {_, n} := Erlang erlang process_info: pid with: #message_queue_len
+    n
+
   start: preset :: Dictionary -> ProviderWorker =>
     self.worker := (ProviderWorker
       issuer: self.provider issuer
@@ -90,6 +105,69 @@ TestCase subclass: ProviderWorkerTest
     self assert: (self.provider hits: "/.well-known/openid-configuration") equals: 1
     self assert: (self.provider hits: "/jwks") equals: 1
 
+  // ===== server cache =====
+  testServerMakesNoOidccCallWithinTtl =>
+    worker := self start: #{}
+    first := self assertOk: worker server
+    inner := worker oidccWorker
+    // A suspended oidcc worker answers nothing and queues every call.
+    Erlang sys suspend: inner
+    [
+      #(1, 2, 3) do: [:i |
+        self assert: (self assertOk: worker server) equals: first
+      ]
+      Erlang timer sleep: 50
+      self assert: (self queuedAt: inner) equals: 0
+    ] ensure: [Erlang sys resume: inner]
+
+  testServerRereadsAfterTtl =>
+    worker := self startWith: #{#cacheTtl => 100}
+    self assertOk: worker server
+    inner := worker oidccWorker
+    Erlang timer sleep: 150
+    Erlang sys suspend: inner
+    [
+      // Still answered from the cache at once; the re-read waits behind.
+      self assertOk: worker server
+      Erlang timer sleep: 50
+      self assert: (self queuedAt: inner) equals: 1
+      // One re-read at a time.
+      self assertOk: worker server
+      Erlang timer sleep: 50
+      self assert: (self queuedAt: inner) equals: 1
+    ] ensure: [Erlang sys resume: inner]
+
+  testServerFollowsReloadAfterTtl =>
+    self.provider keyId: "key-1"
+    worker := self startWith: #{#cacheTtl => 100}
+    before := self assertOk: worker server
+    // The oidcc worker's own reload (as its expiry timer would start it).
+    self.provider rotateKeyTo: "key-2"
+    Erlang gen_server cast: worker oidccWorker with: #refresh_jwks
+    Erlang timer sleep: 150
+    // The first call after the TTL answers the old keys and re-reads.
+    self assert: (self assertOk: worker server) equals: before
+    Erlang timer sleep: 100
+    after := self assertOk: worker server
+    self deny: after =:= before
+    // The re-read keys hold key-2: no unknown-kid reload is needed.
+    self exchange: after
+    self assert: (self.provider hits: "/jwks") equals: 2
+
+  testBadCacheOptionsAreRefused =>
+    #(#cacheTtl, #minJwksReloadInterval)
+      do: [:opt |
+        #(-1, "soon")
+          do: [:value |
+            err := (ProviderWorker
+              issuer: self.provider issuer
+              preset: #{}
+              options: (self unsafe at: opt put: value)) error
+            self assert: err code equals: "config"
+            self assert: (err description includesSubstring: opt asString)
+          ]
+      ]
+
   testPresetQuirksApply =>
     preset := ProviderPresets gitlab
     server := self assertOk: (self start: preset) server
@@ -115,6 +193,82 @@ TestCase subclass: ProviderWorkerTest
     // another JWKS load.
     self exchange: (self assertOk: worker server)
     self assert: (self.provider hits: "/jwks") equals: 2
+
+  testUnknownKidReloadIsRateLimited =>
+    self.provider keyId: "key-1"
+    worker := self start: #{}
+    server := self assertOk: worker server
+    self exchange: server
+    self.provider rotateKeyTo: "key-2"
+    self exchange: server
+    self assert: (self.provider hits: "/jwks") equals: 2
+    // Within #minJwksReloadInterval (30 s by default) an unknown kid gets
+    // the kept keys and no fetch, so validation fails.
+    self.provider rotateKeyTo: "key-3"
+    self assert: (self retrieve: server client: self confidential) isError
+    self assert: (self retrieve: (self assertOk: worker server) client: self confidential) isError
+    self assert: (self.provider hits: "/jwks") equals: 2
+
+  testUnknownKidReloadsAgainAfterInterval =>
+    self.provider keyId: "key-1"
+    worker := self startWith: #{#minJwksReloadInterval => 200}
+    server := self assertOk: worker server
+    self.provider rotateKeyTo: "key-2"
+    self exchange: server
+    self.provider rotateKeyTo: "key-3"
+    Erlang timer sleep: 250
+    self exchange: server
+    self assert: (self.provider hits: "/jwks") equals: 3
+
+  testWithinIntervalGetsTheKeptKeys =>
+    // A server built before a reload gets the worker's newer keys, without
+    // a fetch, for a kid they hold.
+    self.provider keyId: "key-1"
+    worker := self start: #{}
+    old := self assertOk: worker server
+    other := self assertOk: worker server
+    self.provider rotateKeyTo: "key-2"
+    self exchange: old
+    self exchange: other
+    self assert: (self.provider hits: "/jwks") equals: 2
+
+  testUnknownKidDuringReloadWaitsForIt =>
+    self.provider keyId: "key-1"
+    worker := self start: #{}
+    server := self assertOk: worker server
+    self.provider rotateKeyTo: "key-2"
+    self.provider slow: "/jwks" by: 300
+    table := Ets new: #bt4578_kid_reload type: #set
+    this := self
+    [
+      ok := (this retrieve: server client: this confidential) isOk
+      table at: #first put: ok
+    ] fork
+    Erlang timer sleep: 100
+    // The forked exchange's reload is under way: this one waits for its
+    // keys instead of failing with the old ones.
+    self exchange: server
+    tries := 0
+    [(table at: #first) isNil and: [tries < 100]]
+      whileTrue: [
+        tries := tries + 1
+        Erlang timer sleep: 20
+      ]
+    self assert: (table at: #first) equals: true
+    self assert: (self.provider hits: "/jwks") equals: 2
+    table delete
+
+  testFailedWorkerReloadFallsBackToDirect =>
+    self.provider keyId: "key-1"
+    worker := self startWith: #{#backoffMin => 60000, #backoffMax => 60000}
+    server := self assertOk: worker server
+    self exchange: server
+    self.provider rotateKeyTo: "key-2"
+    // The worker's reload gets a 503 and keeps the old keys; validation
+    // then loads the keys itself.
+    self.provider failNext: "/jwks" times: 1
+    self exchange: server
+    self assert: (self.provider hits: "/jwks") equals: 3
 
   testRotationAfterWorkerStopsStillValidates =>
     self.provider keyId: "key-1"
