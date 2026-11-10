@@ -787,9 +787,7 @@ claim_source_check(
         is_binary(U) orelse is_list(U)
     ],
     Check = fun
-        (get, Url, {ok, {{_, Status, _}, _Headers, Body}}, Unsafe) when
-            Status =:= 200; Status =:= 201
-        ->
+        (get, Url, {ok, {{_, 200, _}, _Headers, Body}}, Unsafe) ->
             case lists:member(iolist_to_binary(Url), Urls) of
                 true -> check_claim_sources(userinfo_claims(Body), Unsafe);
                 false -> ok

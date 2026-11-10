@@ -50,7 +50,8 @@ before Beamtalk code sees the configuration. `allow_unsafe_http` (tests
 only) also admits plain HTTP on a loopback host, as
 `beamtalk_oauth_oidcc:check_https/2` does. Each refusal emits the
 telemetry event `[beamtalk_oauth, http_adapter, refused]` (metadata
-`#{reason => insecure_url}`), so a refused background load is visible.
+`#{reason => insecure_url}`, or `#{reason => insecure_claim_source}` for a
+`response_check` refusal), so a refused background load is visible.
 """.
 
 -behaviour(oidcc_http_adapter).
@@ -72,8 +73,9 @@ take_captured() ->
 
 -define(DEFAULT_MAX_BODY, 1048576).
 
-%% Emitted for every refused request, with `#{reason => insecure_url}' as
-%% metadata (never the URL).
+%% Emitted for every refused request or response, with
+%% `#{reason => insecure_url | insecure_claim_source}' as metadata (never
+%% the URL).
 -define(REFUSED_EVENT, [beamtalk_oauth, http_adapter, refused]).
 %% oidcc's own default; used when oidcc passes `infinity`, which
 %% `HTTPClient` does not accept.
@@ -148,7 +150,9 @@ check_response(Method, Url, {ok, _} = Answer, #{response_check := Check} = Confi
 ->
     case Check(Method, Url, Answer, unsafe(Config)) of
         ok -> ok;
-        {error, Reason} -> {response_refused, Reason}
+        {error, Reason} ->
+            telemetry:execute(?REFUSED_EVENT, #{count => 1}, #{reason => insecure_claim_source}),
+            {response_refused, Reason}
     end;
 check_response(_Method, _Url, _Answer, _Config) ->
     ok.

@@ -890,10 +890,16 @@ TestCase subclass: OAuthFlowsTest
     self.server := self signedUserinfoServer
     toks := self exchange
     self userinfoAnswers: (self claimsWithSources: #("{self.provider issuer}/claims", "http://claims.example.test/groups"))
+    log := EventLog spawn
+    log listenTo: #(#beamtalk_oauth, #http_adapter, #refused)
     err := (self userInfoFor: toks) error
+    log detach
     self assert: err code equals: "insecure_endpoint"
     self assert: (err description includesSubstring: "claim_source")
     self assert: (err description includesSubstring: "http://claims.example.test/groups")
+    // The refusal is visible to telemetry, like a refused request URL.
+    self assert: (log events includes: #{#reason => #insecure_claim_source})
+    log stop
     // The allowed source was not fetched either.
     self assert: (self.provider hits: "/claims") equals: 0
 
