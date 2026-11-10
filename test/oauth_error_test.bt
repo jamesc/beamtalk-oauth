@@ -173,7 +173,10 @@ TestCase subclass: OAuthErrorTest
         "error_description" => "bad token rt-1"
       }
     body := (Json parse: json) unwrap
-    self assert: ((body at: "token") isKindOf: String)
+    self assert: (body isKindOf: Dictionary)
+    (body isKindOf: Dictionary) ifTrue: [
+      self assert: ((body at: "token") isKindOf: String)
+    ]
     scrubbed := OAuthError scrub: body secrets: #("rt-1")
     self deny: (scrubbed printString includesSubstring: "rt-1")
     self assert: (scrubbed at: "error") equals: "invalid_request"

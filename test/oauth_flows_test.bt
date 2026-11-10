@@ -74,7 +74,7 @@ TestCase subclass: OAuthFlowsTest
       callback: (self callbackFor: sess)) unwrap
 
   // The query of `url` as a Dictionary.
-  queryOf: url :: String -> Object => OAuthFlows parseQuery: url
+  queryOf: url :: String -> Dynamic => OAuthFlows parseQuery: url
 
   codeOf: result :: Result -> String => result error code
 

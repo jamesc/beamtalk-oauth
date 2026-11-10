@@ -185,7 +185,7 @@ TestCase subclass: LoopbackReceiverTest
   testCloseTabPageForbidsScriptsAndFraming =>
     resp := (self callback: "code=x") unwrap
     csp := resp headers detect: [:h |
-      (h at: 1) lowercase =:= "content-security-policy"
+      (h at: 1) asStringUnchecked lowercase =:= "content-security-policy"
     ] ifNone: [nil]
     self assert: csp notNil
     self assert: ((csp at: 2) includesSubstring: "frame-ancestors 'none'")
