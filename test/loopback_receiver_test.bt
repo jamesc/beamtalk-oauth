@@ -561,3 +561,13 @@ TestCase subclass: LoopbackReceiverTest
     self assert: rx isListening
     self assert: rx rearm isOk
     table delete
+
+  testAKeptCallbackIsNotAnsweredTwiceToItsOwner =>
+    self callback: "code=junk"
+    (self.rx awaitCallback: 5000 keepListening: true) unwrap
+    self assert: (self.rx awaitCallback: 100 keepListening: true) error code equals: "config"
+    // Still up and still re-armable: the refusal changes nothing.
+    self assert: self.rx isListening
+    self assert: self.rx rearm isOk
+    self assert: (self callback: "code=real") unwrap status equals: 200
+    self assert: ((self.rx awaitCallback: 5000) unwrap at: "code") equals: "real"

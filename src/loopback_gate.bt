@@ -84,8 +84,9 @@ typed Server subclass: LoopbackGate
   state: server :: HTTPServer | Nil = nil
   /// The monitor on the owning process (the starter, then the waiter).
   state: ownerRef :: Reference | Nil = nil
-  /// The owning process itself, for `awaitFrom:tag:`.
-  state: owner :: Pid | Nil = nil
+  /// Whether the recorded query has been sent to a waiter: a delivered
+  /// query is never sent again; only `rearm` clears it.
+  state: delivered :: Boolean = false
   /// Whether the owner is a waiter (any exit shuts down) rather than the
   /// starter (only an abnormal exit does).
   state: ownerIsWaiter :: Boolean = false
@@ -187,6 +188,7 @@ typed Server subclass: LoopbackGate
     self.stateDigest isNil ifTrue: [^#noState]
     self.waiter isNil ifFalse: [^#busy]
     self.query := nil
+    self.delivered := false
     #ok
 
   /// How many callbacks were refused for a missing, wrong or repeated
@@ -237,9 +239,11 @@ typed Server subclass: LoopbackGate
   /// answering `#ok`. A query that already arrived is sent at once.
   /// Answers, and changes nothing:
   ///
-  /// - `#busy` while another live process is waiting, or holds a
-  ///   callback it was sent with the listener kept up: the receiver has a
+  /// - `#busy` while another live process is waiting: the receiver has a
   ///   single consumer;
+  /// - `#held` when the recorded callback was already sent to a waiter
+  ///   that kept the listener up: it is never sent twice, and a new wait
+  ///   needs `rearm` first;
   /// - `#noState` when `expectState:` was never called, so no callback
   ///   could ever be recorded;
   /// - `#closed` when the gate has shut down (its owner went away or its
@@ -255,17 +259,10 @@ typed Server subclass: LoopbackGate
         {other, _} := self.waiter
         ((other =/= pid) and: [other isAlive]) ifTrue: [^#busy]
       ]
-    // A callback already delivered to a waiter that kept the listener up
-    // is that waiter's until it re-arms: another process may neither get
-    // the same query nor take ownership from it.
-    (self.query notNil
-      and: [
-        self.ownerIsWaiter and: [
-          self.owner notNil and: [
-            (self.owner =/= pid) and: [self.owner isAlive]
-          ]
-        ]
-      ]) ifTrue: [^#busy]
+    // A callback already delivered (to a waiter that kept the listener
+    // up) is never handed out again, to that waiter or any other process,
+    // and no one takes ownership from that waiter, until it re-arms.
+    self.delivered ifTrue: [^#held]
     self.waiter := {pid, tag}
     self.awaited := true
     self watchOwner: pid asWaiter: true
@@ -308,7 +305,6 @@ typed Server subclass: LoopbackGate
   internal watchOwner: pid :: Pid asWaiter: isWaiter :: Boolean -> Nil =>
     self.ownerRef isNil ifFalse: [self.ownerRef demonitor]
     self.ownerRef := pid monitor
-    self.owner := pid
     self.ownerIsWaiter := isWaiter
     nil
 
@@ -352,6 +348,7 @@ typed Server subclass: LoopbackGate
         {pid, tag} := self.waiter
         pid send: {#beamtalk_oauth_callback, tag, self.query}
         self.waiter := nil
+        self.delivered := true
       ]
     nil
 

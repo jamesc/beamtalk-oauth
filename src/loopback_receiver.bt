@@ -219,10 +219,11 @@ typed Value subclass: LoopbackReceiver
   ///   parameter, also given in the description when it is not 0;
   /// - `config`: a timeout outside `0..maxTimeout`; `expectState:` was
   ///   never called; the receiver was stopped (by `stop`, its owner
-  ///   exiting or its lifetime passing), before or during the wait; or
-  ///   another process is already waiting on it. Only in the stopped
-  ///   case is the listener gone: otherwise it stays up, and any other
-  ///   wait carries on.
+  ///   exiting or its lifetime passing), before or during the wait;
+  ///   another process is already waiting on it; or it already answered
+  ///   a callback with the listener kept up and has not been re-armed.
+  ///   Only in the stopped case is the listener gone: otherwise it stays
+  ///   up, and any other wait carries on.
   awaitCallback: timeoutMs :: Integer -> Result(Dictionary, OAuthError) =>
     self awaitCallback: timeoutMs keepListening: false
 
@@ -250,6 +251,10 @@ typed Value subclass: LoopbackReceiver
     registered value =:= #busy
       ifTrue: [
         ^Result error: (OAuthError config: "another process is already waiting on this LoopbackReceiver")
+      ]
+    registered value =:= #held
+      ifTrue: [
+        ^Result error: (OAuthError config: "this LoopbackReceiver already answered its callback; rearm it before waiting again")
       ]
     gatePid := self.gate pid
     outcome := self class
