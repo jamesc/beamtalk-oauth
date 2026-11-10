@@ -12,10 +12,11 @@ so `oidcc` never falls back to `httpc`, and every call that validates a
 token also carries a `refresh_jwks` callback that reloads the key set
 through the same adapter.
 
-Arguments arrive from Beamtalk untouched: Strings as
-`{beamtalk_string, Bin}` (at any depth), Symbols as atoms, nil as `nil`.
-Results go back the same way: binaries meant as text are tagged, absent
-values are `nil`, and `{ok, _}` / `{error, _}` become a `Result`.
+Arguments arrive from Beamtalk untouched: Strings (at any depth), Symbols
+as atoms, nil as `nil`. Results go back the same way: binaries meant as
+text become Strings, absent values are `nil`, and `{ok, _}` / `{error, _}`
+become a `Result`. Strings are built and read only with
+`beamtalk_native_api:string_from_binary/1` and `string_to_binary/1`.
 
 A discovered provider is held as the opaque
 `{beamtalk_oauth_provider, Map}`: the provider configuration record, its
@@ -1206,7 +1207,7 @@ other tuples are kept as they are.
 -spec to_beamtalk(term()) -> term().
 to_beamtalk(B) when is_binary(B) ->
     case unicode:characters_to_binary(B) of
-        B -> {beamtalk_string, B};
+        B -> beamtalk_native_api:string_from_binary(B);
         _ -> B
     end;
 to_beamtalk(undefined) ->
@@ -1260,19 +1261,25 @@ secret(S) ->
     end.
 
 %% Beamtalk Strings nested in a term, unwrapped to raw binaries for oidcc.
-untag({beamtalk_string, B}) when is_binary(B) -> B;
-untag(L) when is_list(L) -> [untag(E) || E <- L];
-untag(M) when is_map(M) -> maps:from_list([{untag_key(K), untag(V)} || {K, V} <- maps:to_list(M)]);
-untag(nil) -> null;
-untag(Other) -> Other.
+untag(V) ->
+    case string_text(V) of
+        {ok, B} -> B;
+        error -> untag_term(V)
+    end.
+
+untag_term(L) when is_list(L) -> [untag(E) || E <- L];
+untag_term(M) when is_map(M) ->
+    maps:from_list([{untag_key(K), untag(V)} || {K, V} <- maps:to_list(M)]);
+untag_term(nil) -> null;
+untag_term(Other) -> Other.
 
 %% Discovery-document member names are binaries; a Symbol key would never
 %% match one, so it is taken by name.
 untag_key(K) when is_atom(K) -> atom_to_binary(K);
 untag_key(K) -> untag(K).
 
-str(B) when is_binary(B) -> {beamtalk_string, B};
-str(L) when is_list(L) -> {beamtalk_string, iolist_to_binary(L)}.
+str(B) when is_binary(B) -> beamtalk_native_api:string_from_binary(B);
+str(L) when is_list(L) -> beamtalk_native_api:string_from_binary(iolist_to_binary(L)).
 
 opt_str(Absent) when Absent =:= undefined; Absent =:= null -> nil;
 opt_str(V) -> str(V).
@@ -1280,11 +1287,18 @@ opt_str(V) -> str(V).
 opt(undefined) -> nil;
 opt(V) -> V.
 
-bin({beamtalk_string, B}) -> B;
-bin(B) when is_binary(B) -> B.
+bin(B) when is_binary(B) -> B;
+bin(S) -> beamtalk_native_api:string_to_binary(S).
 
 %% `{ok, Bin}` for a String or binary, `error` for anything else (nil
 %% included, which `bin/1` must never turn into `<<"nil">>`).
-text({beamtalk_string, B}) when is_binary(B) -> {ok, B};
 text(B) when is_binary(B) -> {ok, B};
-text(_) -> error.
+text(V) -> string_text(V).
+
+%% `{ok, Bin}` for a Beamtalk String, `error` for anything else.
+string_text(V) ->
+    try
+        {ok, beamtalk_native_api:string_to_binary(V)}
+    catch
+        error:_ -> error
+    end.

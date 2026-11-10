@@ -10,14 +10,15 @@ instead of using `httpc`.
 
 Adapter config: `#{client => HTTPClient class object, max_body_bytes =>
 non_neg_integer() | unlimited, allow_unsafe_http => boolean()}`. The class object is passed in from
-Beamtalk and messaged through `beamtalk_message_dispatch:send/3`, so this
-module does not depend on how class methods are compiled. (That module is
-internal to the Beamtalk runtime; BT-4556 tracks a supported API.)
+Beamtalk and messaged through `beamtalk_native_api:send/4`, the runtime's
+supported API for native code, so this module does not depend on how class
+methods are compiled or how values are laid out.
 
-Beamtalk Strings cross as `{beamtalk_string, Bin}`, and a `Result` arrives
-as a map. Requests are tagged on the way out; responses are converted
-back to the `httpc` shape `oidcc` expects: lowercase charlist header names
-and a binary body.
+Strings are built and read with `beamtalk_native_api:string_from_binary/1`
+and `string_to_binary/1`, the `Result` is read with `result_to_tuple/1`, and
+the `HTTPResponse` fields are read by sending `status`, `headers` and
+`body`. Responses are converted back to the `httpc` shape `oidcc` expects:
+lowercase charlist header names and a binary body.
 
 Every failure but a `response_check` refusal and a `deadline` (below) answers
 `{error, {http_client, Reason}}`, where `Reason` is
@@ -99,6 +100,9 @@ take_captured() ->
 %% oidcc's own default; used when oidcc passes `infinity`, which
 %% `HTTPClient` does not accept.
 -define(DEFAULT_TIMEOUT, 60000).
+%% Added to the request timeout to bound `beamtalk_native_api:send/4`'s
+%% wait, should `HTTPClient`'s class method ever run in another process.
+-define(SEND_MARGIN, 5000).
 
 -doc """
 Perform one `oidcc` request through `HTTPClient request:url:options:`.
@@ -243,9 +247,10 @@ do_request(Method, Request, HttpOptions, Client, Config) ->
         {Url, Headers, Body} ?= split_request(Request),
         {ok, HeaderPairs} ?= headers(Headers),
         ok ?= check_url(Url, unsafe(Config)),
+        Timeout = timeout(proplists:get_value(timeout, HttpOptions, ?DEFAULT_TIMEOUT)),
         Opts0 = #{
             headers => HeaderPairs,
-            timeout => timeout(proplists:get_value(timeout, HttpOptions, ?DEFAULT_TIMEOUT)),
+            timeout => Timeout,
             maxBodyBytes => maps:get(max_body_bytes, Config, ?DEFAULT_MAX_BODY)
         },
         Opts =
@@ -254,7 +259,9 @@ do_request(Method, Request, HttpOptions, Client, Config) ->
                 _ -> Opts0#{body => str(Body)}
             end,
         Answer = from_result(
-            beamtalk_message_dispatch:send(Client, 'request:url:options:', [Method, str(Url), Opts])
+            beamtalk_native_api:send(
+                Client, 'request:url:options:', [Method, str(Url), Opts], Timeout + ?SEND_MARGIN
+            )
         ),
         capture(Method, Answer, Config),
         ok ?= check_response(Method, Url, Answer, Config),
@@ -339,33 +346,48 @@ split_request(_Other) ->
 timeout(T) when is_integer(T), T >= 0 -> T;
 timeout(_) -> ?DEFAULT_TIMEOUT.
 
-from_result(#{'$beamtalk_class' := 'Result', isOk := true, okValue := Response}) ->
-    #{status := Status, headers := Headers, body := Body} = Response,
+from_result(Result) ->
+    try beamtalk_native_api:result_to_tuple(Result) of
+        {ok, Response} -> from_response(Response);
+        {error, Reason} -> {error, {http_client, message(Reason)}}
+    catch
+        error:_ -> {error, {http_client, unexpected_result}}
+    end.
+
+%% An `HTTPResponse`, read through its accessors.
+from_response(Response) ->
+    Status = beamtalk_native_api:send(Response, status, []),
+    Headers = beamtalk_native_api:send(Response, headers, []),
+    Body = beamtalk_native_api:send(Response, body, []),
     {ok, {
         {"HTTP/1.1", Status, ""},
         [{string:lowercase(chars(K)), chars(V)} || [K, V] <- Headers],
         bin(Body)
-    }};
-from_result(#{'$beamtalk_class' := 'Result', isOk := false, errReason := Reason}) ->
-    {error, {http_client, message(Reason)}};
-from_result(_Other) ->
-    {error, {http_client, unexpected_result}}.
+    }}.
 
 %% The error's message text. `HTTPClient` builds it from a fixed hint and
 %% the transport reason (`Request failed (econnrefused)`), never from the
 %% request.
 message(Reason) ->
-    try beamtalk_message_dispatch:send(Reason, message, []) of
-        {beamtalk_string, Text} -> Text;
+    try beamtalk_native_api:send(Reason, message, []) of
         Text when is_binary(Text) -> Text;
-        _ -> unknown
+        Text -> text_or(Text, unknown)
     catch
         _:_ -> unknown
     end.
 
-str(V) -> {beamtalk_string, iolist_to_binary(V)}.
+str(V) -> beamtalk_native_api:string_from_binary(iolist_to_binary(V)).
 
-bin({beamtalk_string, B}) -> B;
-bin(B) when is_binary(B) -> B.
+%% A String's text, or a Binary as is.
+bin(B) when is_binary(B) -> B;
+bin(S) -> beamtalk_native_api:string_to_binary(S).
+
+%% A String's text, or `Default` for anything else.
+text_or(S, Default) ->
+    try
+        beamtalk_native_api:string_to_binary(S)
+    catch
+        error:_ -> Default
+    end.
 
 chars(V) -> binary_to_list(bin(V)).
