@@ -571,7 +571,7 @@ TestCase subclass: LoopbackReceiverTest
   testMalformedCodeOrErrorIsRefused =>
     // RFC 6749: a code is printable ASCII, an error code excludes `"`
     // and `\`; no provider sends anything else.
-    #("code=a%0Ab", "code=%C3%A9", "error=bad%22code", "error=a%5Cb") do: [:q |
+    #("code=a%0Ab", "code=ab%0A", "code=%C3%A9", "error=bad%22code", "error=a%5Cb", "error=access_denied%0A") do: [:q |
       self assert: (self callback: q) unwrap status equals: 404
     ]
     self callback: "code=real"

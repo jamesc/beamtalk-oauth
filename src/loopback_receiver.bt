@@ -179,7 +179,10 @@ typed Value subclass: LoopbackReceiver
       ifOk: [:rx | Result ok: rx]
       ifError: [:e |
         [gate close] on: Error do: [:ignored | nil]
-        Result error: (OAuthError transport: "loopback listener failed to start: {e message}")
+        reason := (e respondsTo: #message) ifTrue: [
+          e message
+        ] ifFalse: [e printString]
+        Result error: (OAuthError transport: "loopback listener failed to start: {reason}")
       ]
 
   /// The server's request handler: a block, so it runs in the connection

@@ -384,7 +384,8 @@ Object subclass: OAuthFlows
 
   /// RFC 6749 §4.1.2.1: an `error` value is one or more characters in
   /// %x20-21 / %x23-5B / %x5D-7E (printable ASCII but `"` and `\`).
-  class errorCodePattern -> String => "^[ !#-\\[\\]-~]+$"
+  /// Anchored with `\z`: `$` would also match before a trailing newline.
+  class errorCodePattern -> String => "^[ !#-\\[\\]-~]+\\z"
 
   /// The callback parameters as a Dictionary of String to String, or the
   /// `parse` error for a malformed, non-text or duplicated parameter.

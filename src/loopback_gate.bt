@@ -275,7 +275,8 @@ typed Server subclass: LoopbackGate
     hasCode := self isFilled: code
     hasError := self isFilled: error
     (hasCode or: [hasError]) ifFalse: [^false]
-    (hasCode and: [(code matchesRegex: "^[ -~]+$") not]) ifTrue: [^false]
+    // `\z`, not `$`, which also matches before a trailing newline.
+    (hasCode and: [(code matchesRegex: "^[ -~]+\\z") not]) ifTrue: [^false]
     (hasError and: [
       (error matchesRegex: OAuthFlows errorCodePattern) not
     ]) ifTrue: [^false]

@@ -617,6 +617,11 @@ TestCase subclass: OAuthFlowsTest
       store: self.store
       boundTo: self.binding
     self assert: (self codeOf: quoted) equals: "parse"
+    trailingNewline := OAuthFlows
+      handleCallback: #(#("error", "access_denied\n"), #("state", sess state))
+      store: self.store
+      boundTo: self.binding
+    self assert: (self codeOf: trailingNewline) equals: "parse"
     symbol := OAuthFlows
       handleCallback: #(#("code", #true), #("state", sess state))
       store: self.store
