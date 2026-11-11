@@ -493,6 +493,29 @@ TestCase subclass: SessionStoreTest
     self deny: (text includesSubstring: s codeVerifier)
     self deny: (text includesSubstring: self.binding)
 
+  testSecretSelectorsCoverEverySecretMessage =>
+    secret := SessionStore secretSelectors
+    #(#create:boundTo:, #restore:boundTo:, #consume:boundTo:, #peek:boundTo:, #issueTicket:forState:, #redeemTicket:forState:) do: [:sel |
+      self assert: (secret includes: sel)
+    ]
+
+  // BT-4567: with `sys:log` on, the formatted status (the part OTP passes
+  // through format_status/1) redacts the arguments and replies of the
+  // secret selectors. OTP's raw debug term beside it is not covered.
+  testSysLogRedactsSecretSends =>
+    store := SessionStore spawn
+    s := self.session
+    Erlang sys log: store pid with: true
+    store create: s boundTo: self.binding
+    (store consume: s state boundTo: self.binding) unwrap
+    status := Erlang sys get_status: store pid
+    misc := (Erlang erlang element: 4 with: status) last
+    text := self render: misc
+    self assert: (text includesSubstring: "consume:boundTo:")
+    self deny: (text includesSubstring: s nonce)
+    self deny: (text includesSubstring: s codeVerifier)
+    self deny: (text includesSubstring: self.binding)
+
   testTableIsPrivate =>
     store := SessionStore spawn
     store create: self.session boundTo: self.binding
