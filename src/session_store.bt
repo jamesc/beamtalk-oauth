@@ -112,18 +112,23 @@
 ///
 /// ## Redaction
 ///
-/// Beamtalk actors have no `format_status/1` hook, so sessions do not
-/// live in the actor's state at all: they are kept in a private ETS table
-/// that the actor owns. `sys:get_state/1`, `sys:get_status/1` and crash
-/// reports show only the table's reference, and no other process (nor
-/// `observer`) can read a private table. Bindings are kept only as SHA-256
-/// digests. The table survives hot code reloading and is deleted with the
-/// actor, so a crashed store loses its sessions: it fails closed.
+/// Sessions do not live in the actor's state at all: they are kept in a
+/// private ETS table that the actor owns. `sys:get_state/1`,
+/// `sys:get_status/1` and crash reports show only the table's reference,
+/// and no other process (nor `observer`) can read a private table.
+/// Bindings are kept only as SHA-256 digests. The table survives hot code
+/// reloading and is deleted with the actor, so a crashed store loses its
+/// sessions: it fails closed.
 ///
-/// Arguments and replies still cross the mailbox in the clear: with
-/// `sys:log/2` or `sys:trace/2` turned on, or in the "last message" of a
-/// crash report, a `create:boundTo:` or a consumed session is visible.
-/// Do not enable `sys` debugging on a store in production.
+/// Arguments and replies cross the mailbox. Every message that carries a
+/// session, a binding or a callback ticket is listed in `class
+/// secretSelectors`, so Beamtalk redacts its arguments and its reply in
+/// `sys:get_status/1`'s logged events, in a crash report's last message
+/// and log, and in the `proc_lib` crash report's mailbox (BT-4567,
+/// BT-4666). The raw `sys` tools are not covered: `sys:get_state/1`,
+/// `sys:log(Pid, get)`, `sys:log(Pid, print)` and `sys:trace/2` still show
+/// arguments and replies in the clear. Do not enable `sys` debugging on a
+/// store in production.
 ///
 /// ## Examples
 /// ```beamtalk
@@ -155,6 +160,13 @@ typed Actor subclass: SessionStore
   /// Per table, the stamp before which a full table refuses without
   /// sweeping. See "Size cap".
   state: fullUntil :: Dictionary = #{}
+
+  /// Messages whose arguments or replies carry a session (PKCE verifier,
+  /// nonce), a user-agent binding or a callback ticket. Beamtalk redacts
+  /// them in formatted status, sys logs and crash reports. See
+  /// "Redaction".
+  class secretSelectors -> List(Symbol) =>
+    #(#create:boundTo:, #restore:boundTo:, #consume:boundTo:, #peek:boundTo:, #issueTicket:forState:, #redeemTicket:forState:)
 
   /// The default session lifetime: 10 minutes, in milliseconds.
   class defaultTtl -> Integer => 600000
