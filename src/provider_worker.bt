@@ -121,6 +121,12 @@ Actor subclass: ProviderWorker native: beamtalk_oauth_provider_worker
   class startWith: config :: Dictionary -> Result(ProviderWorker, OAuthError) =>
     (self spawnArgsFor: config) map: [:full | self spawnWith: full]
 
+  /// As `startWith:`, raising on a bad config.
+  class start: config :: Dictionary -> ProviderWorker =>
+    (self startWith: config) ifOk: [:worker |
+      worker
+    ] ifError: [:err | self signalStartError: err]
+
   /// A `SupervisionSpec` that starts a worker from `config` (as
   /// `startWith:` takes it). Refine it with `withId:`, `withRestart:`, ...
   /// The config is checked here, so a bad one raises when the supervisor
@@ -128,9 +134,11 @@ Actor subclass: ProviderWorker native: beamtalk_oauth_provider_worker
   class supervisionSpecFor: config :: Dictionary -> SupervisionSpec =>
     (self spawnArgsFor: config) ifOk: [:full |
       self supervisionSpec withArgs: full
-    ] ifError: [:err |
-      Error signal: "ProviderWorker: {err code}: {err description}"
-    ]
+    ] ifError: [:err | self signalStartError: err]
+
+  /// Raise `err`, a bad start config, as an `Error`.
+  class signalStartError: err :: OAuthError -> Nil =>
+    Error signal: "ProviderWorker: {err code}: {err description}"
 
   /// The backing module's start config for `config` (as `startWith:`
   /// takes it), or the `OAuthError` for a bad one.
