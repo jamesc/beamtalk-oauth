@@ -3,19 +3,19 @@
 
 [[package]]
 name = "buccaneer"
-version = "0.1.3"
+version = "0.1.4"
 registry = "https://github.com/jamesc/beamtalk-registry"
 url = "https://github.com/jamesc/beamtalk-buccaneer.git"
-reference = "tag:v0.1.3"
-sha = "7cb68b1e8c72c14fe6a9cf756f18e6b97924ec61"
+reference = "tag:v0.1.4"
+sha = "1656d9b4e9dc590e20f521c2e1edf3c451723bb2"
 
 [[package]]
 name = "catalina"
-version = "0.2.3"
+version = "0.2.5"
 registry = "https://github.com/jamesc/beamtalk-registry"
 url = "https://github.com/jamesc/beamtalk-catalina.git"
-reference = "tag:v0.2.3"
-sha = "bb43c4cc3034688f6a115f344aa679af1393ddef"
+reference = "tag:v0.2.5"
+sha = "78a3edecb20150fce72a9fe6cb6685b535783b07"
 
 [[package]]
 name = "hpack"
@@ -27,37 +27,45 @@ sha = "34ebb37c8cd07c0c4dd28093c9519cbb5d912ef7"
 
 [[package]]
 name = "http"
-version = "0.3.2"
+version = "0.3.3"
 registry = "https://github.com/jamesc/beamtalk-registry"
 url = "https://github.com/jamesc/beamtalk-http.git"
-reference = "tag:v0.3.2"
-sha = "2f494a45df6f5033f7215acf084ac46889f8b6a6"
+reference = "tag:v0.3.3"
+sha = "f7d3281cb2effae72db899f214a82601aae12a9e"
 
 [[package]]
 name = "mint"
-version = "0.1.0"
+version = "0.2.1"
 registry = "https://github.com/jamesc/beamtalk-registry"
 url = "https://github.com/jamesc/beamtalk-mint.git"
-reference = "tag:v0.1.0"
-sha = "0a22305c2d780d6ca056985b1f30ae0d1b278be0"
+reference = "tag:v0.2.1"
+sha = "5a645a3b6fef2da0611b358e0aebd18bd1f88042"
 
 [[native_package]]
 name = "jose"
 version = "1.11.13"
-sha = ""
+sha = "94ABCD8BF98EB9F007272918BD3F5FFB613E8D250567DE233E6C2B2456319005"
+outer_sha = "15D8BD0F01AB29D1771E8DA1F60F9C98725B23A17F7312CDD40E8E2757BD98C7"
+level = 1
 
 [[native_package]]
 name = "oidcc"
 version = "3.9.2"
-sha = ""
+sha = "6F3E6E574E8D01DCC63A27B87E0790BBE6700BEA82B4CF74DBE52BA26378DA15"
+outer_sha = "E469213A2518904E805FF4F8325A405AC740A74A381E711968D32636C10D9C9B"
+level = 0
 
 [[native_package]]
 name = "telemetry"
 version = "1.4.2"
-sha = ""
+sha = "A0CB522801DFFB1C49FE6E30561BADFFC7B6D0E180DB1300DF759FAA22062855"
+outer_sha = "928F6495066506077862C0D1646609EED891A4326BEE3126BA54B60AF61FEBB1"
+level = 1
 
 [[native_package]]
 name = "telemetry_registry"
 version = "0.3.2"
-sha = ""
+sha = "701576890320BE6428189BFF963E865E8F23E0FF3615EADE8F78662BE0FC003C"
+outer_sha = "E7ED191EB1D115A3034AF8E1E35E4E63D5348851D556646D46CA3D1B4E16BAB9"
+level = 1
 
