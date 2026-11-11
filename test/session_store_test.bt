@@ -514,6 +514,7 @@ TestCase subclass: SessionStoreTest
     self assert: (text includesSubstring: "consume:boundTo:")
     self deny: (text includesSubstring: s nonce)
     self deny: (text includesSubstring: s codeVerifier)
+    self deny: (text includesSubstring: s state)
     self deny: (text includesSubstring: self.binding)
 
   testTableIsPrivate =>
