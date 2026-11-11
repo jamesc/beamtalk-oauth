@@ -54,8 +54,6 @@ Object subclass: HttpcGuard
     {_, current} := Erlang erlang trace_info: mfa with: #call_count
     current =:= false
       ifTrue: [
-        // The spec's first argument is a union the checker reads as Symbol.
-        @expect type
         Erlang erlang
           trace_pattern: mfa
           with: true

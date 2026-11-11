@@ -704,6 +704,15 @@ TestCase subclass: ProviderWorkerTest
     self exchange: (self assertOk: restarted server)
     sup stop
 
+  testSupervisionSpecForBadConfigRaises =>
+    self should: [
+      ProviderWorker supervisionSpecFor: #{#preset => 1}
+    ] raise: #signal
+    self should: [ProviderWorker supervisionSpecFor: #{}] raise: #signal
+
+  testStartBadConfigRaises =>
+    self should: [ProviderWorker start: #{}] raise: #signal
+
   // The running #provider child once it is no longer `old`.
   // The supervisor's #provider child (childWithId: answers it untyped).
   providerChildOf: sup :: ProviderWorkerSup -> Dynamic =>
