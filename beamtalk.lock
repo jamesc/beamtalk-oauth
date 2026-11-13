@@ -3,11 +3,11 @@
 
 [[package]]
 name = "buccaneer"
-version = "0.1.4"
+version = "0.1.5"
 registry = "https://github.com/jamesc/beamtalk-registry"
 url = "https://github.com/jamesc/beamtalk-buccaneer.git"
-reference = "tag:v0.1.4"
-sha = "1656d9b4e9dc590e20f521c2e1edf3c451723bb2"
+reference = "tag:v0.1.5"
+sha = "c9fa8c9c7e2ffa0b885369fd94dd58112158bde8"
 
 [[package]]
 name = "catalina"
@@ -27,11 +27,11 @@ sha = "34ebb37c8cd07c0c4dd28093c9519cbb5d912ef7"
 
 [[package]]
 name = "http"
-version = "0.3.3"
+version = "0.3.4"
 registry = "https://github.com/jamesc/beamtalk-registry"
 url = "https://github.com/jamesc/beamtalk-http.git"
-reference = "tag:v0.3.3"
-sha = "f7d3281cb2effae72db899f214a82601aae12a9e"
+reference = "tag:v0.3.4"
+sha = "4b013f9c460280480f9e84d758751b4c5cfb918c"
 
 [[package]]
 name = "mint"
