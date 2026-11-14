@@ -557,7 +557,7 @@ reg := (ClientRegistration forClient: "APP_ID" redirect: rx redirectUri) unwrap
 store := SessionStore spawn
 sess := OAuthSession newSessionFor: server client: reg
 (store create: sess boundTo: rx binding) unwrap
-rx expectState: sess state                // before the URL is opened
+rx := rx expectState: sess state          // before the URL is opened
 url := (OAuthFlows authorizeUrl: server client: reg scopes: #("openid", "read_user") session: sess) unwrap
 Transcript showCr: url                    // or open the system browser
 toks := (OAuthFlows completeLoopbackLogin: rx server: server client: reg store: store timeout: 300000) unwrap
