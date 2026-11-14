@@ -51,7 +51,7 @@ Object subclass: NativeLogin
     sess := OAuthSession newSessionFor: server client: reg
     (store create: sess boundTo: rx binding) unwrap
     // Before the URL is opened: the receiver only records this state.
-    rx expectState: sess state
+    rx := rx expectState: sess state
     url := (OAuthFlows
       authorizeUrl: server
       client: reg

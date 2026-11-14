@@ -245,7 +245,7 @@ TestCase subclass: LoopbackReceiverTest
     before := Erlang beamtalk_oauth_loopback mailbox_size
     self.rx awaitCallback: 20
     other := LoopbackReceiver start unwrap
-    other expectState: "other-state"
+    other := other expectState: "other-state"
     HTTPClient get: other redirectUri ++ "?code=x&state=other-state"
     (other awaitCallback: 5000) unwrap
     self assert: (Erlang beamtalk_oauth_loopback mailbox_size) equals: before
@@ -300,7 +300,7 @@ TestCase subclass: LoopbackReceiverTest
     other := LoopbackReceiver start unwrap
     early := (HTTPClient get: other redirectUri ++ "?code=early&state=s9") unwrap
     self assert: early status equals: 404
-    other expectState: "s9"
+    other := other expectState: "s9"
     self assert: (HTTPClient get: other redirectUri ++ "?code=late&state=s9") unwrap status equals: 200
     self assert: ((other awaitCallback: 5000) unwrap at: "code") equals: "late"
 
@@ -331,7 +331,7 @@ TestCase subclass: LoopbackReceiverTest
 
   testPercentEncodedStateMatches =>
     other := LoopbackReceiver start unwrap
-    other expectState: "a+b/c d"
+    other := other expectState: "a+b/c d"
     resp := (HTTPClient get: other redirectUri ++ "?code=enc&state=a%2Bb%2Fc+d") unwrap
     self assert: resp status equals: 200
     self assert: ((other awaitCallback: 5000) unwrap at: "state") equals: "a+b/c d"
@@ -451,7 +451,7 @@ TestCase subclass: LoopbackReceiverTest
 
   testAwaitedReceiverOutlivesItsLifetime =>
     other := (LoopbackReceiver startWithLifetime: 100) unwrap
-    other expectState: "slow"
+    other := other expectState: "slow"
     [
       Timer sleep: 400
       HTTPClient get: other redirectUri ++ "?code=slow&state=slow"

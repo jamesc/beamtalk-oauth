@@ -1,6 +1,7 @@
 # ADR 0001: OAuth 2.0 / OIDC client library over `oidcc` (`beamtalk-oauth`)
 
 ## Status
+Implemented (0.1 scope, 2026-11-10) — epic BT-4557 done (BT-4558–BT-4565 plus hardening follow-ups, last BT-4571); shipped in the package's 0.2.0 release (2026-11-11). The plan's later slices (0.2: client credentials, GitHub; 0.3: `private_key_jwt`, RP-initiated logout, introspection) are not started and have no issues.
 Accepted (2026-11-09). Revised the same day from an earlier "Accepted"
 hand-rolled design: an ADR review found `oidcc`, which the original
 survey missed, and the author chose to wrap it rather than write
@@ -556,7 +557,7 @@ reg := (ClientRegistration forClient: "APP_ID" redirect: rx redirectUri) unwrap
 store := SessionStore spawn
 sess := OAuthSession newSessionFor: server client: reg
 (store create: sess boundTo: rx binding) unwrap
-rx expectState: sess state                // before the URL is opened
+rx := rx expectState: sess state          // before the URL is opened
 url := (OAuthFlows authorizeUrl: server client: reg scopes: #("openid", "read_user") session: sess) unwrap
 Transcript showCr: url                    // or open the system browser
 toks := (OAuthFlows completeLoopbackLogin: rx server: server client: reg store: store timeout: 300000) unwrap
@@ -744,7 +745,7 @@ New repo `beamtalk-oauth`, plus work elsewhere:
   held for now; 0.1 does not consume it. Device flow, written before it
   was dropped, is parked separately on `rfc8628-device-flow`.
 - **`beamtalk` toolchain (optional)**: git sources and rebar3 overrides
-  in `[native.dependencies]` (BT-4555, in progress). Not needed for 0.1:
+  in `[native.dependencies]` (BT-4555, done 2026-11-09). Not needed for 0.1:
   Phase 0 found `jose` builds without an override. Useful for consuming
   the fork in tests.
 
@@ -900,7 +901,11 @@ fixture provider), BT-4562 (`OAuthFlows`), BT-4563 (revocation,
 examples, README)
 **Related (beamtalk):** BT-4556 (supported native-to-Beamtalk send
 API), BT-4555 (git sources in `[native.dependencies]`, optional)
-**Status:** Planned
+**Status:** 0.1 scope done (2026-11-10). BT-4558–BT-4565 Done, and the
+hardening follow-ups under the epic (BT-4568, BT-4569, BT-4570, BT-4571,
+BT-4572, BT-4575, BT-4578, BT-4579, BT-4580, BT-4590, BT-4613, BT-4618,
+BT-4639) Done; BT-4556 and BT-4555 Done. The 0.2 and 0.3 slices are not
+yet planned.
 
 ## Migration Path
 

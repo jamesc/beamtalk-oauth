@@ -27,7 +27,7 @@
 /// ```beamtalk
 /// sess := OAuthSession newSessionFor: server client: reg
 /// (store create: sess boundTo: rx binding) unwrap
-/// rx expectState: sess state
+/// rx := rx expectState: sess state
 /// url := (OAuthFlows authorizeUrl: server client: reg scopes: scopes session: sess) unwrap
 /// query := (rx awaitCallback: 300000) unwrap
 /// ```
@@ -125,7 +125,7 @@
 /// rx := LoopbackReceiver start unwrap
 /// rx redirectUri                       // => "http://127.0.0.1:50278/callback"
 /// rx binding size                      // => 43
-/// rx expectState: sess state           // before opening the authorize URL
+/// rx := rx expectState: sess state     // before opening the authorize URL
 /// query := (rx awaitCallback: 300000) unwrap
 /// query at: "code"                     // => "..."
 /// ```
