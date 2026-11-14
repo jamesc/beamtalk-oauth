@@ -54,7 +54,7 @@ TestCase subclass: LiveGitlabTest
     reg := (ClientRegistration forClient: clientId redirect: rx redirectUri) unwrap
     sess := OAuthSession newSessionFor: server client: reg
     (store create: sess boundTo: rx binding) unwrap
-    rx expectState: sess state
+    rx := rx expectState: sess state
     url := (OAuthFlows
       authorizeUrl: server
       client: reg

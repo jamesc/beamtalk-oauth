@@ -59,7 +59,7 @@
 /// store := SessionStore spawn
 /// sess := OAuthSession newSessionFor: server client: reg
 /// (store create: sess boundTo: rx binding) unwrap
-/// rx expectState: sess state
+/// rx := rx expectState: sess state
 /// url := (OAuthFlows authorizeUrl: server client: reg scopes: #("openid", "read_user") session: sess) unwrap
 /// toks := (OAuthFlows completeLoopbackLogin: rx server: server client: reg store: store timeout: 300000) unwrap
 /// toks subject                              // validated by oidcc
