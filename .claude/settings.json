@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 360,
+            "command": "if [ \"${CLAUDE_CODE_REMOTE:-}\" = \"true\" ]; then bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/refresh-edge.sh\" || echo \"refresh-edge: warning: hook exited $? (keeping the installed build)\" >&2; fi; exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}
