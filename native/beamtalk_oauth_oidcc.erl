@@ -73,14 +73,15 @@ userinfo `_claim_sources` endpoint that is not HTTPS),
 -export_type([provider/0]).
 
 -doc "A discovered provider, opaque to Beamtalk.".
--opaque provider() :: {beamtalk_oauth_provider, #{
-    config := oidcc_provider_configuration:t(),
-    jwks := jose_jwk:key(),
-    request_opts := oidcc_http_util:request_opts(),
-    provider_worker => pid(),
-    jwks_reload_interval => non_neg_integer(),
-    deadline => non_neg_integer()
-}}.
+-opaque provider() ::
+    {beamtalk_oauth_provider, #{
+        config := oidcc_provider_configuration:t(),
+        jwks := jose_jwk:key(),
+        request_opts := oidcc_http_util:request_opts(),
+        provider_worker => pid(),
+        jwks_reload_interval => non_neg_integer(),
+        deadline => non_neg_integer()
+    }}.
 
 %% `oidcc` checks ID-token `iat`/`exp`/`nbf` with no tolerance by default;
 %% laptop clocks drift (ADR 0001, Open Question 8).
@@ -977,7 +978,8 @@ opt_text(Map, Key, Default) ->
         _ -> {error, {invalid_property, binary_to_atom(Key)}}
     end.
 
-opt_expiry(null) -> {ok, nil};
+opt_expiry(null) ->
+    {ok, nil};
 opt_expiry(N) when is_integer(N) -> {ok, N};
 opt_expiry(Bin) when is_binary(Bin) ->
     try
@@ -988,8 +990,10 @@ opt_expiry(Bin) when is_binary(Bin) ->
 opt_expiry(_) ->
     {error, {invalid_property, expires_in}}.
 
-opt_scope(null) -> {ok, nil};
-opt_scope(<<>>) -> {ok, nil};
+opt_scope(null) ->
+    {ok, nil};
+opt_scope(<<>>) ->
+    {ok, nil};
 opt_scope(Bin) when is_binary(Bin) -> {ok, str(Bin)};
 opt_scope(List) when is_list(List) ->
     case lists:all(fun is_binary/1, List) of
@@ -1250,9 +1254,12 @@ request_opts(Opts) ->
         _ -> RequestOpts
     end.
 
-secret(nil) -> unauthenticated;
-secret(undefined) -> unauthenticated;
-secret(unauthenticated) -> unauthenticated;
+secret(nil) ->
+    unauthenticated;
+secret(undefined) ->
+    unauthenticated;
+secret(unauthenticated) ->
+    unauthenticated;
 secret(S) ->
     case text(S) of
         {ok, <<>>} -> unauthenticated;
@@ -1270,8 +1277,10 @@ untag(V) ->
 untag_term(L) when is_list(L) -> [untag(E) || E <- L];
 untag_term(M) when is_map(M) ->
     maps:from_list([{untag_key(K), untag(V)} || {K, V} <- maps:to_list(M)]);
-untag_term(nil) -> null;
-untag_term(Other) -> Other.
+untag_term(nil) ->
+    null;
+untag_term(Other) ->
+    Other.
 
 %% Discovery-document member names are binaries; a Symbol key would never
 %% match one, so it is taken by name.

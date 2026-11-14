@@ -332,8 +332,9 @@ handle_cast({beamtalk_oauth_direct_jwks, Kid, Jwks}, #{cache := {Config, Cached}
             not beamtalk_oauth_oidcc:has_kid(Cached, Kid)
     of
         true ->
-            {noreply,
-                State#{cache := {Config, Jwks}, reply := undefined, kid_reload_failed := false}};
+            {noreply, State#{
+                cache := {Config, Jwks}, reply := undefined, kid_reload_failed := false
+            }};
         false ->
             {noreply, State}
     end;
@@ -723,7 +724,8 @@ unknown_options_text(Unknown) ->
 %% name.
 http_client(Config) ->
     case maps:find(client, Config) of
-        {ok, Client} -> Client;
+        {ok, Client} ->
+            Client;
         error ->
             {ok, Client} = beamtalk_native_api:class_named('HTTPClient'),
             Client

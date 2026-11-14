@@ -277,7 +277,8 @@ check_response(Method, Url, {ok, _} = Answer, #{response_check := Check} = Confi
     is_function(Check, 4)
 ->
     case Check(Method, Url, Answer, unsafe(Config)) of
-        ok -> ok;
+        ok ->
+            ok;
         {error, Reason} ->
             telemetry:execute(?REFUSED_EVENT, #{count => 1}, #{reason => insecure_claim_source}),
             {response_refused, Reason}
@@ -309,7 +310,8 @@ unsafe(Config) ->
 %% reason never carries the URL.
 check_url(Url, Unsafe) ->
     case beamtalk_oauth_oidcc:check_https(#{request_url => iolist_to_binary(Url)}, Unsafe) of
-        ok -> ok;
+        ok ->
+            ok;
         {error, _} ->
             telemetry:execute(?REFUSED_EVENT, #{count => 1}, #{reason => insecure_url}),
             {error, insecure_url}
