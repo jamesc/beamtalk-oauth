@@ -20,9 +20,10 @@ fmt:
 fmt-fix:
     beamtalk fmt
 
-# Lint source files
-lint:
-    beamtalk lint
+# Lint source files. Depends on build so the native modules and native deps
+# (oidcc, jose) are compiled and their FFI types are known to the checker.
+lint: build
+    beamtalk lint --warnings-as-errors
 
 # Remove build artifacts
 clean:
