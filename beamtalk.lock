@@ -3,19 +3,19 @@
 
 [[package]]
 name = "buccaneer"
-version = "0.1.5"
+version = "0.1.7"
 registry = "https://github.com/jamesc/beamtalk-registry"
 url = "https://github.com/jamesc/beamtalk-buccaneer.git"
-reference = "tag:v0.1.5"
-sha = "c9fa8c9c7e2ffa0b885369fd94dd58112158bde8"
+reference = "tag:v0.1.7"
+sha = "6acfc24baba900ebd00b3c5673053d11cdc6a7a2"
 
 [[package]]
 name = "catalina"
-version = "0.2.5"
+version = "0.2.7"
 registry = "https://github.com/jamesc/beamtalk-registry"
 url = "https://github.com/jamesc/beamtalk-catalina.git"
-reference = "tag:v0.2.5"
-sha = "78a3edecb20150fce72a9fe6cb6685b535783b07"
+reference = "tag:v0.2.7"
+sha = "78fa5fb38ff3f768aad2f5e715db0bbfaa464aa3"
 
 [[package]]
 name = "hpack"
@@ -27,11 +27,11 @@ sha = "34ebb37c8cd07c0c4dd28093c9519cbb5d912ef7"
 
 [[package]]
 name = "http"
-version = "0.3.4"
+version = "0.3.6"
 registry = "https://github.com/jamesc/beamtalk-registry"
 url = "https://github.com/jamesc/beamtalk-http.git"
-reference = "tag:v0.3.4"
-sha = "4b013f9c460280480f9e84d758751b4c5cfb918c"
+reference = "tag:v0.3.6"
+sha = "db21bf6c0ea343ce541b0401b02f894df164e8a5"
 
 [[package]]
 name = "mint"
@@ -57,9 +57,9 @@ level = 0
 
 [[native_package]]
 name = "telemetry"
-version = "1.4.2"
-sha = "A0CB522801DFFB1C49FE6E30561BADFFC7B6D0E180DB1300DF759FAA22062855"
-outer_sha = "928F6495066506077862C0D1646609EED891A4326BEE3126BA54B60AF61FEBB1"
+version = "1.4.3"
+sha = "D0333FA869361E6833D6FF8E806FF4D8553FE1332FCCE0AF86C7381951A1DC2F"
+outer_sha = "17A63581CF2E832A238287F5FE6811E8CA1F333249F1376AD653164A3C4770D4"
 level = 1
 
 [[native_package]]

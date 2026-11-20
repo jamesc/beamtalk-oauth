@@ -3,10 +3,10 @@
 
 [package]
 name = "oauth"
-version = "0.2.0"
+version = "0.2.1"
 
 [dependencies]
-http = "0.3.4"
+http = "0.3.6"
 
 [native.dependencies]
 oidcc = "3.9.2"
