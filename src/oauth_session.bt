@@ -61,10 +61,6 @@ typed Value subclass: OAuthSession
       |> mapField: #redirectUri
       |> mapField: #createdAt
 
-  /// The JSON shape, from `jsonMapping`. Declared here (not just inherited
-  /// from `JsonMappable`) to keep the public `Dictionary` return type.
-  asJson -> Dictionary => self class jsonMapping encode: self
-
   /// `OAuthSession(state: ..., nonce: [redacted], codeVerifier: [redacted], ...)`.
   printString -> String =>
     r := OAuthError redacted
