@@ -23,6 +23,7 @@
 /// cb printString         // code shows as [redacted]
 /// ```
 typed Value subclass: Callback
+  uses: JsonMappable
   /// The authorization code.
   field: code :: String = ""
   /// The RFC 9207 `iss` parameter, or nil when the provider sent none.
@@ -32,16 +33,26 @@ typed Value subclass: Callback
   /// The single-use ticket recorded in the `SessionStore`.
   field: ticket :: String = ""
 
+  /// The JSON mapping. `code` and `ticket` are always redacted, whatever
+  /// their value; the nested session serialises through its own `asJson`.
+  class jsonMapping -> JsonMapping =>
+    JsonMapping new
+      |> mapField: #code
+         to: "code"
+         using: [:_ :: String | OAuthError redacted]
+      |> mapField: #iss
+      |> mapField: #ticket
+         to: "ticket"
+         using: [:_ :: String | OAuthError redacted]
+      |> mapField: #session
+         to: "session"
+         using: [:s :: OAuthSession | s asJson]
+
+  /// The JSON shape, from `jsonMapping`. Declared here (not just inherited
+  /// from `JsonMappable`) to keep the public `Dictionary` return type.
+  asJson -> Dictionary => self class jsonMapping encode: self
+
   /// `Callback(code: [redacted], iss: ..., state: ...)`. The ticket is not
   /// shown.
   printString -> String =>
     "Callback(code: {OAuthError redacted}, iss: {self.iss}, state: {self.session state})"
-
-  /// The JSON shape, with the code redacted.
-  asJson -> Dictionary =>
-    #{
-      "code" => OAuthError redacted,
-      "iss" => self.iss,
-      "ticket" => OAuthError redacted,
-      "session" => self.session asJson
-    }

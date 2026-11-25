@@ -18,6 +18,7 @@
 /// sess printString     // nonce and codeVerifier show as [redacted]
 /// ```
 typed Value subclass: OAuthSession
+  uses: JsonMappable
   /// The `state` parameter: CSRF token and session-store key.
   field: state :: String = ""
   /// The OIDC `nonce`, checked by `oidcc` in the ID token.
@@ -45,18 +46,26 @@ typed Value subclass: OAuthSession
         #redirectUri => reg redirectUri
       }
 
+  /// The JSON mapping. `nonce` and `codeVerifier` are always redacted,
+  /// whatever their value.
+  class jsonMapping -> JsonMapping =>
+    JsonMapping new
+      |> mapField: #state
+      |> mapField: #nonce
+         to: "nonce"
+         using: [:_ :: String | OAuthError redacted]
+      |> mapField: #codeVerifier
+         to: "codeVerifier"
+         using: [:_ :: String | OAuthError redacted]
+      |> mapField: #issuer
+      |> mapField: #redirectUri
+      |> mapField: #createdAt
+
+  /// The JSON shape, from `jsonMapping`. Declared here (not just inherited
+  /// from `JsonMappable`) to keep the public `Dictionary` return type.
+  asJson -> Dictionary => self class jsonMapping encode: self
+
   /// `OAuthSession(state: ..., nonce: [redacted], codeVerifier: [redacted], ...)`.
   printString -> String =>
     r := OAuthError redacted
     "OAuthSession(state: {self.state}, nonce: {r}, codeVerifier: {r}, issuer: {self.issuer}, redirectUri: {self.redirectUri}, createdAt: {self.createdAt})"
-
-  /// The JSON shape, with nonce and codeVerifier redacted.
-  asJson -> Dictionary =>
-    #{
-      "state" => self.state,
-      "nonce" => OAuthError redacted,
-      "codeVerifier" => OAuthError redacted,
-      "issuer" => self.issuer,
-      "redirectUri" => self.redirectUri,
-      "createdAt" => self.createdAt
-    }
