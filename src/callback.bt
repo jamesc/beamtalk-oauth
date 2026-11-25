@@ -48,10 +48,6 @@ typed Value subclass: Callback
          to: "session"
          using: [:s :: OAuthSession | s asJson]
 
-  /// The JSON shape, from `jsonMapping`. Declared here (not just inherited
-  /// from `JsonMappable`) to keep the public `Dictionary` return type.
-  asJson -> Dictionary => self class jsonMapping encode: self
-
   /// `Callback(code: [redacted], iss: ..., state: ...)`. The ticket is not
   /// shown.
   printString -> String =>

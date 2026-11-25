@@ -397,10 +397,6 @@ typed Value subclass: OAuthError
          to: "detail"
          using: [:d :: Dynamic | d isNil ifTrue: [nil] ifFalse: [d printString]]
 
-  /// The JSON shape, from `jsonMapping`. Declared here (not just inherited
-  /// from `JsonMappable`) to keep the public `Dictionary` return type.
-  asJson -> Dictionary => self class jsonMapping encode: self
-
   /// `OAuthError(code, status: 400): description`. `detail` is not shown.
   printString -> String =>
     statusPart := self.status isNil ifTrue: [

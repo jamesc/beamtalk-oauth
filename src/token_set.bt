@@ -66,10 +66,6 @@ typed Value subclass: TokenSet
   class redactToken: token :: String | Nil -> String | Nil =>
     token isNil ifTrue: [nil] ifFalse: [OAuthError redacted]
 
-  /// The JSON shape, from `jsonMapping`. Declared here (not just inherited
-  /// from `JsonMappable`) to keep the public `Dictionary` return type.
-  asJson -> Dictionary => self class jsonMapping encode: self
-
   /// Unix seconds at which the access token expires, or nil if unknown.
   expiresAt -> Integer | Nil =>
     self.expiresIn isNil ifTrue: [

@@ -229,10 +229,6 @@ typed Value subclass: OAuthServer
       |> mapField: #revocationEndpoint
       |> mapField: #tokenInfoEndpoint
 
-  /// The JSON shape, from `jsonMapping`. Declared here (not just inherited
-  /// from `JsonMappable`) to keep the public `Dictionary` return type.
-  asJson -> Dictionary => self class jsonMapping encode: self
-
   /// The token endpoint from discovery, or nil.
   tokenEndpoint -> String | Nil =>
     self.metadata at: #token_endpoint ifAbsent: [nil]

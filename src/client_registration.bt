@@ -95,10 +95,6 @@ typed Value subclass: ClientRegistration
          ]
       |> mapField: #redirectUri
 
-  /// The JSON shape, from `jsonMapping`. Declared here (not just inherited
-  /// from `JsonMappable`) to keep the public `Dictionary` return type.
-  asJson -> Dictionary => self class jsonMapping encode: self
-
   /// `ClientRegistration(clientId: ..., clientSecret: [redacted], redirectUri: ...)`.
   printString -> String =>
     "ClientRegistration(clientId: {self.clientId}, clientSecret: {self redactedSecret}, redirectUri: {self.redirectUri})"
