@@ -21,6 +21,7 @@
 /// // => "insecure_endpoint"
 /// ```
 typed Value subclass: ClientRegistration
+  uses: JsonMappable
   /// The client id the provider issued.
   field: clientId :: String = ""
   /// The client secret, or nil for a public client.
@@ -83,17 +84,20 @@ typed Value subclass: ClientRegistration
     ]) ifTrue: [^nil]
     OAuthError insecureEndpoint: "redirect URI must be https or http to 127.0.0.1 / [::1]: {uri}"
 
+  /// The JSON mapping. `clientSecret` is redacted when set, nil otherwise.
+  class jsonMapping -> JsonMapping =>
+    JsonMapping new
+      |> mapField: #clientId
+      |> mapField: #clientSecret
+         to: "clientSecret"
+         using: [:secret :: Dynamic |
+           secret isNil ifTrue: [nil] ifFalse: [OAuthError redacted]
+         ]
+      |> mapField: #redirectUri
+
   /// `ClientRegistration(clientId: ..., clientSecret: [redacted], redirectUri: ...)`.
   printString -> String =>
     "ClientRegistration(clientId: {self.clientId}, clientSecret: {self redactedSecret}, redirectUri: {self.redirectUri})"
-
-  /// The JSON shape, with the secret redacted.
-  asJson -> Dictionary =>
-    #{
-      "clientId" => self.clientId,
-      "clientSecret" => self redactedSecret,
-      "redirectUri" => self.redirectUri
-    }
 
   /// `"[redacted]"` when a secret is set, nil otherwise.
   redactedSecret -> String | Nil =>

@@ -94,7 +94,7 @@ TestCase subclass: TokenSetTest
     self assert: (out includesSubstring: "openid read_user")
 
   testAsJsonRedactsTokens =>
-    json := self.tokens asJson
+    json := TokenSet jsonMapping encode: self.tokens
     self assert: (json at: "accessToken") equals: "[redacted]"
     self assert: (json at: "refreshToken") equals: "[redacted]"
     self assert: (json at: "idToken") equals: "[redacted]"
@@ -104,7 +104,7 @@ TestCase subclass: TokenSetTest
     self deny: (out includesSubstring: "eyJhbGci")
 
   testAsJsonKeepsAbsentTokensNil =>
-    json := (TokenSet new: #{#accessToken => "a"}) asJson
+    json := TokenSet jsonMapping encode: (TokenSet new: #{#accessToken => "a"})
     self assert: (json at: "refreshToken") equals: nil
     self assert: (json at: "idToken") equals: nil
 

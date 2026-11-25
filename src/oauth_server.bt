@@ -72,6 +72,7 @@
 /// // => "insecure_endpoint"
 /// ```
 typed Value subclass: OAuthServer
+  uses: JsonMappable
   /// The issuer, as the discovery document states it.
   field: issuer :: String = ""
   /// The opaque `oidcc` provider context. Never printed.
@@ -220,6 +221,14 @@ typed Value subclass: OAuthServer
   class trimSlash: url :: String -> String =>
     (url endsWith: "/") ifTrue: [url take: url size - 1] ifFalse: [url]
 
+  /// The JSON mapping: issuer and endpoints. `context` is deliberately
+  /// unmapped, so it is never included.
+  class jsonMapping -> JsonMapping =>
+    JsonMapping new
+      |> mapField: #issuer
+      |> mapField: #revocationEndpoint
+      |> mapField: #tokenInfoEndpoint
+
   /// The token endpoint from discovery, or nil.
   tokenEndpoint -> String | Nil =>
     self.metadata at: #token_endpoint ifAbsent: [nil]
@@ -228,11 +237,3 @@ typed Value subclass: OAuthServer
   /// The context is never shown.
   printString -> String =>
     "OAuthServer(issuer: {self.issuer}, revocationEndpoint: {self.revocationEndpoint}, tokenInfoEndpoint: {self.tokenInfoEndpoint})"
-
-  /// The JSON shape: issuer and endpoints. The context is never included.
-  asJson -> Dictionary =>
-    #{
-      "issuer" => self.issuer,
-      "revocationEndpoint" => self.revocationEndpoint,
-      "tokenInfoEndpoint" => self.tokenInfoEndpoint
-    }

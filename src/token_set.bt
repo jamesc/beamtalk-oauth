@@ -19,6 +19,7 @@
 /// toks bearerHeader              // => "Bearer ..."
 /// ```
 typed Value subclass: TokenSet
+  uses: JsonMappable
   /// The access token.
   field: accessToken :: String = ""
   /// The token type the provider answered, normally `bearer`.
@@ -41,6 +42,29 @@ typed Value subclass: TokenSet
 
   /// The current Unix time in seconds.
   class now -> Integer => Erlang erlang system_time: #second
+
+  /// The JSON mapping. The three tokens go through `redactToken:`; a mapped
+  /// field without a converter is emitted as-is, so never add a secret field
+  /// without one. `idTokenClaims` is deliberately unmapped (omitted).
+  class jsonMapping -> JsonMapping =>
+    JsonMapping new
+      |> mapField: #accessToken
+         to: "accessToken"
+         using: [:t :: Dynamic | TokenSet redactToken: t]
+      |> mapField: #tokenType
+      |> mapField: #expiresIn
+      |> mapField: #obtainedAt
+      |> mapField: #refreshToken
+         to: "refreshToken"
+         using: [:t :: Dynamic | TokenSet redactToken: t]
+      |> mapField: #scope
+      |> mapField: #idToken
+         to: "idToken"
+         using: [:t :: Dynamic | TokenSet redactToken: t]
+
+  /// `"[redacted]"` for a present token, nil for an absent one.
+  class redactToken: token :: String | Nil -> String | Nil =>
+    token isNil ifTrue: [nil] ifFalse: [OAuthError redacted]
 
   /// Unix seconds at which the access token expires, or nil if unknown.
   expiresAt -> Integer | Nil =>
@@ -102,19 +126,5 @@ typed Value subclass: TokenSet
   printString -> String =>
     "TokenSet(tokenType: {self.tokenType}, accessToken: {self redact: self.accessToken}, expiresIn: {self.expiresIn}, obtainedAt: {self.obtainedAt}, refreshToken: {self redact: self.refreshToken}, scope: {self.scope}, idToken: {self redact: self.idToken})"
 
-  /// The JSON shape, with the three tokens redacted. The ID-token claims
-  /// are omitted; ask for `idTokenClaims` explicitly.
-  asJson -> Dictionary =>
-    #{
-      "accessToken" => self redact: self.accessToken,
-      "tokenType" => self.tokenType,
-      "expiresIn" => self.expiresIn,
-      "obtainedAt" => self.obtainedAt,
-      "refreshToken" => self redact: self.refreshToken,
-      "scope" => self.scope,
-      "idToken" => self redact: self.idToken
-    }
-
   /// `"[redacted]"` for a present token, nil for an absent one.
-  redact: token :: String | Nil -> String | Nil =>
-    token isNil ifTrue: [nil] ifFalse: [OAuthError redacted]
+  redact: token :: String | Nil -> String | Nil => TokenSet redactToken: token

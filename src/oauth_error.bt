@@ -23,6 +23,7 @@
 /// (OAuthError fromOidcc: #token_expired) code          // => "token_expired"
 /// ```
 typed Value subclass: OAuthError
+  uses: JsonMappable
   /// Machine-readable error code.
   field: code :: String = ""
   /// Human-readable description; may be empty.
@@ -385,6 +386,17 @@ typed Value subclass: OAuthError
     (text matchesRegex: "^(?i)https?://[^?#[:space:]]*$") ifTrue: [^false]
     (text size >= 16) and: [(text matchesRegex: "[[:space:]]") not]
 
+  /// The JSON mapping. `detail` is an Erlang term, so it appears as the
+  /// printString of its redacted form.
+  class jsonMapping -> JsonMapping =>
+    JsonMapping new
+      |> mapField: #code
+      |> mapField: #description
+      |> mapField: #status
+      |> mapField: #detail
+         to: "detail"
+         using: [:d :: Dynamic | d isNil ifTrue: [nil] ifFalse: [d printString]]
+
   /// `OAuthError(code, status: 400): description`. `detail` is not shown.
   printString -> String =>
     statusPart := self.status isNil ifTrue: [
@@ -394,15 +406,3 @@ typed Value subclass: OAuthError
       ""
     ] ifFalse: [": {self.description}"]
     "OAuthError({self.code}{statusPart}){descPart}"
-
-  /// The JSON shape. `detail` is an Erlang term, so it appears as the
-  /// printString of its redacted form.
-  asJson -> Dictionary =>
-    #{
-      "code" => self.code,
-      "description" => self.description,
-      "status" => self.status,
-      "detail" => self.detail isNil ifTrue: [
-        nil
-      ] ifFalse: [self.detail printString]
-    }
