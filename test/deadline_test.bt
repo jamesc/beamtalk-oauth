@@ -95,7 +95,7 @@ TestCase subclass: DeadlineTest
     // response does) is still cut off at the deadline.
     config := #{#client => StallingClient, #deadline => self now + 200}
     before := self now
-    result := Erlang beamtalk_oauth_http_adapter
+    result := Erlang oauth_http_adapter
       request: #get
       with: {Binary fromIolist: #("https://idp.example/token"), #()}
       with: #()
@@ -165,7 +165,7 @@ TestCase subclass: DeadlineTest
 
   testShimRefusesBadDeadline =>
     // The Erlang API refuses it too, rather than using the default.
-    found := Erlang beamtalk_oauth_oidcc discover: self.provider issuer with: #{
+    found := Erlang oauth_oidcc discover: self.provider issuer with: #{
       #client => HTTPClient,
       #allow_unsafe_http => true,
       #deadline => 0

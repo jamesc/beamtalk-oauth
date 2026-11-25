@@ -1,7 +1,7 @@
 %% Copyright 2026 James Casey
 %% SPDX-License-Identifier: Apache-2.0
 
--module(beamtalk_oauth_loopback).
+-module(oauth_loopback).
 
 -moduledoc """
 Caller-side wait for `LoopbackReceiver awaitCallback:`.

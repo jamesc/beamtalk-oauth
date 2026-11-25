@@ -88,7 +88,7 @@
 /// server issuer                 // => "https://gitlab.com"
 /// worker stop
 /// ```
-Actor subclass: ProviderWorker native: beamtalk_oauth_provider_worker
+Actor subclass: ProviderWorker native: oauth_provider_worker
 
   /// Start a worker for `issuer`, with no preset.
   class issuer: issuer :: String -> Result(ProviderWorker, OAuthError) =>
@@ -157,7 +157,7 @@ Actor subclass: ProviderWorker native: beamtalk_oauth_provider_worker
       #preset => preset,
       #options => (config at: #options ifAbsent: [#{}])
     }
-    problem := Erlang beamtalk_oauth_provider_worker check: full
+    problem := Erlang oauth_provider_worker check: full
     problem isNil ifFalse: [^Result error: (self errorFor: problem)]
     Result ok: full
 

@@ -1,13 +1,13 @@
 %% Copyright 2026 James Casey
 %% SPDX-License-Identifier: Apache-2.0
 
--module(beamtalk_oauth_oidcc).
+-module(oauth_oidcc).
 
 -moduledoc """
 Shim between Beamtalk values and `oidcc` records and maps.
 
 Every `oidcc` call made here carries
-`request_opts => #{http_adapter => {beamtalk_oauth_http_adapter, Cfg}}`,
+`request_opts => #{http_adapter => {oauth_http_adapter, Cfg}}`,
 so `oidcc` never falls back to `httpc`, and every call that validates a
 token also carries a `refresh_jwks` callback that reloads the key set
 through the same adapter.
@@ -318,7 +318,7 @@ configuration record as a map.
 
 `Source` says how the context's `refresh_jwks` callback reloads the keys
 (see `call_opts/1`): `#{provider_worker => Pid}`, the `ProviderWorker`
-process (`beamtalk_oauth_provider_worker`) the configuration came from,
+process (`oauth_provider_worker`) the configuration came from,
 which reloads and keeps the new keys for every later caller; or
 `#{jwks_reload_interval => Ms}` for a `discover/2` provider, which
 reloads at most once per `Ms` for its `jwks_uri`. `Source` may also name
@@ -905,16 +905,16 @@ refresh_token({beamtalk_oauth_provider, _} = Provider0, Client, Params) when
         Provider = with_refresh_grant(Provider0),
         Context = client_context(Provider, ClientId, maps:get(client_secret, Client, nil)),
         Opts = (capture(call_opts(Provider)))#{expected_subject => Subject},
-        _ = beamtalk_oauth_http_adapter:take_captured(),
+        _ = oauth_http_adapter:take_captured(),
         try guard(fun() -> oidcc_token:refresh(RefreshToken, Context, Opts) end) of
             {ok, Token} ->
                 {ok, token_to_map(Token)};
             {error, sub_invalid} ->
-                without_id_token(beamtalk_oauth_http_adapter:take_captured());
+                without_id_token(oauth_http_adapter:take_captured());
             {error, _} = Error ->
                 Error
         after
-            beamtalk_oauth_http_adapter:take_captured()
+            oauth_http_adapter:take_captured()
         end
     end;
 refresh_token(_Provider, _Client, _Params) ->
@@ -1248,7 +1248,7 @@ request_opts(Opts) ->
             {ok, Max} -> AdapterCfg0#{max_body_bytes => Max};
             error -> AdapterCfg0
         end,
-    RequestOpts = #{http_adapter => {beamtalk_oauth_http_adapter, AdapterCfg}},
+    RequestOpts = #{http_adapter => {oauth_http_adapter, AdapterCfg}},
     case maps:find(timeout, Opts) of
         {ok, T} when is_integer(T), T > 0 -> RequestOpts#{timeout => T};
         _ -> RequestOpts

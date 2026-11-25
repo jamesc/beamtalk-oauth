@@ -119,13 +119,13 @@ Recorded sub-decisions:
 Beamtalk surface   OAuthFlows, OAuthServer, ClientRegistration, OAuthSession,
                    TokenSet, OAuthError, SessionStore, ProviderPresets
         │
-native shim        native/beamtalk_oauth_oidcc.erl: Beamtalk values <-> oidcc
+native shim        native/oauth_oidcc.erl: Beamtalk values <-> oidcc
                    records/maps, forces require_pkce, maps {error, _} terms
         │
 oidcc + jose       discovery, JWKS, ID-token validation, token endpoint,
 (Hex 3.9.2)        userinfo, client auth
         │
-native adapter     native/beamtalk_oauth_http_adapter.erl: oidcc_http_adapter
+native adapter     native/oauth_http_adapter.erl: oidcc_http_adapter
                    behaviour; sends request:url:options: to the HTTPClient
                    class object passed in its config
         │
@@ -160,7 +160,7 @@ typed Value subclass: OAuthServer
 // Supervised oidcc_provider_configuration_worker, owned by the app's
 // supervision tree (explicit, like SessionStore). oidcc itself starts
 // no processes.
-Actor subclass: ProviderWorker native: beamtalk_oauth_provider_worker
+Actor subclass: ProviderWorker native: oauth_provider_worker
   server -> Result(OAuthServer, OAuthError) => ...
 ```
 
@@ -498,7 +498,7 @@ lands in browser history.
 ### Seams and rules
 
 - **One HTTP stack: `http`/Mint.** The shim passes
-  `request_opts => #{http_adapter => {beamtalk_oauth_http_adapter, Cfg}}`
+  `request_opts => #{http_adapter => {oauth_http_adapter, Cfg}}`
   on every `oidcc` call, so `oidcc` never touches `httpc` (a test guard
   fails the suite on any `httpc:request` call). The adapter sends
   `request:url:options:` to the `HTTPClient` class object passed in its

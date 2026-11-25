@@ -1,7 +1,7 @@
 %% Copyright 2026 James Casey
 %% SPDX-License-Identifier: Apache-2.0
 
--module(beamtalk_oauth_provider_worker).
+-module(oauth_provider_worker).
 
 -moduledoc """
 Backing gen_server for the `ProviderWorker` native actor (language ADR
@@ -9,7 +9,7 @@ Backing gen_server for the `ProviderWorker` native actor (language ADR
 
 It starts, and links to, an `oidcc_provider_configuration_worker` that
 loads the provider configuration and JWKS and keeps both refreshed. The
-worker loads through `beamtalk_oauth_oidcc:load_opts/1`, whose
+worker loads through `oauth_oidcc:load_opts/1`, whose
 `request_opts` carry the HTTP adapter, so its own refreshes never use
 `httpc`. Each of its requests times out after 10 s unless the `timeout`
 option says otherwise.
@@ -43,7 +43,7 @@ only): a load fails unless its answer is a `200` or `201` with a JSON
 object body. (A load `oidcc` refuses past that, such as a document for
 another issuer, still counts as a success here.) A load seen running for
 three request timeouts is taken to have ended. Unknown-`kid` reloads (from
-`beamtalk_oauth_oidcc:call_opts/1`) are limited to one per
+`oauth_oidcc:call_opts/1`) are limited to one per
 `minJwksReloadInterval` (default 30 s). Within it no load starts: a
 caller gets the keys the reload under way reads, once it ends, or else
 the cached keys at once, so a token naming a key they lack fails
@@ -71,11 +71,11 @@ Config (the `spawnWith:` map, Symbol keys arriving as atoms):
   `random_exponential`, 1 s to 30 s), `cacheTtl` (ms, default 60 s) and
   `minJwksReloadInterval` (ms, default 30 s), and `deadline` (ms, a
   positive Integer, default 4500), the deadline of each operation on a
-  server built here (`beamtalk_oauth_oidcc:call_opts/1`; the worker's own
+  server built here (`oauth_oidcc:call_opts/1`; the worker's own
   loads do not use it). oidcc's `stop` backoff is refused:
   the worker keeps retrying instead of exiting. `allowUnsafeHttp` also
   needs the test-only application flag (see
-  `beamtalk_oauth_oidcc:unsafe_http_enabled/0`).
+  `oauth_oidcc:unsafe_http_enabled/0`).
 
 The state holds no secrets (no client credentials ever reach either
 process), and `format_status/1` shows only the issuer and the `oidcc`
@@ -97,7 +97,7 @@ refuses non-HTTPS URLs; `oidcc` alone would fetch a plain-HTTP `jwks_uri`.
 -define(CALL_TIMEOUT, 4500).
 
 %% How long an unknown-kid reload may wait for the oidcc worker; the shim
-%% gives up at 3 s (`beamtalk_oauth_oidcc' ?WORKER_JWKS_TIMEOUT).
+%% gives up at 3 s (`oauth_oidcc' ?WORKER_JWKS_TIMEOUT).
 -define(KID_RELOAD_TIMEOUT, 2500).
 
 %% Per-request timeout for the oidcc worker's loads, unless `timeout' is
@@ -165,19 +165,19 @@ validate(Config) when is_map(Config) ->
         {ok, Options} ?= options(Config),
         ok ?= preset(Config),
         ok ?= check_unsafe(Options),
-        ok ?= beamtalk_oauth_oidcc:check_https(#{issuer => Issuer}, unsafe(Options)),
+        ok ?= oauth_oidcc:check_https(#{issuer => Issuer}, unsafe(Options)),
         {ok, Issuer}
     end;
 validate(_Config) ->
     {error, {config, <<"ProviderWorker config must be a Dictionary">>}}.
 
 init(Config) ->
-    beamtalk_oauth_oidcc:ensure_started(),
+    oauth_oidcc:ensure_started(),
     case validate(Config) of
         {ok, Issuer} ->
             {ok, Options} = options(Config),
             Preset = maps:get(preset, Config, #{}),
-            LoadOpts = beamtalk_oauth_oidcc:load_opts(
+            LoadOpts = oauth_oidcc:load_opts(
                 shim_opts(http_client(Config), Preset, Options)
             ),
             BackoffMin = maps:get(backoffMin, Options, 1000),
@@ -247,7 +247,7 @@ handle_call({refresh, []}, From, State0) ->
     read_async(State, ?CALL_TIMEOUT, fun(_Read) -> gen_server:reply(From, {ok, nil}) end),
     {noreply, State};
 handle_call({beamtalk_oauth_unknown_kid, Kid}, From, #{worker := Worker} = State0) ->
-    %% From `beamtalk_oauth_oidcc:call_opts/1': a token names a key we do not
+    %% From `oauth_oidcc:call_opts/1': a token names a key we do not
     %% have. The oidcc worker reloads only when its keys lack `Kid'.
     case {State0, due(State0, last_kid_reload, kid_reload_interval)} of
         {#{kid_waiters := Waiters}, _} when is_list(Waiters) ->
@@ -320,7 +320,7 @@ kid_reload(Kid, From, #{worker := Worker} = State0, Now) ->
         kid_load_mark => Mark
     }}.
 
-%% From `beamtalk_oauth_oidcc:call_opts/1': keys the caller loaded itself
+%% From `oauth_oidcc:call_opts/1': keys the caller loaded itself
 %% after this worker answered `undefined'. They are newer than the cache, so
 %% later callers get them without a fetch (until the next read of the oidcc
 %% worker, whose own retry loads them too).
@@ -328,8 +328,8 @@ kid_reload(Kid, From, #{worker := Worker} = State0, Now) ->
 %% load never replaces newer keys a read brought in meanwhile.
 handle_cast({beamtalk_oauth_direct_jwks, Kid, Jwks}, #{cache := {Config, Cached}} = State) ->
     case
-        beamtalk_oauth_oidcc:has_kid(Jwks, Kid) andalso
-            not beamtalk_oauth_oidcc:has_kid(Cached, Kid)
+        oauth_oidcc:has_kid(Jwks, Kid) andalso
+            not oauth_oidcc:has_kid(Cached, Kid)
     of
         true ->
             {noreply, State#{
@@ -344,7 +344,7 @@ handle_cast(_Msg, State) ->
 %% A helper's read of the oidcc worker: keep it when both parts are there.
 %% A new configuration or JWKS drops the built `server' reply.
 %% The first read also clears what discovery servers kept for this
-%% `jwks_uri' (`beamtalk_oauth_oidcc:forget_jwks/1'): these keys are newer.
+%% `jwks_uri' (`oauth_oidcc:forget_jwks/1'): these keys are newer.
 %% A read that timed out (the oidcc worker is busy with a slow load) is
 %% followed by a background read, so the cache picks up that load when it
 %% ends.
@@ -354,7 +354,7 @@ handle_info({beamtalk_oauth_read, Background, Read}, #{cache := Cache} = State0)
             {{ok, Cache}, _} ->
                 fresh(State0);
             {{ok, {Config, _} = Loaded}, undefined} ->
-                beamtalk_oauth_oidcc:forget_jwks(Config),
+                oauth_oidcc:forget_jwks(Config),
                 fresh(State0#{cache => Loaded, reply => undefined});
             {{ok, {_, Jwks} = Loaded}, {_, OldJwks}} ->
                 Failed = maps:get(kid_reload_failed, State0) andalso Jwks =:= OldJwks,
@@ -445,7 +445,7 @@ server_reply(Read, State, Self) ->
 %% Why a configuration without keys gives no server: an insecure endpoint
 %% (the likely cause), else the keys are not loaded yet.
 partial_reason(Config, #{unsafe := Unsafe}) ->
-    case beamtalk_oauth_oidcc:check_endpoints(Config, Unsafe) of
+    case oauth_oidcc:check_endpoints(Config, Unsafe) of
         ok -> provider_unavailable;
         {error, Reason} -> Reason
     end.
@@ -461,9 +461,9 @@ build(
     },
     Self
 ) ->
-    case beamtalk_oauth_oidcc:check_endpoints(Config, Unsafe) of
+    case oauth_oidcc:check_endpoints(Config, Unsafe) of
         ok ->
-            Info = beamtalk_oauth_oidcc:provider_info(Config, Jwks, RequestOpts, Source#{
+            Info = oauth_oidcc:provider_info(Config, Jwks, RequestOpts, Source#{
                 provider_worker => Self,
                 jwks_reload_interval => Interval
             }),
@@ -514,7 +514,7 @@ kid_reply({ok, {_Config, Jwks}}, Before, Kid) ->
             %% No keys read before the reload: whether it ran is unknown.
             _ -> false
         end,
-    case beamtalk_oauth_oidcc:has_kid(Jwks, Kid) orelse Changed of
+    case oauth_oidcc:has_kid(Jwks, Kid) orelse Changed of
         true -> Jwks;
         false -> undefined
     end;
@@ -673,7 +673,7 @@ unsafe(Options) ->
     maps:get(allowUnsafeHttp, Options, false) =:= true.
 
 check_unsafe(Options) ->
-    case unsafe(Options) andalso not beamtalk_oauth_oidcc:unsafe_http_enabled() of
+    case unsafe(Options) andalso not oauth_oidcc:unsafe_http_enabled() of
         true -> {error, {config, <<"#allowUnsafeHttp is for tests only and is not enabled">>}};
         false -> ok
     end.
@@ -742,7 +742,7 @@ observed(LoadOpts, Observer) ->
     }.
 
 %% The request timeout the oidcc worker's loads use: `timeout' when it is a
-%% positive Integer, as `beamtalk_oauth_oidcc:request_opts/1' takes it,
+%% positive Integer, as `oauth_oidcc:request_opts/1' takes it,
 %% else oidcc's own default.
 request_timeout(Options) ->
     case maps:get(timeout, Options, ?LOAD_REQUEST_TIMEOUT) of

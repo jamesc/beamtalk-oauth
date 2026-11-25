@@ -100,7 +100,7 @@ Actor subclass: FixtureProvider
   /// Also sets the test-only application flag that lets
   /// `#allowUnsafeHttp` work (the fixture is plain HTTP).
   class start -> FixtureProvider =>
-    Erlang beamtalk_oauth_oidcc ensure_started
+    Erlang oauth_oidcc ensure_started
     Erlang application
       set_env: #beamtalk_oauth
       with: #allow_unsafe_http_for_tests

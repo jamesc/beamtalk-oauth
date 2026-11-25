@@ -242,13 +242,13 @@ TestCase subclass: LoopbackReceiverTest
     self assert: self.rx isListening
 
   testNoStrayMessagesAfterTimeoutOrCallback =>
-    before := Erlang beamtalk_oauth_loopback mailbox_size
+    before := Erlang oauth_loopback mailbox_size
     self.rx awaitCallback: 20
     other := LoopbackReceiver start unwrap
     other := other expectState: "other-state"
     HTTPClient get: other redirectUri ++ "?code=x&state=other-state"
     (other awaitCallback: 5000) unwrap
-    self assert: (Erlang beamtalk_oauth_loopback mailbox_size) equals: before
+    self assert: (Erlang oauth_loopback mailbox_size) equals: before
 
   // --- BT-4569: only a callback carrying the flow's state is recorded ---
   testJunkCallbacksBeforeTheRealOneDoNotBlockIt =>

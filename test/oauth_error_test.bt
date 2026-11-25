@@ -85,7 +85,8 @@ TestCase subclass: OAuthErrorTest
 
   testFfiErrorIsUnwrapped =>
     // An FFI {error, R} arrives as an Exception whose reason is R.
-    failed := Erlang beamtalk_oauth_oidcc check_https: #{
+    @expect ffi_nested_string "oauth_oidcc takes Strings at any depth and unwraps them itself"
+    failed := Erlang oauth_oidcc check_https: #{
       #issuer => "http://a.test"
     } with: false
     self assert: (failed error isKindOf: Exception)

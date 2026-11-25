@@ -47,7 +47,7 @@ TestCase subclass: NativeLayerTest
     }
 
   retrieve: client :: Dictionary -> Result =>
-    Erlang beamtalk_oauth_oidcc
+    Erlang oauth_oidcc
       retrieve_token: self server context
       with: client
       with: self codeParams
@@ -55,7 +55,7 @@ TestCase subclass: NativeLayerTest
   // ===== Adapter =====
   testAdapterAnswersHttpcShape =>
     url := self bin: "{self.provider issuer}/.well-known/openid-configuration"
-    got := Erlang beamtalk_oauth_http_adapter
+    got := Erlang oauth_http_adapter
       request: #get
       with: {url, #()}
       with: #()
@@ -71,7 +71,7 @@ TestCase subclass: NativeLayerTest
     self assert: (body asStringUnchecked includesSubstring: "token_endpoint")
 
   adapterGet: url :: String config: cfg :: Dictionary -> Result =>
-    Erlang beamtalk_oauth_http_adapter
+    Erlang oauth_http_adapter
       request: #get
       with: {self bin: url, #()}
       with: #()
@@ -100,7 +100,7 @@ TestCase subclass: NativeLayerTest
     url := self bin: "http://127.0.0.1:{port}/token"
     headers := #({self bin: "authorization", self bin: "Basic c2VjcmV0LXNlY3JldA=="})
     request := {url, headers, self bin: "application/x-www-form-urlencoded", self bin: "code=abc123&code_verifier=xyz"}
-    got := Erlang beamtalk_oauth_http_adapter
+    got := Erlang oauth_http_adapter
       request: #post
       with: request
       with: #()
@@ -120,7 +120,7 @@ TestCase subclass: NativeLayerTest
   testAdapterRejectsStreamingBody =>
     url := self bin: "{self.provider issuer}/token"
     request := {url, #(), self bin: "text/plain", {#chunkify, #producer, #acc}}
-    got := Erlang beamtalk_oauth_http_adapter
+    got := Erlang oauth_http_adapter
       request: #post
       with: request
       with: #()
@@ -131,14 +131,14 @@ TestCase subclass: NativeLayerTest
 
   testAdapterRefusesMalformedHeadersAndSslOptions =>
     url := self bin: "{self.provider issuer}/jwks"
-    got := Erlang beamtalk_oauth_http_adapter
+    got := Erlang oauth_http_adapter
       request: #get
       with: {url, #(#bogus)}
       with: #()
       with: #()
       with: self adapterConfig
     self assert: got error reason equals: {#http_client, #malformed_headers}
-    ssl := Erlang beamtalk_oauth_http_adapter
+    ssl := Erlang oauth_http_adapter
       request: #get
       with: {url, #()}
       with: #({#ssl, #()})
@@ -151,7 +151,7 @@ TestCase subclass: NativeLayerTest
     // crash becomes a fixed reason, not the request.
     url := self bin: "{self.provider issuer}/token"
     headers := #({self bin: "authorization", {#secret, self bin: "c2VjcmV0"}})
-    got := Erlang beamtalk_oauth_http_adapter
+    got := Erlang oauth_http_adapter
       request: #get
       with: {url, headers}
       with: #()
@@ -162,18 +162,18 @@ TestCase subclass: NativeLayerTest
   // ===== Shim =====
   testRetrieveRefusesBadInput =>
     params := self codeParams
-    noProvider := Erlang beamtalk_oauth_oidcc
+    noProvider := Erlang oauth_oidcc
       retrieve_token: nil
       with: self confidential
       with: params
     self assert: noProvider error reason equals: #invalid_provider
     ctx := self server context
-    noCode := Erlang beamtalk_oauth_oidcc
+    noCode := Erlang oauth_oidcc
       retrieve_token: ctx
       with: self confidential
       with: (params removeKey: #code)
     self assert: noCode error reason equals: {#missing_param, #code}
-    nilNonce := Erlang beamtalk_oauth_oidcc
+    nilNonce := Erlang oauth_oidcc
       retrieve_token: ctx
       with: self confidential
       with: (params at: #nonce put: nil)
@@ -186,36 +186,41 @@ TestCase subclass: NativeLayerTest
       #token_endpoint => "https://a.test/token",
       #registration_endpoint => #undefined
     }
-    self assert: (Erlang beamtalk_oauth_oidcc check_https: ok with: false) isOk
+    @expect ffi_nested_string "oauth_oidcc takes Strings at any depth and unwraps them itself"
+    self assert: (Erlang oauth_oidcc check_https: ok with: false) isOk
     bad := #{
       #issuer => "https://a.test",
       #token_endpoint => "http://a.test/token"
     }
-    checked := Erlang beamtalk_oauth_oidcc check_https: bad with: false
+    @expect ffi_nested_string "oauth_oidcc takes Strings at any depth and unwraps them itself"
+    checked := Erlang oauth_oidcc check_https: bad with: false
     self assert: checked isError
     self assert: (OAuthError fromOidcc: checked error) code equals: "insecure_endpoint"
     // allowUnsafeHttp admits plain HTTP on loopback hosts only.
-    unsafe := Erlang beamtalk_oauth_oidcc check_https: bad with: true
+    @expect ffi_nested_string "oauth_oidcc takes Strings at any depth and unwraps them itself"
+    unsafe := Erlang oauth_oidcc check_https: bad with: true
     self assert: (OAuthError fromOidcc: unsafe error) code equals: "insecure_endpoint"
     loopback := #{
       #token_endpoint => "http://127.0.0.1:8080/token",
       #jwks_uri => "http://[::1]:8080/jwks"
     }
-    self assert: (Erlang beamtalk_oauth_oidcc check_https: loopback with: true) isOk
+    @expect ffi_nested_string "oauth_oidcc takes Strings at any depth and unwraps them itself"
+    self assert: (Erlang oauth_oidcc check_https: loopback with: true) isOk
 
   testHttpsCheckOnDiscoveredMetadata =>
     // End to end: the fixture's real (plain-HTTP) metadata fails the
     // check unless the loopback opt-in is given.
     metadata := self server metadata
-    strict := Erlang beamtalk_oauth_oidcc check_https: metadata with: false
+    strict := Erlang oauth_oidcc check_https: metadata with: false
     self assert: (OAuthError fromOidcc: strict error) code equals: "insecure_endpoint"
-    self assert: (Erlang beamtalk_oauth_oidcc check_https: metadata with: true) isOk
+    self assert: (Erlang oauth_oidcc check_https: metadata with: true) isOk
 
   testHttpsCheckCoversAliases =>
     endpoints := #{
       #mtls_endpoint_aliases => #{#token_endpoint => "http://a.test/token"}
     }
-    checked := Erlang beamtalk_oauth_oidcc check_https: endpoints with: false
+    @expect ffi_nested_string "oauth_oidcc takes Strings at any depth and unwraps them itself"
+    checked := Erlang oauth_oidcc check_https: endpoints with: false
     self assert: (OAuthError fromOidcc: checked error) code equals: "insecure_endpoint"
 
   testClaimSourceCheck =>
@@ -234,7 +239,8 @@ TestCase subclass: NativeLayerTest
             }))
     ]
     check := [:endpoint :unsafe |
-      Erlang beamtalk_oauth_oidcc check_claim_sources: (claims value: endpoint) with: unsafe
+      @expect ffi_nested_string "oauth_oidcc takes Strings at any depth and unwraps them itself"
+      Erlang oauth_oidcc check_claim_sources: (claims value: endpoint) with: unsafe
     ]
     self assert: (check value: "https://claims.test/b" value: false) isOk
     insecure := check value: "http://claims.test/b" value: false
@@ -259,7 +265,8 @@ TestCase subclass: NativeLayerTest
         bin: (Json generate: #{
           "_claim_sources" => #{"b" => #{"endpoint" => "http://claims.test/b"}}
         }))
-    self assert: (Erlang beamtalk_oauth_oidcc check_claim_sources: noNames with: false) isOk
+    @expect ffi_nested_string "oauth_oidcc takes Strings at any depth and unwraps them itself"
+    self assert: (Erlang oauth_oidcc check_claim_sources: noNames with: false) isOk
     both := Erlang json
       decode: (self
         bin: (Json
@@ -272,13 +279,15 @@ TestCase subclass: NativeLayerTest
               }
             }
           }))
-    self assert: (Erlang beamtalk_oauth_oidcc check_claim_sources: both with: false) isOk
+    @expect ffi_nested_string "oauth_oidcc takes Strings at any depth and unwraps them itself"
+    self assert: (Erlang oauth_oidcc check_claim_sources: both with: false) isOk
     // No sources, or claims that are not a map: nothing to check.
     noSources := Erlang json decode: (self bin: (Json generate: #{
       "sub" => "u"
     }))
-    self assert: (Erlang beamtalk_oauth_oidcc check_claim_sources: noSources with: false) isOk
-    self assert: (Erlang beamtalk_oauth_oidcc check_claim_sources: #(1, 2) with: false) isOk
+    @expect ffi_nested_string "oauth_oidcc takes Strings at any depth and unwraps them itself"
+    self assert: (Erlang oauth_oidcc check_claim_sources: noSources with: false) isOk
+    self assert: (Erlang oauth_oidcc check_claim_sources: #(1, 2) with: false) isOk
 
   testClockSkewIsSet =>
     skew := Erlang application
@@ -317,8 +326,9 @@ TestCase subclass: NativeLayerTest
       fromDiscovery: self.provider issuer
       preset: ProviderPresets gitlab
       options: #{#allowUnsafeHttp => true}) unwrap
+    @expect ffi_nested_string "oauth_oidcc takes Strings at any depth and unwraps them itself"
     self
-      assertOk: (Erlang beamtalk_oauth_oidcc
+      assertOk: (Erlang oauth_oidcc
         retrieve_token: gitlab context
         with: public
         with: self codeParams)
