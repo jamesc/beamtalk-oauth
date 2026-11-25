@@ -146,7 +146,8 @@ Object subclass: OAuthFlows
       #scopes => wanted,
       #extra => pairs
     }
-    found := Erlang beamtalk_oauth_oidcc
+    @expect ffi_nested_string "oauth_oidcc takes Strings at any depth and unwraps them itself (see the module doc)"
+    found := Erlang oauth_oidcc
       authorize_url: server context
       with: (self clientOf: reg)
       with: params
@@ -648,7 +649,8 @@ Object subclass: OAuthFlows
       #pkce_verifier => sess codeVerifier
     }
     sentAt := TokenSet now
-    found := Erlang beamtalk_oauth_oidcc
+    @expect ffi_nested_string "oauth_oidcc takes Strings at any depth and unwraps them itself (see the module doc)"
+    found := Erlang oauth_oidcc
       retrieve_token: server context
       with: (self clientOf: reg)
       with: params
@@ -697,7 +699,8 @@ Object subclass: OAuthFlows
       #expected_subject => toks subject
     }
     sentAt := TokenSet now
-    found := Erlang beamtalk_oauth_oidcc
+    @expect ffi_nested_string "oauth_oidcc takes Strings at any depth and unwraps them itself (see the module doc)"
+    found := Erlang oauth_oidcc
       refresh_token: server context
       with: (self clientOf: reg)
       with: params
@@ -771,7 +774,8 @@ Object subclass: OAuthFlows
       #token_type => toks tokenType,
       #expected_subject => toks subject
     }
-    found := Erlang beamtalk_oauth_oidcc
+    @expect ffi_nested_string "oauth_oidcc takes Strings at any depth and unwraps them itself (see the module doc)"
+    found := Erlang oauth_oidcc
       userinfo: server context
       with: (self clientOf: reg)
       with: params

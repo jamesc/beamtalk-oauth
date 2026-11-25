@@ -1,7 +1,7 @@
 %% Copyright 2026 James Casey
 %% SPDX-License-Identifier: Apache-2.0
 
--module(beamtalk_oauth_http_adapter).
+-module(oauth_http_adapter).
 
 -moduledoc """
 `oidcc_http_adapter` over Beamtalk's `HTTPClient` (Mint), so every call
@@ -37,11 +37,11 @@ With `response_check => Fun` in the config, each response is passed to
 an `{error, Reason}` from it is answered as is (not wrapped in
 `http_client`). The shim uses this to HTTPS-check the distributed-claim
 endpoints a userinfo response names before `oidcc` fetches them
-(`beamtalk_oauth_oidcc:check_claim_sources/2`).
+(`oauth_oidcc:check_claim_sources/2`).
 
 With `deadline => At` in the config (absolute, in
 `erlang:monotonic_time(millisecond)`), the operation's deadline set by
-`beamtalk_oauth_oidcc:call_opts/1`, each request times out at what is
+`oauth_oidcc:call_opts/1`, each request times out at what is
 left of it, or at `oidcc`'s timeout if that is sooner, and runs in a
 helper process killed once the deadline passes (`HTTPClient`'s timeout
 alone does not bound a response that trickles in). Once nothing is left
@@ -51,7 +51,7 @@ not crash), answers `{error, deadline_exceeded}` (not wrapped in
 `http_client`).
 
 A `200` answer to a `GET` of a discovery document is handed to
-`beamtalk_oauth_oidcc:mark_discovery/3`, which marks a document that
+`oauth_oidcc:mark_discovery/3`, which marks a document that
 leaves out `revocation_endpoint_auth_methods_supported` (so the marker
 survives `oidcc` applying the RFC 8414 default).
 
@@ -68,7 +68,7 @@ otherwise), whatever `oidcc` accepted: `oidcc` itself takes a plain-HTTP
 `jwks_uri`, and an `oidcc_provider_configuration_worker` fetches it
 before Beamtalk code sees the configuration. `allow_unsafe_http` (tests
 only) also admits plain HTTP on a loopback host, as
-`beamtalk_oauth_oidcc:check_https/2` does. Each refusal emits the
+`oauth_oidcc:check_https/2` does. Each refusal emits the
 telemetry event `[beamtalk_oauth, http_adapter, refused]` (metadata
 `#{reason => insecure_url}`, or `#{reason => insecure_claim_source}` for a
 `response_check` refusal), so a refused background load is visible.
@@ -217,7 +217,7 @@ past_deadline(Answer, _Config) ->
 %% by whether the URL is a discovery document.
 observe(Request, Event, #{load_observer := Observer}) when is_pid(Observer) ->
     Kind =
-        try beamtalk_oauth_oidcc:is_discovery_url(element(1, Request)) of
+        try oauth_oidcc:is_discovery_url(element(1, Request)) of
             true -> configuration;
             false -> jwks
         catch
@@ -294,22 +294,22 @@ capture(_Method, _Answer, _Config) ->
 
 %% A discovery document is passed through the shim, which records whether
 %% the provider named its revocation auth methods before `oidcc` fills in
-%% the RFC 8414 default (`beamtalk_oauth_oidcc:mark_discovery/3`).
+%% the RFC 8414 default (`oauth_oidcc:mark_discovery/3`).
 %% Only a 200 is a document: an error body at that URL is left as served.
 mark_discovery(Method, Url, {ok, {{_, 200, _} = Status, Headers, Body}}) ->
-    {ok, {Status, Headers, beamtalk_oauth_oidcc:mark_discovery(Method, Url, Body)}};
+    {ok, {Status, Headers, oauth_oidcc:mark_discovery(Method, Url, Body)}};
 mark_discovery(_Method, _Url, Answer) ->
     Answer.
 
 %% The opt-in counts only while the test-only application flag is set.
 unsafe(Config) ->
     maps:get(allow_unsafe_http, Config, false) =:= true andalso
-        beamtalk_oauth_oidcc:unsafe_http_enabled().
+        oauth_oidcc:unsafe_http_enabled().
 
 %% HTTPS only (plain HTTP on loopback with the test-only opt-in). The
 %% reason never carries the URL.
 check_url(Url, Unsafe) ->
-    case beamtalk_oauth_oidcc:check_https(#{request_url => iolist_to_binary(Url)}, Unsafe) of
+    case oauth_oidcc:check_https(#{request_url => iolist_to_binary(Url)}, Unsafe) of
         ok ->
             ok;
         {error, _} ->

@@ -34,7 +34,8 @@ TestCase subclass: DiscoveryJwksTest
   // An exchange through a provider context (say one with a small
   // deadline, `with_deadline/2`).
   retrieveWith: context -> Result =>
-    Erlang beamtalk_oauth_oidcc
+    @expect ffi_nested_string "oauth_oidcc takes Strings at any depth and unwraps them itself"
+    Erlang oauth_oidcc
       retrieve_token: context
       with: #{
         #client_id => FixtureProvider clientId,
@@ -120,7 +121,7 @@ TestCase subclass: DiscoveryJwksTest
 
   testSpentDeadlineStartsNoRequest =>
     server := self discover: #{}
-    context := Erlang beamtalk_oauth_oidcc with_deadline: server context with: 0
+    context := Erlang oauth_oidcc with_deadline: server context with: 0
     result := self retrieveWith: context
     self assert: ((self errorOf: result) description includesSubstring: "deadline exceeded")
     self assert: (self.provider hits: "/token") equals: 0
@@ -130,8 +131,8 @@ TestCase subclass: DiscoveryJwksTest
     self.provider rotateKeyTo: "key-2"
     // The unknown-kid refresh of an operation whose deadline is already
     // spent (as by a slow token request): no load, and none claimed.
-    context := Erlang beamtalk_oauth_oidcc with_deadline: server context with: 1
-    opts := Erlang beamtalk_oauth_oidcc call_opts: context
+    context := Erlang oauth_oidcc with_deadline: server context with: 1
+    opts := Erlang oauth_oidcc call_opts: context
     Erlang timer sleep: 20
     refreshed := (opts at: #refresh_jwks) value: nil value: "key-2"
     self assert: refreshed equals: {#error, #deadline_exceeded}

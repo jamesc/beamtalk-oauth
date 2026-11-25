@@ -420,14 +420,15 @@ Object subclass: TokenRevocation
   /// nil when `url` may carry a token, otherwise `insecure_endpoint`.
   ///
   /// The rule is the shim's and the HTTP adapter's
-  /// (`beamtalk_oauth_oidcc:check_https/2`): HTTPS, or plain HTTP to a
+  /// (`oauth_oidcc:check_https/2`): HTTPS, or plain HTTP to a
   /// loopback host only when the test-only application flag
   /// `beamtalk_oauth` / `allow_unsafe_http_for_tests` is set (as
   /// `FixtureProvider start` does). Discovery already checks the endpoints
   /// it names; this also covers a preset's endpoints and servers built by
   /// hand.
   class checkEndpoint: url :: String -> OAuthError | Nil =>
-    shim := Erlang beamtalk_oauth_oidcc
+    shim := Erlang oauth_oidcc
+    @expect ffi_nested_string "oauth_oidcc takes Strings at any depth and unwraps them itself (see the module doc)"
     checked := shim check_https: #{
       #request_url => url
     } with: shim unsafe_http_enabled

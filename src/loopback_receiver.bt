@@ -205,7 +205,7 @@ typed Value subclass: LoopbackReceiver
   /// (`#timeout`) or the gate exits (`#stopped`).
   class await: tag :: Reference from: gatePid :: Pid timeout: timeoutMs :: Integer -> Result(Dictionary, Object) =>
     // `{callback, Query}`, `timeout` or `stopped` from the native module.
-    answer := Erlang beamtalk_oauth_loopback
+    answer := Erlang oauth_loopback
       await: tag
       gate: gatePid
       timeout: timeoutMs

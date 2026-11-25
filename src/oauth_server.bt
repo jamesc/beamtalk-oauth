@@ -172,7 +172,7 @@ typed Value subclass: OAuthServer
       ifTrue: [
         shimOpts := shimOpts at: #min_jwks_reload_interval put: (opts at: #minJwksReloadInterval)
       ]
-    found := Erlang beamtalk_oauth_oidcc discover: issuer with: shimOpts
+    found := Erlang oauth_oidcc discover: issuer with: shimOpts
     found ifOk: [:info |
       Result ok: (self fromShim: info preset: preset)
     ] ifError: [:reason | Result error: (OAuthError fromOidcc: reason)]

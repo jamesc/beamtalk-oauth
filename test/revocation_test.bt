@@ -239,7 +239,7 @@ TestCase subclass: RevocationTest
     self assert: (self.provider lastRequestTo: "/revoke") equals: nil
 
   testMarkDiscoveryOnlyMarksDiscoveryDocuments =>
-    shim := Erlang beamtalk_oauth_oidcc
+    shim := Erlang oauth_oidcc
     url := self bin: "https://idp.test/tenant/.well-known/openid-configuration"
     plain := self bin: "\{""a"":1}"
     marked := (shim

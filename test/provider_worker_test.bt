@@ -75,14 +75,14 @@ TestCase subclass: ProviderWorkerTest
   // An exchange through a provider context (say one with a small
   // deadline, `with_deadline/2`).
   retrieveWith: context client: client :: Dictionary -> Result =>
-    Erlang beamtalk_oauth_oidcc
+    Erlang oauth_oidcc
       retrieve_token: context
       with: client
       with: self codeParams
 
   // `server`'s context with an operation deadline of `ms` (0 allowed).
   budgeted: server :: OAuthServer ms: ms :: Integer =>
-    Erlang beamtalk_oauth_oidcc with_deadline: server context with: ms
+    Erlang oauth_oidcc with_deadline: server context with: ms
 
   // `result` (a shim answer) failed with the deadline error.
   assertDeadline: result :: Result =>
@@ -579,7 +579,7 @@ TestCase subclass: ProviderWorkerTest
     self.provider rotateKeyTo: "key-2"
     // The unknown-kid refresh of an operation whose deadline is already
     // spent (as by a slow token request).
-    opts := Erlang beamtalk_oauth_oidcc call_opts: (self budgeted: server ms: 1)
+    opts := Erlang oauth_oidcc call_opts: (self budgeted: server ms: 1)
     Erlang timer sleep: 20
     refreshed := (opts at: #refresh_jwks) value: nil value: "key-2"
     self assert: refreshed equals: {#error, #deadline_exceeded}
