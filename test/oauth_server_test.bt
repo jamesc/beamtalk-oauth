@@ -41,7 +41,7 @@ TestCase subclass: OAuthServerTest
     self assert: (text startsWith: "OAuthServer(issuer: ")
     self deny: (text includesSubstring: "beamtalk_oauth_provider")
     self deny: (text includesSubstring: "jose")
-    self deny: ((OAuthServer jsonMapping encode: server) includesKey: "context")
+    self deny: (server asJson includesKey: "context")
 
   testPresetSuppliesMissingRevocationAndTokenInfo =>
     self provider discoveryOverrides: #{"revocation_endpoint" => nil}

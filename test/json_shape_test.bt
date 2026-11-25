@@ -11,10 +11,6 @@ TestCase subclass: JsonShapeTest
   assertNoneIn: text :: String of: secrets :: List =>
     secrets do: [:s | self deny: (text includesSubstring: s)]
 
-  /// `asJson` as a Dictionary. `JsonMappable asJson` is typed `Object`, so go
-  /// through `perform:` (answers Dynamic) to read keys.
-  jsonOf: value => value perform: #asJson
-
   testTokenSetShape =>
     t := TokenSet
       new: #{
@@ -28,7 +24,7 @@ TestCase subclass: JsonShapeTest
         #idToken => "eyJhbGciOiJSUzI1NiJ9.payload.sig"
       }
     self
-      assert: (self jsonOf: t)
+      assert: t asJson
       equals: #{
         "accessToken" => "[redacted]",
         "tokenType" => "Bearer",
@@ -42,7 +38,7 @@ TestCase subclass: JsonShapeTest
 
   testTokenSetAbsentTokensStayNil =>
     t := TokenSet new: #{#accessToken => "access-AAA111"}
-    json := (self jsonOf: t)
+    json := t asJson
     self assert: (json at: "accessToken") equals: "[redacted]"
     self assert: (json at: "refreshToken") equals: nil
     self assert: (json at: "idToken") equals: nil
@@ -62,7 +58,7 @@ TestCase subclass: JsonShapeTest
         #createdAt => 42
       }
     self
-      assert: (self jsonOf: s)
+      assert: s asJson
       equals: #{
         "state" => "st-1",
         "nonce" => "[redacted]",
@@ -74,7 +70,7 @@ TestCase subclass: JsonShapeTest
     self assertNoneIn: s asJson printString ++ (Json generate: s) of: #("nonce-NNN444", "verifier-VVV555")
 
   testOAuthSessionEmptySecretsStillRedacted =>
-    json := self jsonOf: OAuthSession new
+    json := OAuthSession new asJson
     self assert: (json at: "nonce") equals: "[redacted]"
     self assert: (json at: "codeVerifier") equals: "[redacted]"
 
@@ -92,11 +88,11 @@ TestCase subclass: JsonShapeTest
         #session => sess,
         #ticket => "ticket-TTT777"
       }
-    json := (self jsonOf: cb)
+    json := cb asJson
     self assert: (json at: "code") equals: "[redacted]"
     self assert: (json at: "ticket") equals: "[redacted]"
     self assert: (json at: "iss") equals: "https://idp.example"
-    self assert: (json at: "session") equals: (self jsonOf: sess)
+    self assert: (json at: "session") equals: sess asJson
     self assert: json size equals: 4
     self assertNoneIn: json printString ++ (Json generate: cb) of: #("code-CCC666", "ticket-TTT777", "nonce-NNN444", "verifier-VVV555")
 
@@ -108,7 +104,7 @@ TestCase subclass: JsonShapeTest
         #redirectUri => "https://app.example.com/cb"
       }
     self
-      assert: (self jsonOf: reg)
+      assert: reg asJson
       equals: #{
         "clientId" => "app",
         "clientSecret" => "[redacted]",
@@ -118,7 +114,7 @@ TestCase subclass: JsonShapeTest
 
   testClientRegistrationPublicClientSecretStaysNil =>
     reg := ClientRegistration new: #{#clientId => "app"}
-    self assert: ((self jsonOf: reg) at: "clientSecret") equals: nil
+    self assert: (reg asJson at: "clientSecret") equals: nil
 
   testOAuthServerShapeOmitsContext =>
     server := OAuthServer
@@ -128,7 +124,7 @@ TestCase subclass: JsonShapeTest
         #revocationEndpoint => "https://idp.example/revoke"
       }
     self
-      assert: (self jsonOf: server)
+      assert: server asJson
       equals: #{
         "issuer" => "https://idp.example",
         "revocationEndpoint" => "https://idp.example/revoke",
@@ -144,7 +140,7 @@ TestCase subclass: JsonShapeTest
         #status => 400,
         #detail => #{"reason" => "x"}
       }
-    json := (self jsonOf: e)
+    json := e asJson
     self assert: (json at: "code") equals: "invalid_grant"
     self assert: (json at: "description") equals: "expired"
     self assert: (json at: "status") equals: 400
@@ -152,7 +148,7 @@ TestCase subclass: JsonShapeTest
     self assert: json size equals: 4
 
   testOAuthErrorAbsentDetailAndStatusAreNil =>
-    json := self jsonOf: (OAuthError code: "x" description: "y")
+    json := (OAuthError code: "x" description: "y") asJson
     self assert: (json at: "status") equals: nil
     self assert: (json at: "detail") equals: nil
 
