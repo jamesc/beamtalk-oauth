@@ -1,6 +1,18 @@
 // Copyright 2026 James Casey
 // SPDX-License-Identifier: Apache-2.0
 
+/// The shim's token map (`oauth_oidcc:token_to_map/1`): every key is
+/// present, and a part the provider did not send is `nil`.
+type TokenResponse = #{
+  #access_token => String | Nil,
+  #token_type => String | Nil,
+  #expires_in => Integer | Nil,
+  #refresh_token => String | Nil,
+  #scope => String | Nil,
+  #id_token_claims => Dictionary | Nil,
+  #id_token => String | Nil
+}
+
 /// OAuthFlows — the grant operations a login uses: the authorization URL,
 /// the callback, the code exchange, refresh, userinfo, and (delegating to
 /// `TokenRevocation`) revocation and token info.
@@ -563,7 +575,9 @@ Object subclass: OAuthFlows
     rearms := 0
     // The `invalid_grant` behind the last re-arm, answered if the wait
     // after it times out.
-    refused := nil
+    // Annotated: the return-type check types a bare `nil` local as Nil
+    // inside the loop below (BT-5298).
+    refused :: OAuthError | Nil := nil
     [true]
       whileTrue: [
         remaining := deadline - self monotonicMs
@@ -870,15 +884,16 @@ Object subclass: OAuthFlows
     #{#client_id => reg clientId, #client_secret => reg clientSecret}
 
   /// A `TokenSet` from the shim's token map, obtained at `sentAt`.
-  class tokenSetFrom: toks :: Dictionary obtainedAt: sentAt :: Integer -> TokenSet =>
+  class tokenSetFrom: toks :: TokenResponse obtainedAt: sentAt :: Integer -> TokenSet =>
+    #{#access_token => accessToken, #token_type => tokenType, #expires_in => expiresIn, #refresh_token => refreshToken, #scope => scope, #id_token_claims => claims, #id_token => idToken} := toks
     TokenSet
       new: #{
-        #accessToken => (toks at: #access_token) ifNil: [""],
-        #tokenType => (toks at: #token_type) ifNil: ["bearer"],
-        #expiresIn => (toks at: #expires_in),
+        #accessToken => accessToken ifNil: [""],
+        #tokenType => tokenType ifNil: ["bearer"],
+        #expiresIn => expiresIn,
         #obtainedAt => sentAt,
-        #refreshToken => (toks at: #refresh_token),
-        #scope => (toks at: #scope),
-        #idTokenClaims => (toks at: #id_token_claims),
-        #idToken => (toks at: #id_token)
+        #refreshToken => refreshToken,
+        #scope => scope,
+        #idTokenClaims => claims,
+        #idToken => idToken
       }

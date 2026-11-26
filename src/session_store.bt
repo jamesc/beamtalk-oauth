@@ -465,7 +465,7 @@ typed Actor subclass: SessionStore
         // injected clock under 1114112), and would cross the FFI as a
         // String.
         stamps := Erlang ets select: table with: #({#'$1', #(), #({{{#element, 2, #'$1'}}})})
-        oldest := (Erlang lists min: stamps) at: 1
+        {oldest} := Erlang lists min: stamps
         next := next max: oldest + self.ttl
       ]
     self.fullUntil := self.fullUntil at: table put: next

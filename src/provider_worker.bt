@@ -164,9 +164,10 @@ Actor subclass: ProviderWorker native: oauth_provider_worker
   /// The `OAuthError` for a config problem from the backing module's
   /// `check/1`.
   class errorFor: problem :: Tuple -> OAuthError =>
-    (problem at: 1) =:= #config ifTrue: [
-      OAuthError config: (problem at: 2)
-    ] ifFalse: [OAuthError fromOidcc: problem]
+    problem match: [
+      {#config, text} -> OAuthError config: text;
+      _ -> OAuthError fromOidcc: problem
+    ]
 
   /// An `OAuthServer` from the worker's current configuration and JWKS.
   /// Answers at once from the last configuration and keys read (see the

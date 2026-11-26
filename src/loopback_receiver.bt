@@ -209,8 +209,10 @@ typed Value subclass: LoopbackReceiver
       await: tag
       gate: gatePid
       timeout: timeoutMs
-    (answer isKindOf: Tuple) ifTrue: [^Result ok: (answer at: 2)]
-    Result error: answer
+    answer match: [
+      {#callback, query} -> Result ok: query;
+      _ -> Result error: answer
+    ]
 
   /// The redirect URI to register with the provider for this flow:
   /// `http://127.0.0.1:{port}/callback`.
