@@ -576,7 +576,7 @@ Object subclass: OAuthFlows
     // The `invalid_grant` behind the last re-arm, answered if the wait
     // after it times out.
     // Annotated: the return-type check types a bare `nil` local as Nil
-    // inside the loop below (BT-5298).
+    // inside the loop below (BT-5298); drop the annotation once that is fixed.
     refused :: OAuthError | Nil := nil
     [true]
       whileTrue: [
