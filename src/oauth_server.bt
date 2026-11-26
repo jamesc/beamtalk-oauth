@@ -180,8 +180,8 @@ typed Value subclass: OAuthServer
 
   /// Build the server from the shim's discovery answer.
   class fromShim: info :: Dictionary preset: preset :: Dictionary -> OAuthServer =>
-    issuer := info at: #issuer
-    revocation := (info at: #revocation_endpoint)
+    #{#issuer => issuer, #revocation_endpoint => advertisedRevocation, #context => context, #metadata => metadata} := info
+    revocation := advertisedRevocation
       ifNil: [
         self
           endpoint: #revocationEndpoint
@@ -192,14 +192,14 @@ typed Value subclass: OAuthServer
     self
       new: #{
         #issuer => issuer,
-        #context => (info at: #context),
+        #context => context,
         #revocationEndpoint => revocation,
         #tokenInfoEndpoint => (self
           endpoint: #tokenInfoEndpoint
           path: #tokenInfoPath
           issuer: issuer
           preset: preset),
-        #metadata => (info at: #metadata),
+        #metadata => metadata,
         #preset => preset
       }
 
