@@ -302,12 +302,10 @@ Object subclass: TokenRevocation
   /// or a List, must name it. GitLab: `application.uid` must be it. An
   /// answer with none of these fails closed (false).
   class isForClient: clientId :: String body: body :: Dictionary -> Boolean =>
-    azp := body at: "azp" ifAbsent: [nil]
+    #{?"azp" => azp, ?"aud" => aud, ?"application" => app} := body
     azp notNil ifTrue: [^azp =:= clientId]
-    aud := body at: "aud" ifAbsent: [nil]
     (aud isKindOf: String) ifTrue: [^aud =:= clientId]
     (aud isKindOf: List) ifTrue: [^aud includes: clientId]
-    app := body at: "application" ifAbsent: [nil]
     (app isKindOf: Dictionary) ifTrue: [
       ^(app at: "uid" ifAbsent: [nil]) =:= clientId
     ]
@@ -318,9 +316,10 @@ Object subclass: TokenRevocation
   class isInactive: status :: Integer body: body :: Object -> Boolean =>
     status =:= 401 ifTrue: [^true]
     status =:= 400 ifFalse: [^false]
-    (body isKindOf: Dictionary) ifFalse: [^false]
-    code := body at: "error" ifAbsent: [nil]
-    code isNil or: [code =:= "invalid_token"]
+    body match: [
+      #{?"error" => code} -> code isNil or: [code =:= "invalid_token"];
+      _ -> false
+    ]
 
   /// The answer for an inactive token.
   class inactive -> Dictionary =>

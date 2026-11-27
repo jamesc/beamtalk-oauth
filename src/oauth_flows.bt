@@ -270,14 +270,22 @@ Object subclass: OAuthFlows
           boundTo: binding
         ^Result error: parsed
       ]
-    state := parsed at: "state" ifAbsent: [""]
+    #{
+      ?"state" => state = "",
+      ?"code" => code = "",
+      ?"error" => providerError,
+      ?"error_description" => errorDescription = "",
+      ?"iss" => iss
+    } := parsed
     // A callback no provider would send leaves the session alone, so a
     // local process that reads `state` cannot end the login with one.
     // An `error` that is present but malformed (empty included) is
     // answered below, after the session is consumed, as before.
     // `LoopbackGate` is stricter and refuses an empty one.
-    ((parsed includesKey: "error") not and: [
-      (parsed at: "code" ifAbsent: [""]) isEmpty
+    // Query parameters are Strings, never nil: a nil `providerError` means
+    // the callback has no `error` parameter.
+    (providerError isNil and: [
+      code isEmpty
     ]) ifTrue: [^Result error: (OAuthError parse: "callback has no code")]
     (self
       issuerMismatchOf: parsed
@@ -287,14 +295,13 @@ Object subclass: OAuthFlows
     // A full ticket table would refuse the ticket after the session is
     // burned: refuse first, and leave the session for a retry.
     (state isEmpty not and: [
-      (parsed at: "error" ifAbsent: [nil]) isNil
+      providerError isNil
     ]) ifTrue: [
       store hasTicketRoom ifFalse: [^Result error: OAuthError sessionStoreFull]
     ]
     burned := state isEmpty ifTrue: [
       nil
     ] ifFalse: [store consume: state boundTo: binding]
-    providerError := parsed at: "error" ifAbsent: [nil]
     providerError notNil
       ifTrue: [
         (providerError matchesRegex: self errorCodePattern) ifFalse: [
@@ -303,19 +310,14 @@ Object subclass: OAuthFlows
         (burned notNil and: [
           burned isError
         ]) ifTrue: [^Result error: burned error]
-        ^Result
-          error: (self providerError: providerError description: (parsed at: "error_description" ifAbsent: [
-            ""
-          ]))
+        ^Result error: (self providerError: providerError description: errorDescription)
       ]
-    // Not empty: checked above.
-    code := parsed at: "code" ifAbsent: [""]
+    // `code` is not empty: checked above.
     burned isNil ifTrue: [
       ^Result error: (OAuthError parse: "callback has no state")
     ]
     burned isError ifTrue: [^Result error: burned error]
     sess := burned value
-    iss := parsed at: "iss" ifAbsent: [nil]
     (iss notNil and: [iss =/= sess issuer])
       ifTrue: [
         ^Result error: (OAuthError code: "issuer_mismatch" description: "callback iss {self echo: iss} is not the session's issuer {sess issuer}")
@@ -885,7 +887,15 @@ Object subclass: OAuthFlows
 
   /// A `TokenSet` from the shim's token map, obtained at `sentAt`.
   class tokenSetFrom: toks :: TokenResponse obtainedAt: sentAt :: Integer -> TokenSet =>
-    #{#access_token => accessToken, #token_type => tokenType, #expires_in => expiresIn, #refresh_token => refreshToken, #scope => scope, #id_token_claims => claims, #id_token => idToken} := toks
+    #{
+      #access_token => accessToken,
+      #token_type => tokenType,
+      #expires_in => expiresIn,
+      #refresh_token => refreshToken,
+      #scope => scope,
+      #id_token_claims => claims,
+      #id_token => idToken
+    } := toks
     TokenSet
       new: #{
         #accessToken => accessToken ifNil: [""],
