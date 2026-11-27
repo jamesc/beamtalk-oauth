@@ -885,15 +885,7 @@ Object subclass: OAuthFlows
 
   /// A `TokenSet` from the shim's token map, obtained at `sentAt`.
   class tokenSetFrom: toks :: TokenResponse obtainedAt: sentAt :: Integer -> TokenSet =>
-    #{
-      #access_token => accessToken,
-      #token_type => tokenType,
-      #expires_in => expiresIn,
-      #refresh_token => refreshToken,
-      #scope => scope,
-      #id_token_claims => claims,
-      #id_token => idToken
-    } := toks
+    #{#access_token => accessToken, #token_type => tokenType, #expires_in => expiresIn, #refresh_token => refreshToken, #scope => scope, #id_token_claims => claims, #id_token => idToken} := toks
     TokenSet
       new: #{
         #accessToken => accessToken ifNil: [""],
