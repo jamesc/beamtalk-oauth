@@ -148,6 +148,25 @@ TestCase subclass: TokenInfoTest
       body: #{"error" => "invalid_token"}
     self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
 
+  testNullErrorMemberIsInactive =>
+    // A present `"error": null` reads like a missing `error`: inactive.
+    self.provider
+      fail: "/tokeninfo"
+      status: 400
+      body: #{"error" => nil}
+    self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
+
+  testNonObject400IsAnError =>
+    // A 400 whose body is not a JSON object is not "this token is inactive".
+    self.provider
+      respond: "/tokeninfo"
+      status: 400
+      body: "oops"
+      contentType: "text/plain"
+    got := self info: self google token: self tokens
+    self assert: got isError
+    self assert: got error status equals: 400
+
   testActiveMemberIsRespected =>
     self.provider tokenInfo: #{"active" => false, "sub" => "user-1"}
     self assert: ((self info: self google token: self tokens) unwrap at: #active) equals: false
