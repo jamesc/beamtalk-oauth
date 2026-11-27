@@ -288,7 +288,7 @@ Object subclass: OAuthFlows
       code isEmpty
     ]) ifTrue: [^Result error: (OAuthError parse: "callback has no code")]
     (self
-      issuerMismatchOf: parsed
+      issuerMismatchOf: iss
       state: state
       store: store
       boundTo: binding) ifNotNil: [:err | ^Result error: err]
@@ -332,12 +332,11 @@ Object subclass: OAuthFlows
         session: sess
         ticket: ticket)
 
-  /// The `issuer_mismatch` error when `parsed` carries an `iss` and the
+  /// The `issuer_mismatch` error when the callback carried an `iss` and the
   /// session stored under `state` with `binding` has another issuer; nil
   /// otherwise, including when no such session is found (consuming it
   /// answers that error). Removes nothing from `store`.
-  class issuerMismatchOf: parsed :: Dictionary state: state :: String store: store :: SessionStore boundTo: binding :: String -> OAuthError | Nil =>
-    iss := parsed at: "iss" ifAbsent: [nil]
+  class issuerMismatchOf: iss :: String | Nil state: state :: String store: store :: SessionStore boundTo: binding :: String -> OAuthError | Nil =>
     (iss isNil or: [state isEmpty]) ifTrue: [^nil]
     found := store peek: state boundTo: binding
     found isError ifTrue: [^nil]
